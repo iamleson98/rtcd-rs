@@ -16,8 +16,10 @@ changing the LMS server or the web client.
 | Media | ICE-lite over UDP and ICE-TCP, DTLS-SRTP, the `calls-dc` data channel (lock protocol, zlib SDP, media map), Opus voice with VAD events, VP8 camera and screen share with simulcast layer switching that needs no renegotiation, `video_subscribe`, keyframe relay, bandwidth-driven screen layer choice |
 | Metrics | the Prometheus metric names are the Go service's, plus the network counters below |
 
-The LMS web app's own call client (`compare/harness/browser/lms`) runs against it in headless Chrome,
-Firefox and Safari, next to the Go service, with the same checks.
+The LMS web app's own call client runs against it in headless Chrome, Firefox and Safari, next to the
+Go service, with the same checks. That comparison lives in the
+[webrtc](https://github.com/iamleson98/webrtc) repository (`compare/`), which includes this one as a
+submodule.
 
 ## Measuring network usage
 
@@ -59,7 +61,6 @@ crates/rtcd         the service: config, auth, store, HTTP and websocket API, TL
 crates/rtcd-testkit an emulated browser used by the engine tests
 vendor/rtc          the WebRTC stack, pinned (git submodule)
 compat/golden       regenerates the golden vectors from the Go sources
-compare/            the Go rtcd and what runs against both servers (see compare/README.md)
 deploy/             the entrypoint and config template the image uses
 ```
 
@@ -81,9 +82,9 @@ docker run --rm -p 8045:8045 -p 8443:8443/udp -p 8443:8443 \
 ## Continuous integration
 
 `ci.yml` runs rustfmt, clippy (warnings are errors), the whole test suite on Linux and macOS, a
-dependency audit, and the Docker image started through its entrypoint. `compare.yml` runs the same
-suite against the Go and the Rust server on both systems and compares the results (see
-`compare/README.md`). `image.yml` publishes `ghcr.io/<owner>/rtcd-rust` on a version tag.
+dependency audit, and the Docker image started through its entrypoint. `image.yml` publishes
+`ghcr.io/<owner>/rtcd-rust` on a version tag. The Go-versus-Rust comparison runs in the webrtc
+repository.
 
 ## Not done yet
 

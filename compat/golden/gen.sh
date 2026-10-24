@@ -1,13 +1,13 @@
 #!/bin/bash
 # Regenerates the golden wire vectors in crates/rtcd-proto/tests/golden from the original Go rtcd.
 #
-#   compat/golden/gen.sh   (RTCD_GO_SRC overrides the default compare/rtcd-go)
+#   RTCD_GO_SRC=/path/to/rtcd compat/golden/gen.sh
 #
 # The vectors are checked in, so CI does not need the Go sources; run this when the Go side changes
 # its wire format, and commit the diff.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-SRC=$(cd "${RTCD_GO_SRC:-$HERE/../../compare/rtcd-go}" && pwd)
+SRC=$(cd "${RTCD_GO_SRC:?point RTCD_GO_SRC at the Go rtcd checkout}" && pwd)
 OUT="$HERE/../../crates/rtcd-proto/tests/golden"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
