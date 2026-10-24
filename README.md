@@ -43,7 +43,7 @@ transport-wide sequence number (8 bytes on a 65-byte packet, both ways) and nobo
 whatever places new calls (the LMS server does, from its DNS-discovered pool) can send them to the
 lighter instance. Calls stay on the instance they start on.
 
-Within an instance, `RTCD_RTC_SHARDS` threads serve the calls (0 chooses one per core). The shards
+Within an instance, `RTCD_RTC_SHARDS` threads serve the calls (0 chooses one per four cores). The shards
 share the media port; the kernel hands a datagram to one of them, and a shard that gets one that is
 not its own passes it on. Once a shard has learned a participant's address it opens a socket
 connected to that address, bound to the same port, which the kernel serves directly: after the first

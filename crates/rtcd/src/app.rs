@@ -82,11 +82,12 @@ pub fn sfu_config(cfg: &Config, addresses: Vec<LocalAddress>) -> SfuConfig {
     if rtc.nack_buffer_size != 0 {
         engine.nack_buffer_size = rtc.nack_buffer_size as u16;
     }
-    // One shard per core serves the calls; an operator can pin the number.
+    // One shard per four cores serves the calls (measured: a shard carries about 700 participants,
+    // and each shard beyond what the load needs costs CPU for nothing); an operator can pin it.
     let shards = if rtc.shards > 0 {
         rtc.shards as usize
     } else {
-        std::thread::available_parallelism().map_or(1, |n| n.get().min(32))
+        std::thread::available_parallelism().map_or(1, |n| n.get().div_ceil(4).min(32))
     };
     SfuConfig {
         engine,
