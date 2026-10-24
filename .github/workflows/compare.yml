@@ -83,7 +83,14 @@ jobs:
           for pack in packs/*/pack.tgz; do tar -xzf "$pack" -C results; done
           ls results
       - name: Compare the results
-        run: $GITHUB_WORKSPACE/scripts/ci-run.sh python3 compare/report.py results
+        run: |
+          status=0
+          $GITHUB_WORKSPACE/scripts/ci-run.sh python3 compare/report.py results || status=$?
+          # The report as an annotation too, so it can be read without opening the summary.
+          if [ -f results/report.md ]; then
+            echo "::notice title=comparison::$(sed -e 's/%/%25/g' results/report.md | awk '{printf "%s%%0A", $0}')"
+          fi
+          exit $status
       - uses: actions/upload-artifact@v4
         if: always()
         with:
