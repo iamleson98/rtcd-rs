@@ -51,6 +51,18 @@ not its own passes it on. Once a shard has learned a participant's address it op
 connected to that address, bound to the same port, which the kernel serves directly: after the first
 packets almost nothing takes the detour (`rtcd_net_forwarded_packets_total` shows how much does).
 
+## Using it from class-management
+
+- Bring it in as a submodule: `git submodule add https://github.com/iamleson98/rtcd-rs.git rtcd-rust`
+  and `git submodule update --init --recursive` (the `rtc` submodule comes with it).
+- The image takes the environment, ports (8045, 8443), user (2001) and `/data` volume of `lms-rtcd`,
+  and the entrypoint and config template are the ones that image uses: the Kubernetes manifests change
+  only in the image name. Clients registered with the Go rtcd in `/data` are taken over on the first
+  start.
+- Its instances are found by the server's DNS discovery like the Go ones, and `GET /system` lets the
+  server put new calls on the lighter instance.
+- The web client, the server's `custom_calls_*` actions and the session recorder need no change.
+
 ## Layout
 
 ```
