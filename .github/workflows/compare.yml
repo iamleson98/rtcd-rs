@@ -1,0 +1,82 @@
+name: compare
+
+# The Go rtcd and the Rust rtcd run through the same suite on Linux and macOS: each project's own
+# tests, the Go service client + pion interop scenarios, the LMS call client in headless Chrome, and
+# classroom load. report.py compares the results and fails when Rust is worse.
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  suite:
+    name: ${{ matrix.server }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+        server: [ go, rust ]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: compare/rtcd-go/go.mod
+          cache-dependency-path: |
+            compare/rtcd-go/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.server == 'rust'
+      - uses: oven-sh/setup-bun@v2
+      - name: Install perf
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq linux-tools-common linux-tools-$(uname -r) || sudo apt-get install -y -qq linux-tools-generic || true
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 || true
+      - name: Run the suite
+        env:
+          PROFILE: '1'
+        run: compare/run-suite.sh ${{ matrix.server }} results/${{ matrix.os }}-${{ matrix.server }}
+      # Only the text results: the profiler runs as root and leaves files the zip step cannot read.
+      - name: Make the results readable
+        if: always() && runner.os == 'Linux'
+        run: sudo chown -R "$(id -u):$(id -g)" results || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.os }}-${{ matrix.server }}
+          path: results/*/*.txt
+
+  report:
+    name: Compare
+    needs: suite
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: results-*
+          path: results
+          merge-multiple: true
+      - name: Compare the results
+        run: $GITHUB_WORKSPACE/scripts/ci-run.sh python3 compare/report.py results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: comparison
+          path: results/report.md

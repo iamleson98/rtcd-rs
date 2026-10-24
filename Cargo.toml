@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/rtcd-proto", "crates/rtcd-net", "crates/rtcd-sfu", "crates/rtcd", "crates/rtcd-testkit"]
+exclude = ["vendor"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1

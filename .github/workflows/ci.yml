@@ -1,0 +1,74 @@
+name: ci
+
+# The Rust rtcd: formatting, lints, the whole test suite (on Linux, where the batched socket paths
+# run), a dependency audit, and the Docker image started through its entrypoint.
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  check:
+    name: Format and lints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: $GITHUB_WORKSPACE/scripts/ci-run.sh cargo fmt --all --check
+      - run: $GITHUB_WORKSPACE/scripts/ci-run.sh cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: $GITHUB_WORKSPACE/scripts/ci-run.sh cargo test --workspace --locked --no-fail-fast
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked --version 0.22.2
+      - run: $GITHUB_WORKSPACE/scripts/ci-run.sh cargo audit --deny warnings
+
+  image:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build
+        run: docker build -t rtcd-rust .
+      - name: Start through the entrypoint and ask for the version
+        run: |
+          $GITHUB_WORKSPACE/scripts/ci-run.sh bash -c '
+            docker run -d --name rtcd -p 8045:8045 -e RTCD_ICE_HOST_OVERRIDE=127.0.0.1 rtcd-rust
+            curl --fail --retry 20 --retry-delay 1 --retry-connrefused --retry-all-errors http://127.0.0.1:8045/version \
+              || { docker ps -a; docker logs rtcd; exit 1; }
+            docker logs rtcd'

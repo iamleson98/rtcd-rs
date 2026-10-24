@@ -1,0 +1,44 @@
+# rtcd configuration template.
+#
+# Rendered by rtcd-entrypoint.sh into /tmp/rtcd/config.toml with values from
+# RTCD_* environment variables. Do NOT edit the placeholders — configure via
+# the container environment (deploy/k8s/base/rtcd/rtcd.yaml).
+#
+# Full option reference: rtcd/config/config.sample.toml
+
+[api.http]
+listen_address = "__RTCD_API_LISTEN__"
+
+[api.security]
+# The LMS server self-registers on first connect. Only safe because the API is
+# reachable exclusively inside the cluster network. To use fixed
+# credentials instead, set allow_self_registration to false and embed them in
+# MM_CALLSSETTINGS_RTCDSERVICEURL as http://clientID:authKey@rtcd:8045.
+allow_self_registration = __RTCD_ALLOW_SELF_REGISTRATION__
+enable_admin = __RTCD_ENABLE_ADMIN__
+__RTCD_ADMIN_SECRET_LINE__
+
+[rtc]
+# Media ports. Must match the ports published in host mode in the stack file.
+ice_port_udp = __RTCD_ICE_PORT_UDP__
+ice_port_tcp = __RTCD_ICE_PORT_TCP__
+
+# The video node's PUBLIC IP — advertised to browsers in ICE candidates.
+# On a cloud VM with a NATed public IP this MUST be set explicitly; leave
+# empty only when rtcd can discover its public IP via STUN.
+ice_host_override = "__RTCD_ICE_HOST_OVERRIDE__"
+
+# Used (a) by rtcd to discover its own public IP when ice_host_override is
+# empty and (b) as the default STUN handed to callers.
+ice_servers = [{urls = ["__RTCD_ICE_SERVERS__"]}]
+
+[store]
+# Registered client credentials persist here — keep /data on a volume so
+# restarting the SFU does not orphan the server registration.
+data_source = "__RTCD_DATA_SOURCE__"
+
+[logger]
+enable_console = true
+console_level = "__RTCD_LOG_LEVEL__"
+console_json = __RTCD_LOG_JSON__
+enable_file = false

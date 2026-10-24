@@ -1,0 +1,3 @@
+[submodule "vendor/rtc"]
+	path = vendor/rtc
+	url = https://github.com/iamleson98/rtc.git

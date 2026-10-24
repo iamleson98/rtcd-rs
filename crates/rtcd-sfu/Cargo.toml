@@ -1,0 +1,30 @@
+[package]
+name = "rtcd-sfu"
+description = "The rtcd media plane: sessions, calls, forwarding and negotiation on the sans-IO rtc crate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rtcd-proto = { path = "../rtcd-proto" }
+rtcd-net = { path = "../rtcd-net" }
+rtc = { path = "../../vendor/rtc" }
+bytes = "1.12.1"
+tracing = "0.1.44"
+thiserror = "2.0.21"
+slab = "0.4.12"
+serde_json = "1.0.154"
+rand = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+mio = { version = "1.2.4", features = ["net", "os-poll"] }
+foldhash = "0.2.0"
+
+[dev-dependencies]
+rtcd-proto = { path = "../rtcd-proto" }
+rtcd-testkit = { path = "../rtcd-testkit" }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

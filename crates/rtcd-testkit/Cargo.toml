@@ -1,0 +1,17 @@
+[package]
+name = "rtcd-testkit"
+description = "An emulated browser for testing rtcd over real sockets: a real rtc peer connection behaving like the lms-web call client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rtcd-proto = { path = "../rtcd-proto" }
+rtc = { path = "../../vendor/rtc" }
+bytes = "1"
+serde_json = "1"

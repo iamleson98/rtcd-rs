@@ -1,0 +1,18 @@
+[package]
+name = "rtcd-net"
+description = "Socket primitives for the rtcd media plane: batched UDP, RFC 4571 TCP framing, interface discovery and STUN"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = "1.12.1"
+libc = "0.2.191"
+nix = { version = "0.31.3", features = ["net"] }
+socket2 = { version = "0.6.5", features = ["all"] }
+thiserror = "2.0.21"

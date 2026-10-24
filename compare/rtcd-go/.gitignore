@@ -1,0 +1,26 @@
+# Binaries
+dist/
+
+# Editors/IDEs
+*.swp
+*.swo
+*.vim
+.vscode/
+~
+
+# Helm
+Chart.lock
+*.tgz
+
+# App Specific
+config/config.toml
+*.log
+.aider*
+
+# TLS test fixtures required by service/api tests. The repo-root .gitignore
+# ignores all testfiles/ dirs (Go convention for scratch dirs), so re-include
+# the fixtures explicitly.
+!testfiles/
+testfiles/*
+!testfiles/tls_test_cert.pem
+!testfiles/tls_test_key.pem

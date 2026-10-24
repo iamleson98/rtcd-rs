@@ -1,0 +1,14 @@
+{
+  "vectors": [
+    {
+      "hash": "$2a$10$sCCnghoPLIhB8W/8xEKMmOElXeGE1k9IF26jMwjZ9lvG7erYmTKhG",
+      "key": "0123456789abcdef0123456789abcdef",
+      "name": "0123456789abcdef0123456789abcdef"
+    },
+    {
+      "hash": "$2a$10$N1ytw2/ymNNqp3fAxjDWf.zfXOPDal.24.1DZ0c7n6VfFLa6Gw0Ba",
+      "key": "a-much-longer-key-0123456789abcdef-0123456789abcdef",
+      "name": "a-much-longer-key-0123456789abcdef-0123456789abcdef"
+    }
+  ]
+}

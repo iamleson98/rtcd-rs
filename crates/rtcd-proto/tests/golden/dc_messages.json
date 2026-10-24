@@ -1,0 +1,75 @@
+{
+  "vectors": [
+    {
+      "hex": "cc01",
+      "name": "ping",
+      "payload": null,
+      "type": 1
+    },
+    {
+      "hex": "cc02",
+      "name": "pong",
+      "payload": null,
+      "type": 2
+    },
+    {
+      "hex": "cc07",
+      "name": "lock_request",
+      "payload": null,
+      "type": 7
+    },
+    {
+      "hex": "cc07c3",
+      "name": "lock_true",
+      "payload": true,
+      "type": 7
+    },
+    {
+      "hex": "cc07c2",
+      "name": "lock_false",
+      "payload": false,
+      "type": 7
+    },
+    {
+      "hex": "cc08",
+      "name": "unlock",
+      "payload": null,
+      "type": 8
+    },
+    {
+      "hex": "cc04cb3f8999999999999a",
+      "name": "loss_rate",
+      "payload": 0.0125,
+      "type": 4
+    },
+    {
+      "hex": "cc05cb3fa5810624dd2f1b",
+      "name": "rtt",
+      "payload": 0.042,
+      "type": 5
+    },
+    {
+      "hex": "cc06cb3f689374bc6a7efa",
+      "name": "jitter",
+      "payload": 0.003,
+      "type": 6
+    },
+    {
+      "hex": "cc0981a13082a474797065a5766f696365a973656e6465725f6964a27331",
+      "name": "media_map",
+      "payload": {
+        "0": {
+          "sender_id": "s1",
+          "type": "voice"
+        }
+      },
+      "type": 9
+    },
+    {
+      "hex": "cc03c450789c004300bcff7b2274797065223a226f66666572222c22736470223a22763d305c725c6e6f3d2d2031203220494e20495034203132372e302e302e315c725c6e733d2d5c725c6e227d03009e3b1341",
+      "name": "sdp",
+      "payload": "{\"type\":\"offer\",\"sdp\":\"v=0\\r\\no=- 1 2 IN IP4 127.0.0.1\\r\\ns=-\\r\\n\"}",
+      "type": 3
+    }
+  ]
+}

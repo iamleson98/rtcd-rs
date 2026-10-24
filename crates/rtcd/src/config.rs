@@ -1,0 +1,849 @@
+//! Configuration, read from a TOML file and overridden by `RTCD_*` environment variables, with
+//! the same keys, defaults and checks as the Go rtcd so existing config files and deployments
+//! carry over unchanged.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use serde::Deserialize;
+
+/// Why the configuration could not be used.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("failed to read the config file {path}: {source}")]
+    Read {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("failed to decode the config file: {0}")]
+    Decode(#[from] toml::de::Error),
+    #[error("{var}: {message}")]
+    Env { var: String, message: String },
+    #[error("invalid {field} value: {message}")]
+    Invalid {
+        field: &'static str,
+        message: String,
+    },
+}
+
+fn invalid(field: &'static str, message: impl Into<String>) -> ConfigError {
+    ConfigError::Invalid {
+        field,
+        message: message.into(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+#[derive(Default)]
+pub struct Config {
+    pub api: ApiConfig,
+    pub rtc: RtcConfig,
+    pub store: StoreConfig,
+    pub logger: LoggerConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+#[derive(Default)]
+pub struct ApiConfig {
+    pub http: HttpConfig,
+    pub security: SecurityConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct HttpConfig {
+    pub listen_address: String,
+    pub tls: TlsConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct TlsConfig {
+    pub enable: bool,
+    pub cert_file: String,
+    pub cert_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+#[derive(Default)]
+pub struct SecurityConfig {
+    pub enable_admin: bool,
+    pub admin_secret_key: String,
+    pub allow_self_registration: bool,
+    pub session_cache: SessionCacheConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct SessionCacheConfig {
+    pub expiration_minutes: i64,
+}
+
+/// A STUN or TURN server, written either as a bare URL or as a table.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum IceServerEntry {
+    Url(String),
+    Full {
+        #[serde(default)]
+        urls: Vec<String>,
+        #[serde(default)]
+        username: String,
+        #[serde(default)]
+        credential: String,
+    },
+}
+
+/// A STUN or TURN server.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IceServer {
+    pub urls: Vec<String>,
+    pub username: String,
+    pub credential: String,
+}
+
+impl From<IceServerEntry> for IceServer {
+    fn from(e: IceServerEntry) -> Self {
+        match e {
+            IceServerEntry::Url(u) => Self {
+                urls: vec![u],
+                username: String::new(),
+                credential: String::new(),
+            },
+            IceServerEntry::Full {
+                urls,
+                username,
+                credential,
+            } => Self {
+                urls,
+                username,
+                credential,
+            },
+        }
+    }
+}
+
+impl IceServer {
+    pub fn is_stun(&self) -> bool {
+        !self.urls.is_empty()
+            && self
+                .urls
+                .iter()
+                .all(|u| u.starts_with("stun:") || u.starts_with("stuns:"))
+    }
+
+    pub fn is_turn(&self) -> bool {
+        !self.urls.is_empty()
+            && self
+                .urls
+                .iter()
+                .all(|u| u.starts_with("turn:") || u.starts_with("turns:"))
+    }
+}
+
+/// A port, written as a number or a string (a string may be a `local/port,...` map).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+enum PortOverride {
+    Number(i64),
+    Text(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct TurnConfig {
+    pub static_auth_secret: String,
+    pub credentials_expiration_minutes: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct RtcConfig {
+    pub ice_address_udp: String,
+    pub ice_port_udp: i64,
+    pub ice_address_tcp: String,
+    pub ice_port_tcp: i64,
+    pub ice_host_override: String,
+    #[serde(deserialize_with = "deserialize_port_override")]
+    pub ice_host_port_override: String,
+    #[serde(deserialize_with = "deserialize_ice_servers")]
+    pub ice_servers: Vec<IceServer>,
+    pub turn: TurnConfig,
+    pub enable_ipv6: bool,
+    /// Kept for compatibility with Go rtcd config files: the Go service opened hundreds of sockets
+    /// to ease lock contention, which this service has no use for.
+    pub udp_sockets_count: i64,
+    pub nack_buffer_size: i64,
+    /// Kept for compatibility: packets are always stored by value here, there is no unsafe mode.
+    pub nack_disable_copy: bool,
+    /// Threads serving calls; 0 picks the number the build supports (currently one).
+    pub shards: i64,
+    /// Seconds to let running sessions end on shutdown before ending them; 0 waits for them
+    /// without limit, as the Go service does (a second signal ends them at once).
+    pub drain_timeout_seconds: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct StoreConfig {
+    pub data_source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct LoggerConfig {
+    pub enable_console: bool,
+    pub console_json: bool,
+    pub console_level: String,
+    pub enable_file: bool,
+    pub file_json: bool,
+    pub file_level: String,
+    pub file_location: String,
+    pub enable_color: bool,
+}
+
+fn deserialize_port_override<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(match PortOverride::deserialize(d)? {
+        PortOverride::Number(n) => n.to_string(),
+        PortOverride::Text(s) => s,
+    })
+}
+
+fn deserialize_ice_servers<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<IceServer>, D::Error> {
+    Ok(Vec::<IceServerEntry>::deserialize(d)?
+        .into_iter()
+        .map(IceServer::from)
+        .collect())
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            listen_address: ":8045".into(),
+            tls: TlsConfig::default(),
+        }
+    }
+}
+
+impl Default for SessionCacheConfig {
+    fn default() -> Self {
+        Self {
+            expiration_minutes: 1440,
+        }
+    }
+}
+
+impl Default for TurnConfig {
+    fn default() -> Self {
+        Self {
+            static_auth_secret: String::new(),
+            credentials_expiration_minutes: 1440,
+        }
+    }
+}
+
+impl Default for RtcConfig {
+    fn default() -> Self {
+        Self {
+            ice_address_udp: String::new(),
+            ice_port_udp: 8443,
+            ice_address_tcp: String::new(),
+            ice_port_tcp: 8443,
+            ice_host_override: String::new(),
+            ice_host_port_override: String::new(),
+            ice_servers: Vec::new(),
+            turn: TurnConfig::default(),
+            enable_ipv6: false,
+            udp_sockets_count: 0,
+            nack_buffer_size: 256,
+            nack_disable_copy: true,
+            shards: 0,
+            drain_timeout_seconds: 0,
+        }
+    }
+}
+
+impl Default for StoreConfig {
+    fn default() -> Self {
+        Self {
+            data_source: "/tmp/rtcd_db".into(),
+        }
+    }
+}
+
+impl Default for LoggerConfig {
+    fn default() -> Self {
+        Self {
+            enable_console: true,
+            console_json: false,
+            console_level: "INFO".into(),
+            enable_file: true,
+            file_json: true,
+            file_level: "DEBUG".into(),
+            file_location: "rtcd.log".into(),
+            enable_color: false,
+        }
+    }
+}
+
+const LEVELS: [&str; 5] = ["debug", "info", "warn", "error", "critical"];
+
+impl Config {
+    /// Reads `path` if it exists (a missing file means defaults), then applies the environment.
+    pub fn load(path: &Path, env: &BTreeMap<String, String>) -> Result<Self, ConfigError> {
+        let mut cfg = match std::fs::read_to_string(path) {
+            Ok(text) => Self::from_toml(&text)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: path.display().to_string(),
+                    source,
+                });
+            }
+        };
+        cfg.apply_env(env)?;
+        Ok(cfg)
+    }
+
+    pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
+        Ok(toml::from_str(text)?)
+    }
+
+    /// Applies `RTCD_*` overrides. The names are the Go struct field names in upper case joined by
+    /// underscores (`RTCD_RTC_ICEPORTUDP`), as the Go service's `envconfig` derives them.
+    pub fn apply_env(&mut self, env: &BTreeMap<String, String>) -> Result<(), ConfigError> {
+        let get = |name: &str| env.get(&format!("RTCD_{name}")).map(String::as_str);
+        let var = |name: &str| format!("RTCD_{name}");
+        macro_rules! text {
+            ($name:literal, $field:expr) => {
+                if let Some(v) = get($name) {
+                    $field = v.to_owned();
+                }
+            };
+        }
+        macro_rules! boolean {
+            ($name:literal, $field:expr) => {
+                if let Some(v) = get($name) {
+                    $field = parse_bool(v).ok_or_else(|| ConfigError::Env {
+                        var: var($name),
+                        message: format!("{v:?} is not a boolean"),
+                    })?;
+                }
+            };
+        }
+        macro_rules! integer {
+            ($name:literal, $field:expr) => {
+                if let Some(v) = get($name) {
+                    $field = v.trim().parse().map_err(|_| ConfigError::Env {
+                        var: var($name),
+                        message: format!("{v:?} is not an integer"),
+                    })?;
+                }
+            };
+        }
+        text!("API_HTTP_LISTENADDRESS", self.api.http.listen_address);
+        boolean!("API_HTTP_TLS_ENABLE", self.api.http.tls.enable);
+        text!("API_HTTP_TLS_CERTFILE", self.api.http.tls.cert_file);
+        text!("API_HTTP_TLS_CERTKEY", self.api.http.tls.cert_key);
+        boolean!("API_SECURITY_ENABLEADMIN", self.api.security.enable_admin);
+        text!(
+            "API_SECURITY_ADMINSECRETKEY",
+            self.api.security.admin_secret_key
+        );
+        boolean!(
+            "API_SECURITY_ALLOWSELFREGISTRATION",
+            self.api.security.allow_self_registration
+        );
+        integer!(
+            "API_SECURITY_SESSIONCACHE_EXPIRATIONMINUTES",
+            self.api.security.session_cache.expiration_minutes
+        );
+        text!("RTC_ICEADDRESSUDP", self.rtc.ice_address_udp);
+        integer!("RTC_ICEPORTUDP", self.rtc.ice_port_udp);
+        text!("RTC_ICEADDRESSTCP", self.rtc.ice_address_tcp);
+        integer!("RTC_ICEPORTTCP", self.rtc.ice_port_tcp);
+        text!("RTC_ICEHOSTOVERRIDE", self.rtc.ice_host_override);
+        text!("RTC_ICEHOSTPORTOVERRIDE", self.rtc.ice_host_port_override);
+        if let Some(v) = get("RTC_ICESERVERS") {
+            self.rtc.ice_servers = parse_ice_servers(v).map_err(|message| ConfigError::Env {
+                var: var("RTC_ICESERVERS"),
+                message,
+            })?;
+        }
+        text!(
+            "RTC_TURNCONFIG_STATICAUTHSECRET",
+            self.rtc.turn.static_auth_secret
+        );
+        integer!(
+            "RTC_TURNCONFIG_CREDENTIALSEXPIRATIONMINUTES",
+            self.rtc.turn.credentials_expiration_minutes
+        );
+        boolean!("RTC_ENABLEIPV6", self.rtc.enable_ipv6);
+        integer!("RTC_UDPSOCKETSCOUNT", self.rtc.udp_sockets_count);
+        integer!("RTC_NACKBUFFERSIZE", self.rtc.nack_buffer_size);
+        boolean!("RTC_NACKDISABLECOPY", self.rtc.nack_disable_copy);
+        integer!("RTC_SHARDS", self.rtc.shards);
+        integer!("RTC_DRAINTIMEOUTSECONDS", self.rtc.drain_timeout_seconds);
+        text!("STORE_DATASOURCE", self.store.data_source);
+        boolean!("LOGGER_ENABLECONSOLE", self.logger.enable_console);
+        boolean!("LOGGER_CONSOLEJSON", self.logger.console_json);
+        text!("LOGGER_CONSOLELEVEL", self.logger.console_level);
+        boolean!("LOGGER_ENABLEFILE", self.logger.enable_file);
+        boolean!("LOGGER_FILEJSON", self.logger.file_json);
+        text!("LOGGER_FILELEVEL", self.logger.file_level);
+        text!("LOGGER_FILELOCATION", self.logger.file_location);
+        boolean!("LOGGER_ENABLECOLOR", self.logger.enable_color);
+        Ok(())
+    }
+
+    /// The checks of the Go service, in its order and wording.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let sec = &self.api.security;
+        if sec.enable_admin && sec.admin_secret_key.is_empty() {
+            return Err(invalid("AdminSecretKey", "should not be empty"));
+        }
+        if self.api.http.listen_address.is_empty() {
+            return Err(invalid("ListenAddress", "should not be empty"));
+        }
+        let tls = &self.api.http.tls;
+        if tls.enable {
+            if tls.cert_file.is_empty() {
+                return Err(invalid("CertFile", "should not be empty"));
+            }
+            if tls.cert_key.is_empty() {
+                return Err(invalid("CertKey", "should not be empty"));
+            }
+        }
+        if sec.session_cache.expiration_minutes <= 0 {
+            return Err(invalid("ExpirationMinutes", "should be a positive number"));
+        }
+        let rtc = &self.rtc;
+        for (field, list) in [
+            ("ICEAddressUDP", &rtc.ice_address_udp),
+            ("ICEAddressTCP", &rtc.ice_address_tcp),
+        ] {
+            for addr in split_list(list) {
+                if addr.parse::<std::net::IpAddr>().is_err() {
+                    return Err(invalid(field, format!("{addr} is not a valid IP address")));
+                }
+            }
+        }
+        for (field, port) in [
+            ("ICEPortUDP", rtc.ice_port_udp),
+            ("ICEPortTCP", rtc.ice_port_tcp),
+        ] {
+            if !(80..=49151).contains(&port) {
+                return Err(invalid(
+                    field,
+                    format!("{port} is not in allowed range [80, 49151]"),
+                ));
+            }
+        }
+        for s in &rtc.ice_servers {
+            if s.urls.is_empty() {
+                return Err(invalid("ICEServers", "invalid empty URLs"));
+            }
+            if s.urls.iter().any(String::is_empty) {
+                return Err(invalid("ICEServers", "invalid empty URL"));
+            }
+            if !s.is_stun() && !s.is_turn() {
+                return Err(invalid("ICEServers", "URL is not a valid STUN/TURN server"));
+            }
+        }
+        if !rtc.turn.static_auth_secret.is_empty() {
+            let m = rtc.turn.credentials_expiration_minutes;
+            if m <= 0 {
+                return Err(invalid(
+                    "CredentialsExpirationMinutes",
+                    "should be a positive number",
+                ));
+            }
+            if m >= rtcd_proto::turn::MAX_EXPIRATION_MINUTES {
+                return Err(invalid(
+                    "CredentialsExpirationMinutes",
+                    "should be less than 1 week",
+                ));
+            }
+        }
+        self.host_port_override()?;
+        let n = rtc.nack_buffer_size;
+        if n != 0 {
+            if n < 32 {
+                return Err(invalid("NACKBufferSize", "should be at least 32"));
+            }
+            if n > 8192 {
+                return Err(invalid("NACKBufferSize", "should not exceed 8192"));
+            }
+            if n & (n - 1) != 0 {
+                return Err(invalid(
+                    "NACKBufferSize",
+                    "must be a power of 2 (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)",
+                ));
+            }
+        }
+        if rtc.shards < 0 || rtc.shards > 256 {
+            return Err(invalid("Shards", "must be between 0 and 256"));
+        }
+        if rtc.drain_timeout_seconds < 0 {
+            return Err(invalid("DrainTimeoutSeconds", "should not be negative"));
+        }
+        if self.store.data_source.is_empty() {
+            return Err(invalid("DataSource", "should not be empty"));
+        }
+        let lg = &self.logger;
+        if !lg.enable_console && !lg.enable_file {
+            return Err(ConfigError::Invalid {
+                field: "logger",
+                message: "should enable at least one logging target".into(),
+            });
+        }
+        let known = |l: &str| LEVELS.contains(&l.to_ascii_lowercase().as_str());
+        if lg.enable_console && !known(&lg.console_level) {
+            return Err(invalid("ConsoleLevel", format!("{:?}", lg.console_level)));
+        }
+        if lg.enable_file && !known(&lg.file_level) {
+            return Err(invalid("FileLevel", format!("{:?}", lg.file_level)));
+        }
+        if lg.enable_file && lg.file_location.is_empty() {
+            return Err(invalid("FileLocation", "should not be empty"));
+        }
+        Ok(())
+    }
+
+    /// The parsed `ice_host_port_override`: a single port, or a map of local address to port.
+    pub fn host_port_override(&self) -> Result<HostPortOverride, ConfigError> {
+        HostPortOverride::parse(&self.rtc.ice_host_port_override)
+            .map_err(|m| invalid("ICEHostPortOverride", m))
+    }
+}
+
+/// The advertised port of host candidates, when it differs from the one listened on.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum HostPortOverride {
+    #[default]
+    None,
+    /// One port for every address.
+    Single(u16),
+    /// A port per local address.
+    Map(BTreeMap<String, u16>),
+}
+
+impl HostPortOverride {
+    fn parse(s: &str) -> Result<Self, String> {
+        if s.is_empty() {
+            return Ok(Self::None);
+        }
+        if let Ok(port) = s.parse::<u32>() {
+            if !(80..=49151).contains(&port) {
+                return Err(format!("{port} is not in allowed range [80, 49151]"));
+            }
+            return Ok(Self::Single(port as u16));
+        }
+        let mut map = BTreeMap::new();
+        let mut ports = std::collections::BTreeSet::new();
+        for pair in s.split(',') {
+            let (addr, port) = pair
+                .split_once('/')
+                .filter(|(_, p)| !p.contains('/'))
+                .ok_or("failed to parse mapping: invalid map pairing syntax")?;
+            let port: u16 = port.parse().map_err(|e| {
+                format!("failed to parse mapping: failed to parse port number: {e}")
+            })?;
+            if map.insert(addr.to_owned(), port).is_some() {
+                return Err(format!(
+                    "failed to parse mapping: duplicate mapping found for {addr}"
+                ));
+            }
+            if !ports.insert(port) {
+                return Err(format!(
+                    "failed to parse mapping: duplicate port found for {port}"
+                ));
+            }
+        }
+        Ok(Self::Map(map))
+    }
+
+    /// The port to advertise for a local address, if overridden.
+    pub fn port_for(&self, local: &std::net::IpAddr) -> Option<u16> {
+        match self {
+            Self::None => None,
+            Self::Single(p) => Some(*p),
+            Self::Map(m) => m.get(&local.to_string()).copied(),
+        }
+    }
+}
+
+/// Comma separated list entries, trimmed.
+pub fn split_list(s: &str) -> Vec<&str> {
+    if s.is_empty() {
+        Vec::new()
+    } else {
+        s.split(',').map(str::trim).collect()
+    }
+}
+
+/// Go's `strconv.ParseBool`.
+fn parse_bool(s: &str) -> Option<bool> {
+    match s {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Some(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Some(false),
+        _ => None,
+    }
+}
+
+/// `RTCD_RTC_ICESERVERS`: a JSON array of URLs or of server objects.
+fn parse_ice_servers(value: &str) -> Result<Vec<IceServer>, String> {
+    if let Ok(urls) = serde_json::from_str::<Vec<String>>(value) {
+        return Ok(vec![IceServer {
+            urls,
+            username: String::new(),
+            credential: String::new(),
+        }]);
+    }
+    #[derive(Deserialize)]
+    struct Obj {
+        #[serde(default)]
+        urls: Vec<String>,
+        #[serde(default)]
+        username: String,
+        #[serde(default)]
+        credential: String,
+    }
+    serde_json::from_str::<Vec<Obj>>(value)
+        .map(|v| {
+            v.into_iter()
+                .map(|o| IceServer {
+                    urls: o.urls,
+                    username: o.username,
+                    credential: o.credential,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn defaults_are_the_go_defaults_and_valid() {
+        let c = Config::default();
+        assert_eq!(c.api.http.listen_address, ":8045");
+        assert_eq!((c.rtc.ice_port_udp, c.rtc.ice_port_tcp), (8443, 8443));
+        assert_eq!(c.rtc.nack_buffer_size, 256);
+        assert_eq!(c.store.data_source, "/tmp/rtcd_db");
+        assert_eq!(c.api.security.session_cache.expiration_minutes, 1440);
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn the_sample_config_of_the_go_service_parses() {
+        let c = Config::from_toml(include_str!("../tests/data/config.sample.toml")).unwrap();
+        assert_eq!(c.api.http.listen_address, ":8045");
+        assert!(!c.api.security.allow_self_registration);
+        assert_eq!(c.rtc.ice_port_udp, 8443);
+        assert!(c.rtc.ice_servers.is_empty());
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn the_config_the_docker_entrypoint_renders_parses() {
+        let c = Config::from_toml(
+            r#"
+[api.http]
+listen_address = ":8045"
+
+[api.security]
+allow_self_registration = true
+enable_admin = false
+
+[rtc]
+ice_port_udp = 8443
+ice_port_tcp = 8443
+ice_host_override = "203.0.113.9"
+ice_servers = [{urls = ["stun:stun.l.google.com:19302"]}]
+
+[store]
+data_source = "/data/rtcd_db"
+
+[logger]
+enable_console = true
+console_level = "INFO"
+console_json = true
+enable_file = false
+"#,
+        )
+        .unwrap();
+        c.validate().unwrap();
+        assert!(c.api.security.allow_self_registration);
+        assert_eq!(c.rtc.ice_host_override, "203.0.113.9");
+        assert_eq!(
+            c.rtc.ice_servers[0].urls,
+            vec!["stun:stun.l.google.com:19302"]
+        );
+        assert!(c.rtc.ice_servers[0].is_stun());
+        assert!(!c.logger.enable_file);
+    }
+
+    #[test]
+    fn ice_servers_may_be_bare_urls_or_tables() {
+        let c = Config::from_toml(
+            r#"[rtc]
+ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credential = "p"}]"#,
+        )
+        .unwrap();
+        assert_eq!(c.rtc.ice_servers.len(), 2);
+        assert!(c.rtc.ice_servers[0].is_stun());
+        assert!(c.rtc.ice_servers[1].is_turn());
+        assert_eq!(c.rtc.ice_servers[1].username, "u");
+    }
+
+    #[test]
+    fn a_host_port_override_may_be_a_number_or_a_map() {
+        let n = Config::from_toml("[rtc]\nice_host_port_override = 30443").unwrap();
+        assert_eq!(
+            n.host_port_override().unwrap(),
+            HostPortOverride::Single(30443)
+        );
+        let m =
+            Config::from_toml("[rtc]\nice_host_port_override = \"10.0.0.1/8443,10.0.0.2/8444\"")
+                .unwrap();
+        let o = m.host_port_override().unwrap();
+        assert_eq!(o.port_for(&"10.0.0.2".parse().unwrap()), Some(8444));
+        assert_eq!(o.port_for(&"10.0.0.3".parse().unwrap()), None);
+        for bad in ["10.0.0.1/8443,10.0.0.1/8444", "a/1,b/1", "nonsense", "79"] {
+            let c =
+                Config::from_toml(&format!("[rtc]\nice_host_port_override = \"{bad}\"")).unwrap();
+            assert!(c.host_port_override().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn environment_overrides_use_the_go_names() {
+        let mut c = Config::default();
+        c.apply_env(&env(&[
+            ("RTCD_API_SECURITY_ALLOWSELFREGISTRATION", "true"),
+            ("RTCD_RTC_ICEPORTUDP", "30000"),
+            ("RTCD_STORE_DATASOURCE", "/data/db"),
+            ("RTCD_LOGGER_ENABLEFILE", "false"),
+            ("RTCD_LOGGER_CONSOLEJSON", "1"),
+            ("RTCD_RTC_ICESERVERS", r#"["stun:x:3478"]"#),
+            ("RTCD_RTC_TURNCONFIG_STATICAUTHSECRET", "s3cret"),
+            ("UNRELATED", "x"),
+        ]))
+        .unwrap();
+        assert!(c.api.security.allow_self_registration);
+        assert_eq!(c.rtc.ice_port_udp, 30000);
+        assert_eq!(c.store.data_source, "/data/db");
+        assert!(!c.logger.enable_file);
+        assert!(c.logger.console_json);
+        assert_eq!(c.rtc.ice_servers[0].urls, vec!["stun:x:3478"]);
+        assert_eq!(c.rtc.turn.static_auth_secret, "s3cret");
+    }
+
+    #[test]
+    fn ice_servers_in_the_environment_may_be_objects() {
+        let mut c = Config::default();
+        c.apply_env(&env(&[(
+            "RTCD_RTC_ICESERVERS",
+            r#"[{"urls":["turn:t:3478"],"username":"a","credential":"b"}]"#,
+        )]))
+        .unwrap();
+        assert!(c.rtc.ice_servers[0].is_turn());
+        assert_eq!(c.rtc.ice_servers[0].credential, "b");
+    }
+
+    #[test]
+    fn a_malformed_override_names_its_variable() {
+        let mut c = Config::default();
+        let err = c
+            .apply_env(&env(&[("RTCD_RTC_ICEPORTUDP", "eighty")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("RTCD_RTC_ICEPORTUDP"), "{err}");
+        let err = c
+            .apply_env(&env(&[("RTCD_API_HTTP_TLS_ENABLE", "maybe")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("RTCD_API_HTTP_TLS_ENABLE"), "{err}");
+    }
+
+    #[test]
+    fn validation_catches_what_the_go_service_catches() {
+        let bad = |edit: &dyn Fn(&mut Config)| {
+            let mut c = Config::default();
+            edit(&mut c);
+            c.validate().unwrap_err().to_string()
+        };
+        assert!(bad(&|c| c.api.security.enable_admin = true).contains("AdminSecretKey"));
+        assert!(bad(&|c| c.api.http.listen_address.clear()).contains("ListenAddress"));
+        assert!(bad(&|c| c.api.http.tls.enable = true).contains("CertFile"));
+        assert!(bad(&|c| c.rtc.ice_port_udp = 79).contains("[80, 49151]"));
+        assert!(bad(&|c| c.rtc.ice_port_tcp = 49152).contains("ICEPortTCP"));
+        assert!(bad(&|c| c.rtc.ice_address_udp = "not-an-ip".into()).contains("ICEAddressUDP"));
+        assert!(bad(&|c| c.rtc.nack_buffer_size = 100).contains("power of 2"));
+        assert!(bad(&|c| c.rtc.nack_buffer_size = 16).contains("at least 32"));
+        assert!(bad(&|c| c.rtc.nack_buffer_size = 16384).contains("exceed 8192"));
+        assert!(
+            bad(&|c| c.rtc.ice_servers = vec![IceServer {
+                urls: vec!["http://x".into()],
+                username: String::new(),
+                credential: String::new()
+            }])
+            .contains("STUN/TURN")
+        );
+        assert!(
+            bad(&|c| {
+                c.rtc.turn.static_auth_secret = "s".into();
+                c.rtc.turn.credentials_expiration_minutes = 0;
+            })
+            .contains("CredentialsExpirationMinutes")
+        );
+        assert!(bad(&|c| c.logger.console_level = "loud".into()).contains("ConsoleLevel"));
+        assert!(
+            bad(&|c| {
+                c.logger.enable_console = false;
+                c.logger.enable_file = false;
+            })
+            .contains("at least one logging target")
+        );
+        assert!(bad(&|c| c.store.data_source.clear()).contains("DataSource"));
+    }
+
+    #[test]
+    fn a_missing_file_means_defaults_and_a_present_one_is_overridden_by_the_environment() {
+        let dir = std::env::temp_dir().join(format!("rtcd-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = Config::load(&dir.join("absent.toml"), &env(&[])).unwrap();
+        assert_eq!(missing, Config::default());
+        let file = dir.join("c.toml");
+        std::fs::write(&file, "[rtc]\nice_port_udp = 9000\nice_port_tcp = 9001\n").unwrap();
+        let c = Config::load(&file, &env(&[("RTCD_RTC_ICEPORTTCP", "9002")])).unwrap();
+        assert_eq!((c.rtc.ice_port_udp, c.rtc.ice_port_tcp), (9000, 9002));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn go_parse_bool_spellings() {
+        for t in ["1", "t", "T", "TRUE", "true", "True"] {
+            assert_eq!(parse_bool(t), Some(true));
+        }
+        for f in ["0", "f", "F", "FALSE", "false", "False"] {
+            assert_eq!(parse_bool(f), Some(false));
+        }
+        assert_eq!(parse_bool("yes"), None);
+    }
+}

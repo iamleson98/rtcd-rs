@@ -1,0 +1,12 @@
+{
+  "vectors": [
+    {
+      "json": "{\"GroupID\":\"g\",\"CallID\":\"c\",\"UserID\":\"u\",\"SessionID\":\"s\",\"Props\":{\"av1Support\":false,\"channelID\":\"ch\",\"dcSignaling\":true}}",
+      "name": "one"
+    },
+    {
+      "json": "[{\"GroupID\":\"g\",\"CallID\":\"c\",\"UserID\":\"u\",\"SessionID\":\"s\",\"Props\":{\"av1Support\":false,\"channelID\":\"ch\",\"dcSignaling\":true}},{\"GroupID\":\"g\",\"CallID\":\"c\",\"UserID\":\"u2\",\"SessionID\":\"s2\",\"Props\":null}]",
+      "name": "many"
+    }
+  ]
+}
