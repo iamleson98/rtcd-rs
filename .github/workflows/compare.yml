@@ -51,15 +51,20 @@ jobs:
         env:
           PROFILE: '1'
         run: compare/run-suite.sh ${{ matrix.server }} results/${{ matrix.os }}-${{ matrix.server }}
-      # Only the text results: the profiler runs as root and leaves files the zip step cannot read.
-      - name: Make the results readable
-        if: always() && runner.os == 'Linux'
-        run: sudo chown -R "$(id -u):$(id -g)" results || true
+      # One tarball of the text results: the profiler runs as root, and a tree with files the
+      # runner cannot read fails the zip step of upload-artifact. tar runs as root too.
+      - name: Pack the results
+        if: always()
+        run: |
+          ls -laR results | head -60
+          sudo tar -czf pack.tgz --exclude='*.data*' --exclude='rtcd' -C results . || true
+          sudo chown "$(id -u):$(id -g)" pack.tgz || true
+          ls -la pack.tgz
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: results-${{ matrix.os }}-${{ matrix.server }}
-          path: results/*/*.txt
+          path: pack.tgz
 
   report:
     name: Compare
@@ -71,8 +76,12 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: results-*
-          path: results
-          merge-multiple: true
+          path: packs
+      - name: Unpack the results
+        run: |
+          mkdir results
+          for pack in packs/*/pack.tgz; do tar -xzf "$pack" -C results; done
+          ls results
       - name: Compare the results
         run: $GITHUB_WORKSPACE/scripts/ci-run.sh python3 compare/report.py results
       - uses: actions/upload-artifact@v4
