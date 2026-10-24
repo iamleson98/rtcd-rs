@@ -61,7 +61,7 @@ packets almost nothing takes the detour (`rtcd_net_forwarded_packets_total` show
   start.
 - Its instances are found by the server's DNS discovery like the Go ones, and `GET /system` lets the
   server put new calls on the lighter instance.
-- The web client, the server's `custom_calls_*` actions and the session recorder need no change.
+- The web client and the server's `custom_calls_*` actions need no change (tested in Chrome, Firefox and Safari). The session recorder is a pion client like the ones in the interop tests, but has not been run against it yet.
 
 ## Layout
 
