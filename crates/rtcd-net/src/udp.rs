@@ -134,7 +134,8 @@ fn recv_into(fd: RawFd, batch: &mut RecvBatch) -> io::Result<usize> {
                 fd,
                 hdrs.as_mut_ptr(),
                 slots as u32,
-                libc::MSG_DONTWAIT,
+                // glibc takes a `c_int`, musl a `c_uint`.
+                libc::MSG_DONTWAIT as _,
                 std::ptr::null_mut(),
             );
             if n >= 0 {

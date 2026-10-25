@@ -61,7 +61,7 @@ packets almost nothing takes the detour (`rtcd_net_forwarded_packets_total` show
   start.
 - Its instances are found by the server's DNS discovery like the Go ones, and `GET /system` lets the
   server put new calls on the lighter instance.
-- The web client and the server's `custom_calls_*` actions need no change (tested in Chrome, Firefox and Safari). The session recorder is a pion client like the ones in the interop tests, but has not been run against it yet.
+- The web client and the server's `custom_calls_*` actions need no change (tested in Chrome, Firefox and Safari). The session recorder is a crate of this workspace too (below).
 
 ## Layout
 
@@ -71,9 +71,11 @@ crates/rtcd-net     batched UDP (recvmmsg/sendmmsg/GSO on Linux), RFC 4571 frami
 crates/rtcd-sfu     the engine (one per shard thread, no locks) and the runtime around real sockets
 crates/rtcd         the service: config, auth, store, HTTP and websocket API, TLS, metrics, logging
 crates/rtcd-testkit an emulated browser used by the engine tests
+crates/recorder     the LMS session recorder: joins a class call as a bot and writes it as WebM files and a board log
+crates/lms-sim      a stand-in LMS around a real rtcd with synthetic participants, to test and measure the recorder
 vendor/rtc          the WebRTC stack, pinned (git submodule)
 compat/golden       regenerates the golden vectors from the Go sources
-deploy/             the entrypoint and config template the image uses
+deploy/             the entrypoint and config template the image uses; recorder.Dockerfile
 ```
 
 ## Build, test, run
@@ -97,6 +99,15 @@ docker run --rm -p 8045:8045 -p 8443:8443/udp -p 8443:8443 \
 dependency audit, and the Docker image started through its entrypoint. `image.yml` publishes
 `ghcr.io/<owner>/rtcd-rust` on a version tag. The Go-versus-Rust comparison runs in the webrtc
 repository.
+
+## The session recorder
+
+`crates/recorder` replaces the Go recorder of the LMS (one short-lived job per recording: it joins the
+call listen-only and writes every voice, camera and screen share as WebM, with no re-encoding, and the
+whiteboard as a log). Same environment, endpoints, manifest and log shape; `deploy/recorder.Dockerfile`
+builds a static image on `scratch`. It uses about a quarter of the Go recorder's CPU and a fifth of its
+memory; see [crates/recorder/README.md](crates/recorder/README.md) for the numbers, the method
+(`scripts/bench-recorder.py`) and what differs.
 
 ## Not done yet
 

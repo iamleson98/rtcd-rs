@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rtcd-proto", "crates/rtcd-net", "crates/rtcd-sfu", "crates/rtcd", "crates/rtcd-testkit"]
+members = ["crates/rtcd-proto", "crates/rtcd-net", "crates/rtcd-sfu", "crates/rtcd", "crates/rtcd-testkit", "crates/recorder", "crates/lms-sim"]
 exclude = ["vendor"]
 
 [workspace.package]

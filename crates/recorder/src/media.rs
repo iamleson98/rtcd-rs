@@ -1,0 +1,838 @@
+//! The media of a recording.
+//!
+//! Every stream the SFU forwards to the recorder is written as it arrives, without decoding or
+//! re-encoding, into WebM files the browser plays directly (VP8 video, Opus audio). A file is one
+//! stretch of continuous media from one person: a camera from when it is turned on until it is
+//! turned off, a voice while it is unmuted. Each starts at its own offset into the recording, so
+//! the player lines them up again.
+
+use std::collections::HashMap;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use rtc::rtp::packet::Packet;
+use serde::Serialize;
+use tracing::{error, warn};
+
+use crate::disk::Disk;
+use crate::reorder::{Item, Reorder};
+use crate::vp8;
+use crate::webm::{Track, WebmWriter};
+
+/// Media that stops this long (a muted microphone, a camera turned off, a dropped connection)
+/// closes its file; the next frame opens a new one. Shorter gaps are bridged (audio with
+/// silence), so a file plays as one continuous stream.
+pub const SEGMENT_GAP: Duration = Duration::from_secs(2);
+/// Each recorded camera and screen is asked for a keyframe this often: a seek decodes from the
+/// keyframe before the target, and browsers otherwise send one only every few minutes.
+pub const KEYFRAME_EVERY: Duration = Duration::from_secs(20);
+/// While a file waits for its first keyframe, or after a loss, the sender is asked this often.
+const KEYFRAME_RETRY: Duration = Duration::from_secs(1);
+/// How long a missing video packet is waited for (the sender's answer to a NACK), and how many
+/// packets are held behind the gap: a keyframe is dozens of packets, a voice frame one.
+const VIDEO_WAIT: Duration = Duration::from_millis(300);
+const VIDEO_HELD: usize = 256;
+const AUDIO_WAIT: Duration = Duration::from_millis(120);
+const AUDIO_HELD: usize = 32;
+
+/// Kinds of recorded files (the manifest's vocabulary, shared with the server and the player).
+pub const VOICE: &str = "voice";
+pub const CAMERA: &str = "camera";
+pub const SCREEN: &str = "screen";
+pub const SCREEN_AUDIO: &str = "screen_audio";
+pub const BOARD: &str = "board";
+
+/// Maps the SFU's track ids (`<type>_<session>_<random>`) to a kind.
+pub fn track_kind(track_id: &str) -> Option<&'static str> {
+    match track_id.split_once('_')?.0 {
+        "voice" => Some(VOICE),
+        "video" => Some(CAMERA),
+        "screen" => Some(SCREEN),
+        "screen-audio" => Some(SCREEN_AUDIO),
+        _ => None,
+    }
+}
+
+fn skip_zero(v: &u32) -> bool {
+    *v == 0
+}
+
+/// One file of the recording, as the manifest lists it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Entry {
+    pub kind: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub session_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub user_id: String,
+    /// Place the file on the recording's timeline.
+    pub start_ms: i64,
+    pub end_ms: i64,
+    #[serde(skip_serializing_if = "skip_zero")]
+    pub width: u32,
+    #[serde(skip_serializing_if = "skip_zero")]
+    pub height: u32,
+    pub size: u64,
+    #[serde(skip)]
+    pub path: PathBuf,
+}
+
+/// A recording's files while it runs.
+#[derive(Debug)]
+pub struct Recording {
+    dir: PathBuf,
+    start: Instant,
+    pub disk: Disk,
+    files: Mutex<Vec<Entry>>,
+    next: AtomicU32,
+}
+
+impl Recording {
+    pub fn new(dir: &Path, start: Instant, limit: u64) -> Self {
+        Self {
+            dir: dir.to_owned(),
+            start,
+            disk: Disk::new(limit),
+            files: Mutex::new(Vec::new()),
+            next: AtomicU32::new(0),
+        }
+    }
+
+    /// A moment's offset into the recording, in milliseconds.
+    pub fn at(&self, t: Instant) -> i64 {
+        t.saturating_duration_since(self.start).as_millis() as i64
+    }
+
+    pub fn start(&self) -> Instant {
+        self.start
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn new_path(&self, kind: &str) -> PathBuf {
+        let n = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+        self.dir.join(format!("{n:05}-{kind}.webm"))
+    }
+
+    fn add(&self, e: Entry) {
+        self.files.lock().unwrap_or_else(|p| p.into_inner()).push(e);
+    }
+
+    /// The files finished so far.
+    pub fn files(&self) -> Vec<Entry> {
+        self.files.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
+/// Maps call sessions to their users (`call_state`, `user_joined`). A file looks its user up when
+/// it is opened, not when its track appears: the server may say who a session is a moment later.
+pub type Users = Arc<Mutex<HashMap<String, String>>>;
+
+/// What a stream is.
+#[derive(Debug, Clone)]
+pub struct StreamInfo {
+    pub kind: &'static str,
+    pub session_id: String,
+    pub video: bool,
+}
+
+struct Segment {
+    entry: Entry,
+    writer: WebmWriter,
+    /// The last frame's RTP timestamp, and its time unwrapped, relative to the first.
+    prev_ts: u32,
+    ext: i64,
+    /// The last frame's time (ms into the file), how long a video frame lasts (the gap between
+    /// the last two) and the end of the file's span.
+    last_ms: i64,
+    frame_ms: i64,
+    end_ms: i64,
+}
+
+/// A stream being written.
+pub struct StreamRecorder {
+    info: StreamInfo,
+    rec: Arc<Recording>,
+    users: Users,
+    reorder: Reorder,
+    assembler: vp8::Assembler,
+    seg: Option<Segment>,
+    /// When a packet last arrived, and when the stream last delivered a frame (written or not).
+    last_packet: Option<Instant>,
+    last_media: Option<Instant>,
+    /// A video frame went missing: nothing is written until the next keyframe.
+    need_key: bool,
+    last_ask: Option<Instant>,
+    /// Frames and packets lost, for the log at the end.
+    pub lost: u64,
+}
+
+impl std::fmt::Debug for StreamRecorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamRecorder")
+            .field("info", &self.info)
+            .finish_non_exhaustive()
+    }
+}
+
+const OPUS_SILENCE: [u8; 3] = [0xf8, 0xff, 0xfe];
+const OPUS_FRAME_MS: i64 = 20;
+
+impl StreamRecorder {
+    pub fn new(info: StreamInfo, rec: Arc<Recording>, users: Users) -> Self {
+        let (wait, held) = if info.video {
+            (VIDEO_WAIT, VIDEO_HELD)
+        } else {
+            (AUDIO_WAIT, AUDIO_HELD)
+        };
+        Self {
+            info,
+            rec,
+            users,
+            reorder: Reorder::new(wait, held),
+            assembler: vp8::Assembler::new(),
+            seg: None,
+            last_packet: None,
+            last_media: None,
+            need_key: false,
+            last_ask: None,
+            lost: 0,
+        }
+    }
+
+    pub fn info(&self) -> &StreamInfo {
+        &self.info
+    }
+
+    /// Takes a packet that arrived now. Returns whether the sender should be asked for a keyframe.
+    pub fn packet(&mut self, now: Instant, p: Packet) -> bool {
+        self.last_packet = Some(now);
+        self.reorder.push(now, p);
+        self.drain(now, now);
+        self.want_keyframe(now)
+    }
+
+    /// Upkeep: gives up gaps that were waited for, closes idle files, and says whether a keyframe
+    /// should be asked for.
+    pub fn tick(&mut self, now: Instant) -> bool {
+        self.drain(now, now);
+        if self.seg.is_some()
+            && self
+                .last_media
+                .is_some_and(|m| now.saturating_duration_since(m) > SEGMENT_GAP)
+        {
+            self.close_segment();
+        }
+        self.want_keyframe(now)
+    }
+
+    /// Whether to ask a video sender for a keyframe now: often while a file waits for its first
+    /// one or a loss broke the picture, and regularly after that (seeking decodes from the
+    /// keyframe before the target). A sender that sends nothing is not asked.
+    fn want_keyframe(&mut self, now: Instant) -> bool {
+        if !self.info.video {
+            return false;
+        }
+        let active = self
+            .last_packet
+            .is_some_and(|t| now.saturating_duration_since(t) < SEGMENT_GAP);
+        let wait = if self.seg.is_none() || self.need_key {
+            KEYFRAME_RETRY
+        } else {
+            KEYFRAME_EVERY
+        };
+        let due = self
+            .last_ask
+            .is_none_or(|t| now.saturating_duration_since(t) >= wait);
+        if active && due {
+            self.last_ask = Some(now);
+            return true;
+        }
+        false
+    }
+
+    /// When [`Self::tick`] next has something to do because of a gap.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.reorder.deadline()
+    }
+
+    /// Writes what is ready at `now`; gaps are given up as if it were `give_up_at` (the end of the
+    /// stream gives them all up at once, but nothing arrived later than `now`).
+    fn drain(&mut self, now: Instant, give_up_at: Instant) {
+        while let Some(item) = self.reorder.pop(give_up_at) {
+            match item {
+                Item::Packet(p) => {
+                    if self.info.video {
+                        self.assembler.push(now, &p);
+                        while let Some((f, data)) = self.assembler.frame() {
+                            self.video_frame(f.arrived, f.timestamp, f.key, &data);
+                            self.assembler.recycle(data);
+                        }
+                    } else {
+                        self.audio_frame(now, p.header.timestamp, &p.payload);
+                    }
+                }
+                Item::Lost(n) => {
+                    self.lost += u64::from(n);
+                    if self.info.video {
+                        self.assembler.lost();
+                        if !self.need_key {
+                            // The picture is broken until the next keyframe: ask at once.
+                            self.need_key = true;
+                            self.last_ask = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn video_frame(&mut self, arrived: Instant, ts: u32, key: bool, data: &[u8]) {
+        if self.seg.is_some()
+            && self
+                .last_media
+                .is_some_and(|m| arrived.saturating_duration_since(m) > SEGMENT_GAP)
+        {
+            self.close_segment();
+        }
+        self.last_media = Some(arrived);
+        if key {
+            self.need_key = false;
+        }
+        // Nothing before a keyframe decodes, and nothing after a loss until the next one.
+        if self.need_key || (self.seg.is_none() && !key) {
+            return;
+        }
+        if self.seg.is_none() {
+            let (w, h) = vp8::size(data).unwrap_or((0, 0));
+            if let Err(e) = self.open(
+                arrived,
+                ts,
+                Track::Vp8 {
+                    width: w,
+                    height: h,
+                },
+                (w, h),
+            ) {
+                error!(kind = self.info.kind, error = %e, "cannot open a segment");
+                return;
+            }
+        }
+        self.write(ts, key, data, true);
+    }
+
+    fn audio_frame(&mut self, now: Instant, ts: u32, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        if self.seg.is_some()
+            && self
+                .last_media
+                .is_some_and(|m| now.saturating_duration_since(m) > SEGMENT_GAP)
+        {
+            self.close_segment();
+        }
+        self.last_media = Some(now);
+        if self.seg.is_none()
+            && let Err(e) = self.open(now, ts, Track::Opus, (0, 0))
+        {
+            error!(kind = self.info.kind, error = %e, "cannot open a segment");
+            return;
+        }
+        self.write(ts, true, data, false);
+    }
+
+    fn open(
+        &mut self,
+        arrived: Instant,
+        ts: u32,
+        track: Track,
+        size: (u32, u32),
+    ) -> io::Result<()> {
+        let path = self.rec.new_path(self.info.kind);
+        let writer = WebmWriter::create(&path, &track, self.info.kind, self.rec.disk.clone())?;
+        let user_id = self
+            .users
+            .lock()
+            .map(|u| u.get(&self.info.session_id).cloned().unwrap_or_default())
+            .unwrap_or_default();
+        let entry = Entry {
+            kind: self.info.kind.to_owned(),
+            session_id: self.info.session_id.clone(),
+            user_id,
+            start_ms: self.rec.at(arrived).max(0),
+            end_ms: 0,
+            width: size.0,
+            height: size.1,
+            size: 0,
+            path,
+        };
+        self.seg = Some(Segment {
+            entry,
+            writer,
+            prev_ts: ts,
+            ext: 0,
+            last_ms: 0,
+            frame_ms: 33,
+            end_ms: 0,
+        });
+        Ok(())
+    }
+
+    fn write(&mut self, ts: u32, key: bool, data: &[u8], video: bool) {
+        let Some(seg) = self.seg.as_mut() else { return };
+        let clock: i64 = if video { 90_000 } else { 48_000 };
+        let next = seg.ext + i64::from(ts.wrapping_sub(seg.prev_ts) as i32);
+        if next < seg.ext {
+            return; // late duplicate
+        }
+        let ms = next * 1000 / clock;
+        if !video {
+            // Short silences (DTX, a lost burst) are bridged: a continuous track keeps players
+            // from stalling on the hole.
+            while seg.end_ms + OPUS_FRAME_MS <= ms {
+                seg.writer.write_block(false, seg.end_ms, &OPUS_SILENCE);
+                seg.end_ms += OPUS_FRAME_MS;
+            }
+        } else if seg.end_ms > 0 {
+            seg.frame_ms = (ms - seg.last_ms).clamp(1, 1000);
+        }
+        seg.ext = next;
+        seg.prev_ts = ts;
+        seg.writer.write_block(key, ms, data);
+        seg.last_ms = ms;
+        let span = if video { seg.frame_ms } else { OPUS_FRAME_MS };
+        seg.end_ms = seg.end_ms.max(ms + span);
+    }
+
+    fn close_segment(&mut self) {
+        let Some(mut seg) = self.seg.take() else {
+            return;
+        };
+        let path = seg.entry.path.clone();
+        match seg.writer.finish(seg.end_ms) {
+            Ok(done) => {
+                seg.entry.size = done.size;
+                seg.entry.end_ms = seg.entry.start_ms + seg.end_ms;
+                self.rec.add(seg.entry);
+            }
+            Err(e) => {
+                error!(kind = self.info.kind, error = %e, "cannot finish a segment");
+                if let Err(e) = std::fs::remove_file(&path)
+                    && e.kind() != io::ErrorKind::NotFound
+                {
+                    warn!(error = %e, "cannot remove an unfinished segment");
+                }
+            }
+        }
+    }
+
+    /// The stream ended: what is held is released and the file is finished.
+    pub fn finish(&mut self, now: Instant) {
+        // Packets behind a gap are released as they are.
+        self.drain(now, now + Duration::from_secs(3600));
+        self.close_segment();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::webm::parse::*;
+
+    const CLUSTER: u32 = 0x1F43_B675;
+    const SIMPLE_BLOCK: u32 = 0xA3;
+    const TIMECODE: u32 = 0xE7;
+    const SEGMENT: u32 = 0x1853_8067;
+    const TRACKS: u32 = 0x1654_AE6B;
+    const TRACK_ENTRY: u32 = 0xAE;
+    const CODEC_ID: u32 = 0x86;
+    const INFO: u32 = 0x1549_A966;
+    const DURATION: u32 = 0x4489;
+    const CUES: u32 = 0x1C53_BB6B;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("media-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn setup(tag: &str, limit: u64) -> (Arc<Recording>, Instant) {
+        let start = Instant::now();
+        (Arc::new(Recording::new(&tmp(tag), start, limit)), start)
+    }
+
+    fn opus(seq: u16, ts: u32, payload: &[u8]) -> Packet {
+        let mut p = Packet::default();
+        p.header.sequence_number = seq;
+        p.header.timestamp = ts;
+        p.header.payload_type = 111;
+        p.header.ssrc = 1;
+        p.payload = payload.to_vec().into();
+        p
+    }
+
+    fn voice(rec: &Arc<Recording>) -> StreamRecorder {
+        let users: Users = Users::default();
+        users.lock().unwrap().insert("sess".into(), "user".into());
+        StreamRecorder::new(
+            StreamInfo {
+                kind: VOICE,
+                session_id: "sess".into(),
+                video: false,
+            },
+            rec.clone(),
+            users,
+        )
+    }
+
+    fn camera(rec: &Arc<Recording>) -> StreamRecorder {
+        StreamRecorder::new(
+            StreamInfo {
+                kind: CAMERA,
+                session_id: "s".into(),
+                video: true,
+            },
+            rec.clone(),
+            Users::default(),
+        )
+    }
+
+    /// Feeds `count` 20 ms Opus packets, the first arriving at `at`.
+    fn speak(s: &mut StreamRecorder, at: Instant, seq: u16, ts: u32, count: usize) {
+        for i in 0..count {
+            s.packet(
+                at + Duration::from_millis(20 * i as u64),
+                opus(seq + i as u16, ts + 960 * i as u32, &[0xfc, 1, 2]),
+            );
+        }
+    }
+
+    /// The block times (ms) of a file.
+    fn block_times(path: &Path) -> Vec<i64> {
+        let data = std::fs::read(path).unwrap();
+        let top = elements(&data, 0, data.len());
+        let seg = top.iter().find(|e| e.id == SEGMENT).unwrap();
+        let mut out = Vec::new();
+        for c in find(&data, *seg, CLUSTER) {
+            let kids = elements(&data, c.start, c.start + c.len);
+            let base = uint(&data, *kids.iter().find(|e| e.id == TIMECODE).unwrap()) as i64;
+            for b in kids.iter().filter(|e| e.id == SIMPLE_BLOCK) {
+                out.push(
+                    base + i64::from(i16::from_be_bytes([data[b.start + 1], data[b.start + 2]])),
+                );
+            }
+        }
+        out
+    }
+
+    fn codec(path: &Path) -> String {
+        let data = std::fs::read(path).unwrap();
+        let top = elements(&data, 0, data.len());
+        let seg = top.iter().find(|e| e.id == SEGMENT).unwrap();
+        let tracks = find(&data, *seg, TRACKS)[0];
+        let entry = find(&data, tracks, TRACK_ENTRY)[0];
+        let id = find(&data, entry, CODEC_ID)[0];
+        String::from_utf8(data[id.start..id.start + id.len].to_vec()).unwrap()
+    }
+
+    fn has_cues_and_duration(path: &Path) -> bool {
+        let data = std::fs::read(path).unwrap();
+        let top = elements(&data, 0, data.len());
+        let seg = top.iter().find(|e| e.id == SEGMENT).unwrap();
+        let info = find(&data, *seg, INFO)[0];
+        let d = float(&data, find(&data, info, DURATION)[0]);
+        !find(&data, *seg, CUES).is_empty() && d > 0.0
+    }
+
+    #[test]
+    fn voice_is_split_where_the_microphone_was_muted() {
+        let (rec, start) = setup("voice", u64::MAX);
+        let mut s = voice(&rec);
+        // One second of speech, a 200 ms hole (bridged), more speech, then 5 s muted.
+        speak(&mut s, start + Duration::from_secs(1), 100, 0, 50);
+        speak(
+            &mut s,
+            start + Duration::from_millis(2200),
+            150,
+            50 * 960 + 10 * 960,
+            50,
+        );
+        speak(&mut s, start + Duration::from_secs(8), 200, 400_000, 25);
+        s.finish(start + Duration::from_secs(9));
+
+        let files = rec.files();
+        assert_eq!(files.len(), 2, "{files:?}");
+        let (first, second) = (&files[0], &files[1]);
+        assert_eq!(
+            (
+                first.start_ms,
+                first.kind.as_str(),
+                first.session_id.as_str(),
+                first.user_id.as_str()
+            ),
+            (1000, VOICE, "sess", "user")
+        );
+        assert_eq!(second.start_ms, 8000);
+        // 1 s + 200 ms bridged + 1 s, ending on the last frame's end.
+        assert_eq!(first.end_ms - first.start_ms, 2200);
+        assert_eq!(codec(&first.path), "A_OPUS");
+        assert!(
+            has_cues_and_duration(&first.path),
+            "the file would not seek"
+        );
+        let times = block_times(&first.path);
+        assert_eq!(times.len(), 110, "100 frames and 10 of silence");
+        assert!(
+            times.windows(2).all(|w| w[1] - w[0] == 20),
+            "no hole in the track: {times:?}"
+        );
+        assert_eq!(first.size, std::fs::metadata(&first.path).unwrap().len());
+    }
+
+    #[test]
+    fn the_end_of_a_stream_releases_what_it_held_into_the_same_file() {
+        let (rec, start) = setup("release", u64::MAX);
+        let mut s = voice(&rec);
+        // Packet 2 never came; 3 waits behind the gap when the stream ends.
+        for (i, seq) in [0u16, 1, 3].iter().enumerate() {
+            s.packet(
+                start + Duration::from_millis(20 * i as u64),
+                opus(*seq, u32::from(*seq) * 960, &[0xfc, 1, 2]),
+            );
+        }
+        s.finish(start + Duration::from_millis(100));
+        let files = rec.files();
+        assert_eq!(
+            files.len(),
+            1,
+            "a held packet must not open a file of its own: {files:?}"
+        );
+        assert!(files[0].start_ms < 100, "{files:?}");
+        assert_eq!(
+            block_times(&files[0].path),
+            [0, 20, 40, 60],
+            "the hole is bridged with silence"
+        );
+    }
+
+    #[test]
+    fn dtx_silence_keeps_one_continuous_segment() {
+        let (rec, start) = setup("dtx", u64::MAX);
+        let mut s = voice(&rec);
+        speak(&mut s, start, 100, 0, 50);
+        // Five seconds of DTX: one packet every 400 ms.
+        for i in 0..13u32 {
+            s.packet(
+                start + Duration::from_millis(1000 + 400 * u64::from(i)),
+                opus(150 + i as u16, 50 * 960 + i * 20 * 960, &[0xf8]),
+            );
+            s.tick(start + Duration::from_millis(1000 + 400 * u64::from(i)));
+        }
+        speak(&mut s, start + Duration::from_secs(6), 163, 6 * 48_000, 50);
+        s.finish(start + Duration::from_secs(8));
+
+        let files = rec.files();
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].end_ms - files[0].start_ms, 7000);
+        let times = block_times(&files[0].path);
+        assert!(
+            times.windows(2).all(|w| w[1] - w[0] == 20),
+            "a hole in the track"
+        );
+    }
+
+    #[test]
+    fn an_idle_stream_is_finished_on_the_tick() {
+        let (rec, start) = setup("idle", u64::MAX);
+        let mut s = voice(&rec);
+        speak(&mut s, start, 1, 0, 25);
+        assert!(rec.files().is_empty(), "still open");
+        s.tick(start + Duration::from_millis(500 + 1500));
+        assert!(rec.files().is_empty(), "within the gap");
+        s.tick(start + Duration::from_millis(500 + 2100));
+        assert_eq!(
+            rec.files().len(),
+            1,
+            "closed once the stream has been silent for the gap"
+        );
+    }
+
+    #[test]
+    fn reordered_audio_is_written_in_order() {
+        let (rec, start) = setup("reorder", u64::MAX);
+        let mut s = voice(&rec);
+        let order = [0u16, 2, 1, 3, 5, 4, 6];
+        for (n, i) in order.iter().enumerate() {
+            s.packet(
+                start + Duration::from_millis(20 * n as u64),
+                opus(10 + i, u32::from(*i) * 960, &[0xfc, 1]),
+            );
+        }
+        s.finish(start + Duration::from_secs(1));
+        let times = block_times(&rec.files()[0].path);
+        assert_eq!(times, [0, 20, 40, 60, 80, 100, 120]);
+    }
+
+    /// A one-packet VP8 frame; keyframes carry their size.
+    fn vp8_frame(seq: u16, ts: u32, key: bool) -> Packet {
+        let mut p = Packet::default();
+        p.header.sequence_number = seq;
+        p.header.timestamp = ts;
+        p.header.marker = true;
+        p.header.payload_type = 96;
+        p.header.ssrc = 7;
+        let frame: &[u8] = if key {
+            &[
+                0x10, 0x00, 0x00, 0x00, 0x9d, 0x01, 0x2a, 0x80, 0x02, 0x68, 0x01, 0xaa,
+            ]
+        } else {
+            &[0x10, 0x01, 0x00, 0x00, 0x00]
+        };
+        p.payload = frame.to_vec().into();
+        p
+    }
+
+    #[test]
+    fn a_camera_file_opens_on_a_keyframe() {
+        let (rec, start) = setup("camera", u64::MAX);
+        let mut s = camera(&rec);
+        let mut asked = 0;
+        for i in 0..40u32 {
+            let key = i == 10 || i == 30;
+            let now = start + Duration::from_millis(66 * u64::from(i));
+            asked += usize::from(s.packet(now, vp8_frame(i as u16, i * 6000, key)));
+        }
+        s.finish(start + Duration::from_secs(4));
+        assert!(asked >= 1, "no keyframe was asked for while waiting");
+        let files = rec.files();
+        assert_eq!(files.len(), 1);
+        let cam = &files[0];
+        assert_eq!((cam.width, cam.height), (640, 360));
+        assert_eq!(cam.start_ms, 660, "starts at the first keyframe");
+        assert_eq!(codec(&cam.path), "V_VP8");
+        let data = std::fs::read(&cam.path).unwrap();
+        let top = elements(&data, 0, data.len());
+        let seg = top.iter().find(|e| e.id == SEGMENT).unwrap();
+        let clusters = find(&data, *seg, CLUSTER);
+        assert_eq!(
+            clusters.len(),
+            2,
+            "the second keyframe opens a seekable cluster"
+        );
+        let first_block = find(&data, clusters[0], SIMPLE_BLOCK)[0];
+        assert_eq!(data[first_block.start + 3], 0x80, "opens on a keyframe");
+    }
+
+    #[test]
+    fn a_lost_video_packet_freezes_the_picture_until_the_next_keyframe() {
+        let (rec, start) = setup("loss", u64::MAX);
+        let mut s = camera(&rec);
+        let mut asked = Vec::new();
+        for i in 0..60u32 {
+            // Frame 20 never arrives. Keyframes at 0 and 40.
+            if i == 20 {
+                continue;
+            }
+            let now = start + Duration::from_millis(33 * u64::from(i));
+            if s.packet(now, vp8_frame(i as u16, i * 3000, i % 40 == 0)) {
+                asked.push(i);
+            }
+            s.tick(now);
+        }
+        s.finish(start + Duration::from_secs(5));
+        let files = rec.files();
+        assert_eq!(
+            files.len(),
+            1,
+            "{files:?}: the loss does not split the file"
+        );
+        let times = block_times(&files[0].path);
+        // Frames 0..19 are written; 21..39 are not (they depend on the lost one); 40.. are.
+        let ms = |frame: i64| frame * 3000 / 90;
+        assert_eq!(times.iter().filter(|t| **t < ms(20)).count(), 20);
+        assert!(
+            times.iter().all(|t| *t < ms(20) || *t >= ms(40)),
+            "{times:?}"
+        );
+        assert!(times.contains(&ms(40)));
+        assert!(
+            asked.iter().any(|i| (21..40).contains(i)),
+            "the sender was asked for a keyframe after the loss: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn reordered_video_packets_do_not_break_the_picture() {
+        let (rec, start) = setup("vreorder", u64::MAX);
+        let mut s = camera(&rec);
+        // Frames 1 and 2 swap places.
+        let seqs = [0u16, 2, 1, 3, 4];
+        for (n, i) in seqs.iter().enumerate() {
+            s.packet(
+                start + Duration::from_millis(10 * n as u64),
+                vp8_frame(*i, u32::from(*i) * 3000, *i == 0),
+            );
+        }
+        s.finish(start + Duration::from_secs(1));
+        let files = rec.files();
+        assert_eq!(files.len(), 1);
+        assert_eq!(block_times(&files[0].path), [0, 33, 66, 100, 133]);
+    }
+
+    #[test]
+    fn the_disk_limit_is_noticed() {
+        let (rec, start) = setup("disk", 32 << 10);
+        let mut s = voice(&rec);
+        speak(&mut s, start, 1, 0, 25);
+        s.tick(start + Duration::from_secs(10));
+        assert!(
+            !rec.disk.is_full(),
+            "half a second of speech is under the limit"
+        );
+        speak(&mut s, start + Duration::from_secs(11), 100, 600_000, 6000);
+        s.finish(start + Duration::from_secs(140));
+        assert!(
+            rec.disk.is_full(),
+            "two minutes of speech ({} bytes) passed the 32 KiB limit",
+            rec.disk.written()
+        );
+        let on_disk: u64 = rec.files().iter().map(|f| f.size).sum();
+        assert!(on_disk > 0 && rec.disk.written() >= on_disk);
+    }
+
+    #[test]
+    fn track_ids_name_their_kind() {
+        assert_eq!(track_kind("voice_sess_abc"), Some(VOICE));
+        assert_eq!(track_kind("video_sess_abc"), Some(CAMERA));
+        assert_eq!(track_kind("screen_sess_abc"), Some(SCREEN));
+        assert_eq!(track_kind("screen-audio_sess_abc"), Some(SCREEN_AUDIO));
+        assert_eq!(track_kind("whatever_sess"), None);
+        assert_eq!(track_kind("nounderscore"), None);
+    }
+
+    #[test]
+    fn the_manifest_entry_is_shaped_like_the_servers() {
+        let e = Entry {
+            kind: CAMERA.into(),
+            session_id: "s".into(),
+            user_id: String::new(),
+            start_ms: 5,
+            end_ms: 9,
+            width: 0,
+            height: 0,
+            size: 7,
+            path: PathBuf::from("/x"),
+        };
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"kind":"camera","session_id":"s","start_ms":5,"end_ms":9,"size":7}"#
+        );
+    }
+}

@@ -1,0 +1,39 @@
+[package]
+name = "recorder"
+description = "The LMS session recorder: joins a class call as a listen-only bot and writes what the room saw and heard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "recorder"
+path = "src/main.rs"
+
+[dependencies]
+rtcd-proto = { path = "../rtcd-proto" }
+rtcd-net = { path = "../rtcd-net" }
+rtc = { path = "../../vendor/rtc" }
+bytes = "1.12.1"
+flate2 = "1.1.9"
+futures-util = "0.3.34"
+rand = "0.10.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["raw_value"] }
+tokio = { version = "1.54.1", features = ["rt", "macros", "net", "signal", "sync", "time", "fs", "io-util"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
+
+[dev-dependencies]
+axum = { version = "0.8.9", features = ["ws"] }
+lms-sim = { path = "../lms-sim" }
+rtcd-testkit = { path = "../rtcd-testkit" }

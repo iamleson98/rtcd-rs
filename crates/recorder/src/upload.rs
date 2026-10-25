@@ -1,0 +1,591 @@
+//! Each file of a recording is uploaded as an object of its own, numbered by its place in the
+//! manifest. The server says where each one goes: with direct access, straight to storage at URLs
+//! it presigns (the bytes leave the cluster once, and never pass through the server), otherwise to
+//! the server. Asking for those URLs a batch at a time also tells the server the upload is still
+//! going.
+
+use std::io::SeekFrom;
+use std::path::Path;
+use std::time::Duration;
+
+use futures_util::TryStreamExt;
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use reqwest::{Body, Method};
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio_util::io::ReaderStream;
+use tracing::{info, warn};
+
+use crate::api::{Api, ApiError};
+use crate::media::Entry;
+
+/// The most files the server takes in one request for URLs; the byte limit keeps a batch short
+/// enough that the next request comes well within the server's patience.
+const BATCH_FILES: usize = 1000;
+const BATCH_BYTES: u64 = 256 << 20;
+/// The slowest an upload may go before it is cut off (and retried): far below the cluster's capped
+/// 10 Mb/s.
+const UPLOAD_RATE: u64 = 256 << 10;
+
+#[derive(Debug, thiserror::Error)]
+pub enum UploadError {
+    #[error("the recording is empty")]
+    Empty,
+    #[error("{0}")]
+    Protocol(String),
+    #[error("file {index}: {source}")]
+    File {
+        index: usize,
+        source: Box<UploadError>,
+    },
+    #[error("part {part} of {total}: {source}")]
+    Part {
+        part: usize,
+        total: usize,
+        source: Box<UploadError>,
+    },
+    #[error(transparent)]
+    Api(#[from] ApiError),
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Orders the files along the timeline (their order in the manifest, and so their numbers) and
+/// fills in their sizes.
+pub fn manifest_files(mut files: Vec<Entry>) -> std::io::Result<Vec<Entry>> {
+    files.sort_by_key(|f| f.start_ms);
+    for f in &mut files {
+        f.size = std::fs::metadata(&f.path)?.len();
+    }
+    Ok(files)
+}
+
+#[derive(Serialize)]
+struct UploadRequest<'a> {
+    index: usize,
+    kind: &'a str,
+    size: u64,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    upload_id: &'a str,
+    #[serde(skip_serializing_if = "is_zero")]
+    first_part: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Part {
+    pub number: usize,
+    pub url: String,
+}
+
+/// Where one file goes: `url` (the whole file), or `upload_id` and the URLs of its next parts,
+/// each `part_size` long but the last.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Target {
+    #[serde(default)]
+    pub index: usize,
+    #[serde(default)]
+    pub content_type: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub upload_id: String,
+    #[serde(default)]
+    pub part_size: u64,
+    #[serde(default)]
+    pub parts: Vec<Part>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Targets {
+    #[serde(default)]
+    direct: bool,
+    #[serde(default)]
+    uploads: Vec<Target>,
+}
+
+/// A file uploaded in parts, for the server to finish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MultipartDone {
+    pub index: usize,
+    pub upload_id: String,
+}
+
+/// A presigned URL storage no longer takes.
+fn expired(e: &UploadError) -> bool {
+    matches!(e, UploadError::Api(a) if a.status() == Some(403))
+}
+
+impl Api {
+    /// Sends every file (in manifest order) and returns the uploads in parts to finish.
+    pub async fn upload(&self, files: &[Entry]) -> Result<Vec<MultipartDone>, UploadError> {
+        if files.is_empty() {
+            return Err(UploadError::Empty);
+        }
+        let mut multipart = Vec::new();
+        let mut start = 0;
+        while start < files.len() {
+            let (mut end, mut size) = (start, 0u64);
+            while end < files.len()
+                && end - start < BATCH_FILES
+                && (end == start || size + files[end].size <= BATCH_BYTES)
+            {
+                size += files[end].size;
+                end += 1;
+            }
+            let batch: Vec<_> = (start..end)
+                .map(|n| UploadRequest {
+                    index: n,
+                    kind: &files[n].kind,
+                    size: files[n].size,
+                    upload_id: "",
+                    first_part: 0,
+                })
+                .collect();
+            let targets = self.targets(&batch).await?;
+            if !targets.direct {
+                for (n, f) in files.iter().enumerate().take(end).skip(start) {
+                    self.upload_to_server(n, f)
+                        .await
+                        .map_err(|e| UploadError::File {
+                            index: n,
+                            source: Box::new(e),
+                        })?;
+                }
+            } else {
+                if targets.uploads.len() != batch.len() {
+                    return Err(UploadError::Protocol(format!(
+                        "asked where {} files go, told {}",
+                        batch.len(),
+                        targets.uploads.len()
+                    )));
+                }
+                for t in targets.uploads {
+                    let n = t.index;
+                    if n < start || n >= end {
+                        return Err(UploadError::Protocol(format!(
+                            "told where file {n} goes, not asked"
+                        )));
+                    }
+                    let f = &files[n];
+                    let result = if t.upload_id.is_empty() {
+                        self.upload_whole(n, f, t).await
+                    } else {
+                        let id = t.upload_id.clone();
+                        let r = self.upload_parts(n, f, t).await;
+                        multipart.push(MultipartDone {
+                            index: n,
+                            upload_id: id,
+                        });
+                        r
+                    };
+                    result.map_err(|e| UploadError::File {
+                        index: n,
+                        source: Box::new(e),
+                    })?;
+                }
+            }
+            info!(files = end, of = files.len(), "uploaded files");
+            start = end;
+        }
+        Ok(multipart)
+    }
+
+    async fn targets(&self, files: &[UploadRequest<'_>]) -> Result<Targets, UploadError> {
+        let body = serde_json::to_vec(&serde_json::json!({ "files": files }))
+            .map_err(|e| UploadError::Protocol(e.to_string()))?;
+        Ok(self
+            .retry("upload URLs", || async {
+                let req = self
+                    .authed(Method::POST, &format!("{}/uploads", self.base))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body.clone());
+                Api::json::<Targets>(req).await
+            })
+            .await?)
+    }
+
+    /// Asks again where one file goes (its URLs ran out, or for its next parts).
+    async fn target(&self, req: UploadRequest<'_>) -> Result<Target, UploadError> {
+        let index = req.index;
+        let mut out = self.targets(&[req]).await?;
+        if !out.direct || out.uploads.len() != 1 || out.uploads[0].index != index {
+            return Err(UploadError::Protocol(
+                "storage is no longer directly reachable".into(),
+            ));
+        }
+        Ok(out.uploads.remove(0))
+    }
+
+    async fn upload_whole(&self, n: usize, f: &Entry, t: Target) -> Result<(), UploadError> {
+        let result = self
+            .put(&t.url, Some(&t.content_type), None, &f.path, 0, f.size)
+            .await;
+        match result {
+            Err(e) if expired(&e) => {
+                let t = self
+                    .target(UploadRequest {
+                        index: n,
+                        kind: &f.kind,
+                        size: f.size,
+                        upload_id: "",
+                        first_part: 0,
+                    })
+                    .await?;
+                self.put(&t.url, Some(&t.content_type), None, &f.path, 0, f.size)
+                    .await
+            }
+            other => other,
+        }
+    }
+
+    /// Sends a file's parts in order, asking for the next parts' URLs as it goes (and once more
+    /// for a part whose URL ran out).
+    async fn upload_parts(&self, n: usize, f: &Entry, mut t: Target) -> Result<(), UploadError> {
+        if t.part_size == 0 {
+            return Err(UploadError::Protocol("no part size".into()));
+        }
+        let total = f.size.div_ceil(t.part_size) as usize;
+        let mut reminted = 0;
+        let mut next = 1;
+        while next <= total {
+            if t.parts.first().is_none_or(|p| p.number != next) {
+                t = self
+                    .target(UploadRequest {
+                        index: n,
+                        kind: &f.kind,
+                        size: f.size,
+                        upload_id: &t.upload_id,
+                        first_part: next,
+                    })
+                    .await?;
+            }
+            let parts = std::mem::take(&mut t.parts);
+            for p in parts {
+                let offset = (p.number as u64 - 1) * t.part_size;
+                let len = t.part_size.min(f.size - offset);
+                match self.put(&p.url, None, None, &f.path, offset, len).await {
+                    Err(e) if expired(&e) && reminted != p.number => {
+                        reminted = p.number;
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(UploadError::Part {
+                            part: p.number,
+                            total,
+                            source: Box::new(e),
+                        });
+                    }
+                    Ok(()) => next = p.number + 1,
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn upload_to_server(&self, n: usize, f: &Entry) -> Result<(), UploadError> {
+        let url = format!("{}/files/{n}", self.base);
+        self.put(
+            &url,
+            Some("application/octet-stream"),
+            Some(&self.token),
+            &f.path,
+            0,
+            f.size,
+        )
+        .await
+    }
+
+    /// Sends `size` bytes of the file at `path` from `offset`, retried on network and server
+    /// errors (a PUT replaces what an earlier attempt left).
+    async fn put(
+        &self,
+        url: &str,
+        content_type: Option<&str>,
+        bearer: Option<&str>,
+        path: &Path,
+        offset: u64,
+        size: u64,
+    ) -> Result<(), UploadError> {
+        Ok(self
+            .retry("upload", || async {
+                let mut file = tokio::fs::File::open(path)
+                    .await
+                    .map_err(|e| ApiError::Network(e.to_string()))?;
+                file.seek(SeekFrom::Start(offset))
+                    .await
+                    .map_err(|e| ApiError::Network(e.to_string()))?;
+                let stream = ReaderStream::with_capacity(file.take(size), 256 << 10)
+                    .map_err(std::io::Error::other);
+                let mut req = self
+                    .uploads
+                    .put(url)
+                    .timeout(Duration::from_secs(60 + size / UPLOAD_RATE))
+                    .header(CONTENT_LENGTH, size)
+                    .body(Body::wrap_stream(stream));
+                if let Some(ct) = content_type {
+                    req = req.header(CONTENT_TYPE, ct);
+                }
+                if let Some(b) = bearer {
+                    req = req.bearer_auth(b);
+                }
+                Api::send(req).await.map(|_| ())
+            })
+            .await?)
+    }
+
+    /// Runs `f` until it succeeds, fails for good (a 4xx answer) or runs out of attempts, waiting
+    /// longer after each failure.
+    async fn retry<T, F, Fut>(&self, what: &str, mut f: F) -> Result<T, ApiError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, ApiError>>,
+    {
+        let mut attempt = 0;
+        loop {
+            match f().await {
+                Ok(v) => return Ok(v),
+                Err(e) if e.retryable() && attempt < self.retries => {
+                    attempt += 1;
+                    let wait = self.backoff * attempt;
+                    warn!(what, wait_ms = wait.as_millis() as u64, error = %e, "retrying");
+                    tokio::time::sleep(wait).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::media::{CAMERA, VOICE};
+    use crate::testing::{Fake, REC_PATH};
+
+    fn files(tag: &str) -> (Vec<Entry>, [Vec<u8>; 2]) {
+        let dir = std::env::temp_dir().join(format!("upload-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bodies = [
+            b"0123456789".to_vec(),
+            b"abcdefghijklmnopqrstuvwxy".to_vec(),
+        ];
+        let mut entries = Vec::new();
+        for (i, (kind, start)) in [(VOICE, 100), (CAMERA, 200)].into_iter().enumerate() {
+            let path: PathBuf = dir.join(kind);
+            std::fs::write(&path, &bodies[i]).unwrap();
+            entries.push(Entry {
+                kind: kind.into(),
+                session_id: String::new(),
+                user_id: String::new(),
+                start_ms: start,
+                end_ms: start + 1,
+                width: 0,
+                height: 0,
+                size: 0,
+                path,
+            });
+        }
+        (manifest_files(entries).unwrap(), bodies)
+    }
+
+    #[tokio::test]
+    async fn files_go_straight_to_storage_in_parts_when_the_server_says_so() {
+        let (files, bodies) = files("direct");
+        let fake = Fake::start(|r, attempt, site| {
+            match r.path.as_str() {
+                p if p == format!("{REC_PATH}/uploads") => {
+                    let v: Value = serde_json::from_slice(&r.body).unwrap();
+                    let asked = v["files"].as_array().unwrap();
+                    let part = |n: u64| json!({"number": n, "url": format!("{site}/store/up/{n}")});
+                    let mut camera = json!({"index": 1, "content_type": "video/webm", "upload_id": "up", "part_size": 10});
+                    if asked.len() == 2 {
+                        camera["parts"] = json!([part(1), part(2)]);
+                        return (200, Some(json!({"direct": true, "uploads": [
+                            {"index": 0, "content_type": "audio/webm", "url": format!("{site}/store/voice")},
+                            camera
+                        ]})));
+                    }
+                    if asked[0]["index"] == 0 {
+                        return (200, Some(json!({"direct": true, "uploads": [
+                            {"index": 0, "content_type": "audio/webm", "url": format!("{site}/store/voice-again")}
+                        ]})));
+                    }
+                    camera["parts"] = json!([part(asked[0]["first_part"].as_u64().unwrap())]);
+                    (200, Some(json!({"direct": true, "uploads": [camera]})))
+                }
+                // Its URL ran out: the recorder asks for a fresh one.
+                "/store/voice" => (403, None),
+                "/store/up/2" if attempt == 1 => (502, None),
+                _ => (200, None),
+            }
+        })
+        .await;
+        let multipart = fake.api().upload(&files).await.unwrap();
+        assert_eq!(
+            multipart,
+            [MultipartDone {
+                index: 1,
+                upload_id: "up".into()
+            }]
+        );
+
+        let seen = fake.seen();
+        let calls: Vec<String> = seen
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} {}",
+                    r.method,
+                    r.path.strip_prefix(REC_PATH).unwrap_or(&r.path)
+                )
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                "POST /uploads",
+                "PUT /store/voice",
+                "POST /uploads",
+                "PUT /store/voice-again",
+                "PUT /store/up/1",
+                "PUT /store/up/2",
+                "PUT /store/up/2",
+                "POST /uploads",
+                "PUT /store/up/3"
+            ]
+        );
+        for r in &seen {
+            if r.path.starts_with("/store/") {
+                assert_eq!(r.auth, "", "the bot's token went to storage: {}", r.path);
+            }
+            if r.path == "/store/voice-again" {
+                assert_eq!(r.body, bodies[0]);
+                assert_eq!(r.content_type, "audio/webm");
+            }
+        }
+        let camera: Vec<u8> = ["/store/up/1", "/store/up/2", "/store/up/3"]
+            .iter()
+            .flat_map(|p| {
+                seen.iter()
+                    .rev()
+                    .find(|r| r.path == *p && r.method == "PUT")
+                    .unwrap()
+                    .body
+                    .clone()
+            })
+            .collect();
+        assert_eq!(camera, bodies[1]);
+    }
+
+    #[tokio::test]
+    async fn files_go_through_the_server_when_storage_is_not_reachable() {
+        let (files, bodies) = files("server");
+        let fake = Fake::start(|r, attempt, _| {
+            if r.path.ends_with("/uploads") {
+                (200, Some(json!({"direct": false, "uploads": []})))
+            } else if r.path.ends_with("/files/1") && attempt == 1 {
+                (502, None)
+            } else {
+                (200, None)
+            }
+        })
+        .await;
+        let api = fake.api();
+        let multipart = api.upload(&files).await.unwrap();
+        api.complete(Duration::from_millis(93_500), &files, &multipart)
+            .await
+            .unwrap();
+
+        let seen = fake.seen();
+        let calls: Vec<String> = seen
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.path.strip_prefix(REC_PATH).unwrap()))
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                "POST /uploads",
+                "PUT /files/0",
+                "PUT /files/1",
+                "PUT /files/1",
+                "POST /complete"
+            ]
+        );
+        assert!(seen.iter().all(|r| r.auth == "Bearer bot-token"));
+        assert_eq!(seen[1].body, bodies[0]);
+        assert_eq!(
+            seen[3].body, bodies[1],
+            "the file is sent whole again after a failure"
+        );
+        let body: Value = serde_json::from_slice(&seen[4].body).unwrap();
+        assert_eq!(body["duration_ms"], 93_500);
+        assert_eq!(body["files"].as_array().unwrap().len(), 2);
+        assert_eq!(body["files"][1]["size"], 25);
+        assert_eq!(body["files"][0]["kind"], "voice");
+        assert_eq!(body["multipart"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_ends_the_upload_and_an_empty_recording_is_an_error() {
+        let (files, _) = files("refused");
+        let fake = Fake::start(|_, _, _| (409, None)).await;
+        assert!(fake.api().upload(&files).await.is_err());
+        assert_eq!(fake.seen().len(), 1, "a 4xx is not retried");
+        assert!(matches!(
+            fake.api().upload(&[]).await,
+            Err(UploadError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_server_that_keeps_failing_is_given_up_on() {
+        let (files, _) = files("failing");
+        let fake = Fake::start(|_, _, _| (503, None)).await;
+        let mut api = fake.api();
+        api.retries = 3;
+        assert!(api.upload(&files).await.is_err());
+        assert_eq!(fake.seen().len(), 4, "the first try and three retries");
+    }
+
+    #[test]
+    fn the_manifest_is_in_timeline_order_with_sizes() {
+        let dir = std::env::temp_dir().join(format!("upload-{}-manifest", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        let entry = |kind: &str, start: i64, path: PathBuf| Entry {
+            kind: kind.into(),
+            session_id: String::new(),
+            user_id: String::new(),
+            start_ms: start,
+            end_ms: 0,
+            width: 0,
+            height: 0,
+            size: 0,
+            path,
+        };
+        let got = manifest_files(vec![
+            entry("board", 0, write("board", "BOARD")),
+            entry("camera", 500, write("cam", "CAMERA")),
+            entry("voice", 100, write("voice", "VO")),
+        ])
+        .unwrap();
+        let got: Vec<String> = got
+            .iter()
+            .map(|f| format!("{}:{}", f.kind, f.size))
+            .collect();
+        assert_eq!(got, ["board:5", "voice:2", "camera:6"]);
+        assert!(manifest_files(vec![entry("board", 0, dir.join("gone"))]).is_err());
+    }
+}
