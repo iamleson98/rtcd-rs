@@ -40,6 +40,23 @@ Measured with `scripts/bench-recorder.py` (see it for the method) on the same sy
 rtcd and participants sending real VP8 and Opus, both recorders run natively on the same machine and
 measured by `/usr/bin/time` from start to the end of the upload.
 
+Linux (arm64 container, glibc, median of two runs; the bench ran alone):
+
+| class (people / cameras / screens, seconds) | recorder | CPU seconds | CPU % of a core | peak memory |
+|---|---|---|---|---|
+| small (3 / 2 / 1, 15 s) | Go | 0.36 | 2.4% | 21.9 MiB |
+| | Rust | 0.16 | 1.0% | 9.2 MiB |
+| class of 10 (10 / 6 / 1, 30 s) | Go | 2.33 | 7.8% | 36.9 MiB |
+| | Rust | 0.47 | 1.6% | 10.4 MiB |
+| class of 20 (20 / 12 / 1, 40 s) | Go | 2.82 | 7.0% | 55.5 MiB |
+| | Rust | 0.88 | 2.2% | 13.0 MiB |
+| class of 30 (30 / 20 / 2, 60 s) | Go | 3.75 | 6.3% | 81.8 MiB |
+| | Rust | 1.37 | 2.3% | 15.6 MiB |
+
+The Rust recorder uses 2.4 to 5 times less CPU and 2.4 to 5 times less memory, and the gap in memory grows
+with the class. A recorder that is starved of CPU for seconds splits its files (a stream silent for 2 s ends
+its file), as the Go one does; run the benchmark on a machine with nothing else busy.
+
 macOS (Apple silicon), both recorders native, one run each:
 
 | class (people / cameras / screens, seconds) | recorder | CPU seconds | peak memory | files |
