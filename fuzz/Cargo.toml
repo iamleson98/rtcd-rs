@@ -1,0 +1,63 @@
+[package]
+name = "rtcd-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+bytes = "1"
+rtc = { path = "../vendor/rtc" }
+rtcd-proto = { path = "../crates/rtcd-proto" }
+rtcd-sfu = { path = "../crates/rtcd-sfu" }
+recorder = { path = "../crates/recorder" }
+
+# Not part of the workspace: fuzzing needs nightly.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "dc_decode"
+path = "fuzz_targets/dc_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client_unpack"
+path = "fuzz_targets/client_unpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "engine_signals"
+path = "fuzz_targets/engine_signals.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vp8_payloads"
+path = "fuzz_targets/vp8_payloads.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recorder_stream"
+path = "fuzz_targets/recorder_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recorder_signal"
+path = "fuzz_targets/recorder_signal.rs"
+test = false
+doc = false
+bench = false

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/rtcd-proto", "crates/rtcd-net", "crates/rtcd-sfu", "crates/rtcd", "crates/rtcd-testkit", "crates/recorder", "crates/lms-sim"]
-exclude = ["vendor"]
+exclude = ["vendor", "fuzz"]
 
 [workspace.package]
 version = "0.1.0"

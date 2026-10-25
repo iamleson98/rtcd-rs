@@ -51,6 +51,22 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - run: $GITHUB_WORKSPACE/scripts/ci-run.sh cargo test --workspace --locked --no-fail-fast
 
+  fuzz:
+    name: Fuzz targets (a short run each)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked --version 0.13.2
+      - name: Run every target for a minute
+        working-directory: fuzz
+        run: |
+          for t in $(cargo +nightly fuzz list); do
+            $GITHUB_WORKSPACE/scripts/ci-run.sh cargo +nightly fuzz run "$t" -- -max_total_time=60 -max_len=4096
+          done
+
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest

@@ -13,6 +13,7 @@ changing the LMS server or the web client.
 | Configuration | the same `config.toml` keys and the same `RTCD_*` environment variables, including `:8045`-style addresses, `ice_host_override` NAT maps, STUN discovery, TURN credential generation, TLS |
 | Container | the `Dockerfile` uses the LMS image's entrypoint and config template, so environment, ports (8045, 8443), user (2001) and the `/data` volume are unchanged |
 | Data | a data directory the Go rtcd used is opened as is: its registered clients are taken over on the first start (`crates/rtcd/src/legacy.rs`) |
+| Extension | a data channel frame of type 10 (`SharpScreen(true)`) asks for a shared screen at its large layer whatever the bandwidth estimate says, until the receiver's link is starved. The session recorder sends it; the Go service never sees it from a browser |
 | Media | ICE-lite over UDP and ICE-TCP, DTLS-SRTP, the `calls-dc` data channel (lock protocol, zlib SDP, media map), Opus voice with VAD events, VP8 camera and screen share with simulcast layer switching that needs no renegotiation, `video_subscribe`, keyframe relay, bandwidth-driven screen layer choice |
 | Metrics | the Prometheus metric names are the Go service's, plus the network counters below |
 
@@ -35,6 +36,17 @@ predicts the network bill (`increase(...[1d])` is GB per day):
 | `rtcd_rtc_rtp_bytes_sent_total{type}` | RTP bytes sent to participants by `voice`, `video`, `screen`, `screen-audio` (the Go service's metric) |
 | `rtcd_rtc_rtp_bytes_received_total{type}` | the uplink, by the same types |
 | `rtcd_rtc_rtp_tracks_writes_time{groupID,type}` | time to write one packet to one receiver (a sample of the writes) |
+
+What the receivers experience, read from each receiver's connection statistics every five seconds:
+
+| metric | what it counts |
+|---|---|
+| `rtcd_rtc_receiver_feedback_total{type}` | retransmission (`nack`), keyframe (`pli`) and full intra (`fir`) requests receivers sent |
+| `rtcd_rtc_retransmitted_packets_total`, `_bytes_total` | what was sent again over RTX because they asked (receivers that negotiate RTX) |
+| `rtcd_rtc_receiver_loss_ratio`, `rtcd_rtc_receiver_rtt` | histograms of the loss fraction and round trip time receivers report |
+| `rtcd_rtc_bandwidth_estimate_bps` | histogram of the receivers' bandwidth estimates |
+| `rtcd_rtc_screen_layer_seconds_total{layer}` | seconds receivers spent on the small and the large layer of a shared screen (`rate()` is the number of receivers on each) |
+| `rtcd_rtc_keyframe_requests_total{result}` | keyframes asked of senders, `sent` or `held_back` (asked a moment ago) |
 
 What is spent on the wire: only video takes part in the bandwidth estimate, so voice packets carry no
 transport-wide sequence number (8 bytes on a 65-byte packet, both ways) and nobody reports on them.
@@ -109,7 +121,15 @@ builds a static image on `scratch`. It uses about a quarter of the Go recorder's
 memory; see [crates/recorder/README.md](crates/recorder/README.md) for the numbers, the method
 (`scripts/bench-recorder.py`) and what differs.
 
+## Fuzzing
+
+`fuzz/` holds libFuzzer targets for what comes from outside: data channel frames, websocket frames, the
+engine given a session and any SDP, ICE and announcements a client can send, VP8 payloads, the recorder's
+stream writer and its signal parser. `cd fuzz && cargo +nightly fuzz run <target>`; the `rtc` crates have
+targets of their own for STUN, RTP, RTCP, SDP, DTLS, SCTP and SRTP.
+
 ## Not done yet
 
-- AV1.
-- Splitting one call across instances (calls stay on the instance they start on).
+- AV1: the LMS server never offers it (`av1Support` is false on every join), so nothing would use it.
+- Splitting one call across instances (calls stay on the instance they start on). One instance carries
+  300 participants at about half a core.
