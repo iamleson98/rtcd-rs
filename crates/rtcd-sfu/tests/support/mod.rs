@@ -17,6 +17,7 @@ use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
 use rtc::peer_connection::configuration::media_engine::MediaEngine;
+use rtc::peer_connection::configuration::setting_engine::SettingEngineBuilder;
 use rtc::peer_connection::event::{RTCDataChannelEvent, RTCPeerConnectionEvent, RTCTrackEvent};
 use rtc::peer_connection::message::RTCMessage;
 use rtc::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
@@ -41,6 +42,8 @@ use rtcd_sfu::metrics::NoMetrics;
 
 pub const AUDIO_LEVEL_URI: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
 pub const SERVER: &str = "10.0.0.1:8443";
+/// The last payload byte of a packet `send_video_losing` keeps back, to find it again.
+pub const LATE: u8 = 0xdd;
 
 /// A track a browser receives.
 #[derive(Debug, Clone)]
@@ -95,6 +98,10 @@ pub struct Browser {
     /// Every keyframe request seen, kept after the encoder has answered it.
     pub keyframe_log: Vec<u32>,
     pub rtcp_seen: Vec<String>,
+    /// Every packet the SFU asked this browser to send again: (SSRC, sequence number).
+    pub nacks: Vec<(u32, u16)>,
+    /// Packets `send_video_losing` kept back instead of sending.
+    pub held_back: Vec<rtc::rtp::Packet>,
     /// Errors the connection returned for datagrams from the SFU.
     pub read_errors: Vec<String>,
     pub datagrams_in: usize,
@@ -264,6 +271,13 @@ impl World {
             .with_configuration(RTCConfigurationBuilder::new().build())
             .with_media_engine(me)
             .with_interceptor_registry(registry)
+            // A browser remembers 1024 packets, not the library's 64: a packet repaired late is
+            // still taken.
+            .with_setting_engine(
+                SettingEngineBuilder::new()
+                    .with_srtp_replay_protection_window(1024)
+                    .build(),
+            )
             .build(self.now)
             .unwrap();
         pc.create_data_channel("calls-dc", None).unwrap();
@@ -328,6 +342,8 @@ impl World {
             keyframe_requests: vec![],
             keyframe_log: vec![],
             rtcp_seen: vec![],
+            nacks: vec![],
+            held_back: vec![],
             read_errors: vec![],
             datagrams_in: 0,
             unreachable: false,
@@ -630,6 +646,11 @@ impl World {
                     for p in &packets {
                         b.rtcp_seen
                             .push(format!("{:?}", p).chars().take(60).collect());
+                        if let Some(nack) = p.as_any().downcast_ref::<rtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack>() {
+                            for pair in &nack.nacks {
+                                b.nacks.extend(pair.packet_list().into_iter().map(|seq| (nack.media_ssrc, seq)));
+                            }
+                        }
                         if let Some(pli) = p.as_any().downcast_ref::<rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication>() {
                             b.keyframe_requests.push(pli.media_ssrc);
                         }
@@ -743,6 +764,21 @@ impl World {
     /// the VP8 keyframe tag. Each packet carries the layer in its payload, so a receiver can tell
     /// where it came from.
     pub fn send_video(&mut self, i: usize, screen: bool, layer: Layer, key: bool, packets: usize) {
+        self.send_video_losing(i, screen, layer, key, packets, None);
+    }
+
+    /// `send_video`, except that packet number `lost` of the frame, if any, never leaves the
+    /// browser: it is kept in `held_back`, for `send_held_back` to deliver late, as a
+    /// retransmission is.
+    pub fn send_video_losing(
+        &mut self,
+        i: usize,
+        screen: bool,
+        layer: Layer,
+        key: bool,
+        packets: usize,
+        lost: Option<usize>,
+    ) {
         let now = self.now;
         let b = &mut self.browsers[i];
         let v = if screen {
@@ -784,7 +820,12 @@ impl World {
             if first {
                 payload.push(if key { 0x00 } else { 0x01 });
             }
-            payload.extend_from_slice(&[layer as u8 + 1, 0xaa, 0xbb, 0xcc]);
+            payload.extend_from_slice(&[
+                layer as u8 + 1,
+                0xaa,
+                0xbb,
+                if lost == Some(n) { LATE } else { 0xcc },
+            ]);
             let mut header = rtc::rtp::header::Header {
                 version: 2,
                 marker: n == packets - 1,
@@ -810,7 +851,30 @@ impl World {
                 payload: Bytes::from(payload),
             };
             v.seq[l] = v.seq[l].wrapping_add(1);
+            if lost == Some(n) {
+                b.held_back.push(packet);
+                continue;
+            }
             b.pc.rtp_sender(v.sender)
+                .unwrap()
+                .write_rtp(now, packet)
+                .expect("write_rtp");
+        }
+    }
+
+    /// Sends the packets `send_video_losing` kept back, now, on the sender they belong to.
+    pub fn send_held_back(&mut self, i: usize, screen: bool) {
+        let now = self.now;
+        let b = &mut self.browsers[i];
+        let sender = if screen {
+            b.screen.as_ref()
+        } else {
+            b.camera.as_ref()
+        }
+        .expect("a video sender")
+        .sender;
+        for packet in std::mem::take(&mut b.held_back) {
+            b.pc.rtp_sender(sender)
                 .unwrap()
                 .write_rtp(now, packet)
                 .expect("write_rtp");

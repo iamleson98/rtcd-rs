@@ -107,6 +107,9 @@ fn media_engine() -> Result<MediaEngine> {
     Ok(m)
 }
 
+/// Packets an SRTP receiver remembers, to refuse a replay and to accept a late arrival.
+const SRTP_REPLAY_WINDOW: usize = 2048;
+
 /// A new peer connection for a session, and the handle to its bandwidth estimate.
 pub(crate) fn new_peer(
     cfg: &EngineConfig,
@@ -166,6 +169,11 @@ pub(crate) fn new_peer(
         .with_answering_dtls_role(RTCDtlsRole::Server)
         .with_lite(cfg.ice_lite)
         .with_sctp_enable_zero_checksum(true)
+        // A retransmission arrives a round trip and a NACK interval after the packet it replaces,
+        // and a screen share sends a few hundred packets a second. The library's window of 64
+        // packets rejects it as a duplicate, so a hole never closes and the stream stalls. Browsers
+        // use 1024; this covers a second of a large layer at a round trip of several hundred ms.
+        .with_srtp_replay_protection_window(SRTP_REPLAY_WINDOW)
         .build();
 
     let pc = RTCPeerConnectionBuilder::new()
