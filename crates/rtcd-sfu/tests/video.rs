@@ -314,6 +314,40 @@ fn a_screen_share_reaches_everyone_and_ends_cleanly() {
     );
 }
 
+/// A retransmission comes a round trip after the packet it replaces, and a screen share sends
+/// hundreds of packets a second: by then the SFU has seen many packets of the stream. The packet
+/// must still be accepted, or a hole never closes and a receiver of the stream is left on a frame
+/// it cannot decode.
+#[test]
+fn a_retransmission_that_comes_late_is_accepted() {
+    // An estimate above what the large layer needs, so the large layer is what bob gets.
+    let cfg = rtcd_sfu::config::EngineConfig {
+        min_bitrate: 3_000_000,
+        max_bitrate: 8_000_000,
+        ..support::engine_config()
+    };
+    let mut w = World::with_config(cfg);
+    let a = w.join("alice", "call1");
+    let b = w.join("bob", "call1");
+    w.share_screen(a);
+    w.run_for(Duration::from_secs(1));
+    w.stream_video(a, true, 2.0, 30, &BOTH);
+
+    w.send_video_losing(a, true, Layer::High, false, 4, Some(1));
+    // Far more than the 64 packets a small anti-replay window covers go by before it is resent.
+    w.stream_video(a, true, 3.0, 30, &BOTH);
+    w.send_held_back(a, true);
+    w.run_for(Duration::from_secs(1));
+
+    assert!(
+        w.browsers[b]
+            .rtp
+            .iter()
+            .any(|(t, p)| t.starts_with("screen_") && p.payload.last() == Some(&support::LATE)),
+        "the packet that came late reaches the receiver"
+    );
+}
+
 #[test]
 fn a_second_screen_share_is_refused_while_one_is_live() {
     let mut w = World::new();
