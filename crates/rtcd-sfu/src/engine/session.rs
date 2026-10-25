@@ -237,6 +237,18 @@ pub(crate) struct Session {
 
     pub up: Uplink,
     pub down: Downlink,
+    pub quality: QualityMark,
+}
+
+/// Where the counters of a connection's statistics stood when they were last reported.
+#[derive(Debug, Default)]
+pub(crate) struct QualityMark {
+    pub at: Option<Instant>,
+    pub nacks: u64,
+    pub plis: u64,
+    pub firs: u64,
+    pub retransmitted_packets: u64,
+    pub retransmitted_bytes: u64,
 }
 
 impl std::fmt::Debug for Session {

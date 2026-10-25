@@ -13,6 +13,7 @@ mod datachannel;
 mod join;
 mod media;
 mod negotiate;
+mod quality;
 mod route;
 mod session;
 mod signaling;

@@ -142,8 +142,10 @@ impl Engine {
             .last_pli
             .is_some_and(|t| now.saturating_duration_since(t) < KEYFRAME_INTERVAL)
         {
+            self.metrics.keyframe_request(false);
             return;
         }
+        self.metrics.keyframe_request(true);
         src.last_pli = Some(now);
         debug!(session = %p.cfg.session_id, ssrc = src.ssrc, "keyframe requested");
         let (receiver, ssrc) = (src.receiver, src.ssrc);
@@ -242,6 +244,7 @@ impl Engine {
         self.watch_camera(key, now);
         self.retry_keyframes(key, now);
         self.review_screen_level(key, now);
+        self.report_quality(key, now);
     }
 
     /// Moves the receivers of a camera between its layers as the large one pauses and resumes.
@@ -280,7 +283,7 @@ impl Engine {
     }
 
     /// Decides, from the receiver's bandwidth estimate, which layer of a screen share it gets.
-    fn review_screen_level(&mut self, key: SessionKey, now: Instant) {
+    pub(super) fn review_screen_level(&mut self, key: SessionKey, now: Instant) {
         let Some(s) = self.sessions.get(key) else {
             return;
         };
@@ -313,6 +316,8 @@ impl Engine {
                 high_rate,
             },
         );
+        self.metrics
+            .screen_layer_time(after == Layer::High, Self::tick_interval());
         if after != before {
             debug!(session = %s.cfg.session_id, ?after, target = estimate.target, "screen share layer changed");
             self.sync_stream(key, sharer, TrackType::Screen, now);

@@ -8,7 +8,7 @@ use prometheus::{
     TextEncoder,
 };
 use rtcd_sfu::ids::TrackType;
-use rtcd_sfu::metrics::{Direction, Metrics as SfuMetrics, NetTraffic};
+use rtcd_sfu::metrics::{Direction, Metrics as SfuMetrics, NetTraffic, ReceiverQuality};
 
 const NAMESPACE: &str = "rtcd";
 const LATENCY_BUCKETS: [f64; 14] = [
@@ -16,6 +16,13 @@ const LATENCY_BUCKETS: [f64; 14] = [
 ];
 const LOSS_BUCKETS: [f64; 12] = [
     0.001, 0.005, 0.0075, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0,
+];
+const RTT_BUCKETS: [f64; 12] = [
+    0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.25, 0.4, 0.6, 1.0, 2.0,
+];
+/// A receiver's bandwidth estimate, bits per second.
+const ESTIMATE_BUCKETS: [f64; 12] = [
+    100e3, 250e3, 500e3, 750e3, 1e6, 1.5e6, 2e6, 3e6, 4e6, 6e6, 10e6, 20e6,
 ];
 /// Handshakes and signaling take longer than packet latencies: seconds, not milliseconds.
 const SETUP_BUCKETS: [f64; 14] = [
@@ -47,6 +54,17 @@ pub struct Metrics {
     client_jitter: HistogramVec,
     ws_connections: GaugeVec,
     ws_messages: CounterVec,
+    /// Feedback receivers sent: [nack, pli, fir].
+    feedback: [Counter; 3],
+    retransmitted_packets: Counter,
+    retransmitted_bytes: Counter,
+    receiver_loss: prometheus::Histogram,
+    receiver_rtt: prometheus::Histogram,
+    estimate: prometheus::Histogram,
+    /// Seconds receivers spent on a shared screen's [small, large] layer.
+    screen_layer_seconds: [Counter; 2],
+    /// Keyframe requests: [sent, held back].
+    keyframe_requests: [Counter; 2],
 }
 
 impl std::fmt::Debug for Metrics {
@@ -93,6 +111,25 @@ fn histogram(
             .subsystem(subsystem)
             .buckets(buckets.to_vec()),
         labels,
+    )
+    .expect("valid metric");
+    r.register(Box::new(h.clone())).expect("unique metric");
+    h
+}
+
+fn plain_counter(r: &Registry, name: &str, help: &str) -> Counter {
+    let c = Counter::with_opts(Opts::new(name, help).namespace(NAMESPACE).subsystem("rtc"))
+        .expect("valid metric");
+    r.register(Box::new(c.clone())).expect("unique metric");
+    c
+}
+
+fn plain_histogram(r: &Registry, name: &str, help: &str, buckets: &[f64]) -> prometheus::Histogram {
+    let h = prometheus::Histogram::with_opts(
+        HistogramOpts::new(name, help)
+            .namespace(NAMESPACE)
+            .subsystem("rtc")
+            .buckets(buckets.to_vec()),
     )
     .expect("valid metric");
     r.register(Box::new(h.clone())).expect("unique metric");
@@ -288,6 +325,64 @@ impl Metrics {
                 "Total number of sent/received WebSocket messages",
                 &["clientID", "type", "direction"],
             ),
+            feedback: {
+                let family = counter(
+                    r,
+                    "rtc",
+                    "receiver_feedback_total",
+                    "Feedback receivers sent about the streams they get: retransmission requests (nack), keyframe requests (pli) and full intra requests (fir)",
+                    &["type"],
+                );
+                ["nack", "pli", "fir"].map(|t| family.with_label_values(&[t]))
+            },
+            retransmitted_packets: plain_counter(
+                r,
+                "retransmitted_packets_total",
+                "Packets sent to receivers again because they asked",
+            ),
+            retransmitted_bytes: plain_counter(
+                r,
+                "retransmitted_bytes_total",
+                "Bytes sent to receivers again because they asked",
+            ),
+            receiver_loss: plain_histogram(
+                r,
+                "receiver_loss_ratio",
+                "Fraction of packets lost on the way to a receiver, as it reports (a sample every few seconds per receiver)",
+                &LOSS_BUCKETS,
+            ),
+            receiver_rtt: plain_histogram(
+                r,
+                "receiver_rtt",
+                "Round trip time to a receiver, seconds (a sample every few seconds per receiver)",
+                &RTT_BUCKETS,
+            ),
+            estimate: plain_histogram(
+                r,
+                "bandwidth_estimate_bps",
+                "A receiver's bandwidth estimate, bits per second (a sample every few seconds per receiver)",
+                &ESTIMATE_BUCKETS,
+            ),
+            screen_layer_seconds: {
+                let family = counter(
+                    r,
+                    "rtc",
+                    "screen_layer_seconds_total",
+                    "Seconds receivers spent on each layer of a shared screen",
+                    &["layer"],
+                );
+                ["small", "large"].map(|l| family.with_label_values(&[l]))
+            },
+            keyframe_requests: {
+                let family = counter(
+                    r,
+                    "rtc",
+                    "keyframe_requests_total",
+                    "Keyframes asked of senders, sent or held back because one was asked a moment ago",
+                    &["result"],
+                );
+                ["sent", "held_back"].map(|l| family.with_label_values(&[l]))
+            },
             registry,
         }
     }
@@ -429,6 +524,38 @@ impl SfuMetrics for Metrics {
         }
     }
 
+    fn receiver_quality(&self, q: ReceiverQuality) {
+        for (c, n) in self.feedback.iter().zip([q.nacks, q.plis, q.firs]) {
+            if n > 0 {
+                c.inc_by(n as f64);
+            }
+        }
+        if q.retransmitted_packets > 0 {
+            self.retransmitted_packets
+                .inc_by(q.retransmitted_packets as f64);
+            self.retransmitted_bytes
+                .inc_by(q.retransmitted_bytes as f64);
+        }
+        if let Some(loss) = q.loss {
+            self.receiver_loss.observe(loss.clamp(0.0, 1.0));
+        }
+        if let Some(rtt) = q.rtt {
+            self.receiver_rtt.observe(rtt.as_secs_f64());
+        }
+    }
+
+    fn bandwidth_estimate(&self, bits_per_second: f64) {
+        self.estimate.observe(bits_per_second);
+    }
+
+    fn screen_layer_time(&self, large: bool, took: Duration) {
+        self.screen_layer_seconds[usize::from(large)].inc_by(took.as_secs_f64());
+    }
+
+    fn keyframe_request(&self, sent: bool) {
+        self.keyframe_requests[usize::from(!sent)].inc();
+    }
+
     fn rtp_write_time(&self, group: &str, kind: TrackType, took: Duration) {
         self.rtp_write_time
             .with_label_values(&[group, kind.as_str()])
@@ -455,6 +582,18 @@ mod tests {
         m.client_rtt("g", 0.05);
         m.client_jitter("g", 0.004);
         m.rtp_bytes_sent(TrackType::Voice, 1200);
+        m.receiver_quality(ReceiverQuality {
+            nacks: 3,
+            plis: 1,
+            retransmitted_packets: 3,
+            retransmitted_bytes: 3300,
+            loss: Some(0.02),
+            rtt: Some(Duration::from_millis(40)),
+            ..Default::default()
+        });
+        m.bandwidth_estimate(2.5e6);
+        m.screen_layer_time(true, Duration::from_secs(1));
+        m.keyframe_request(false);
         m.ws_connected("client");
         m.ws_message("client", "join", "in");
         let text = m.render();
@@ -471,6 +610,15 @@ mod tests {
             "rtcd_rtc_client_rtt_count",
             "rtcd_rtc_client_jitter_count",
             "rtcd_rtc_rtp_bytes_sent_total{type=\"voice\"} 1200",
+            "rtcd_rtc_receiver_feedback_total{type=\"nack\"} 3",
+            "rtcd_rtc_receiver_feedback_total{type=\"pli\"} 1",
+            "rtcd_rtc_retransmitted_packets_total 3",
+            "rtcd_rtc_retransmitted_bytes_total 3300",
+            "rtcd_rtc_receiver_loss_ratio_count 1",
+            "rtcd_rtc_receiver_rtt_count 1",
+            "rtcd_rtc_bandwidth_estimate_bps_count 1",
+            "rtcd_rtc_screen_layer_seconds_total{layer=\"large\"} 1",
+            "rtcd_rtc_keyframe_requests_total{result=\"held_back\"} 1",
             "rtcd_ws_connections_total{clientID=\"client\"} 1",
             "rtcd_ws_messages_total{clientID=\"client\",direction=\"in\",type=\"join\"} 1",
         ] {

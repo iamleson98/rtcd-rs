@@ -39,6 +39,14 @@ pub const NOMINAL_LOW_RATE: u64 = 500_000;
 
 /// The share of a layer's rate the estimate has to reach for the layer to be sent.
 const TOLERANCE: f64 = 0.9;
+/// A receiver that asked for the large layer keeps it unless its link is starved: the loss-based
+/// estimate (which only falls when packets are lost) below this share of the layer's rate for
+/// [`PIN_PATIENCE`], once the estimate has had [`PIN_GRACE`] to find its level. It returns to the
+/// large layer when the estimate passes [`PIN_RESUME`].
+const PIN_FLOOR: f64 = 0.4;
+const PIN_RESUME: f64 = 0.6;
+const PIN_GRACE: Duration = Duration::from_secs(30);
+const PIN_PATIENCE: Duration = Duration::from_secs(10);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
@@ -60,18 +68,41 @@ pub struct ScreenInputs {
 /// moving down is immediate, because a receiver short of bandwidth loses frames at once.
 #[derive(Debug)]
 pub struct ScreenLevel {
+    /// The receiver wants the large layer unless its link is starved.
+    pin: Option<Pin>,
     level: Layer,
     last_change: Option<Instant>,
     backoff: Duration,
+}
+
+#[derive(Debug)]
+struct Pin {
+    since: Instant,
+    starved_since: Option<Instant>,
 }
 
 impl ScreenLevel {
     /// Starts on the small layer, which every receiver can take.
     pub fn new() -> Self {
         Self {
+            pin: None,
             level: Layer::Low,
             last_change: None,
             backoff: INITIAL_BACKOFF,
+        }
+    }
+
+    /// Makes the large layer the receiver's from now on (see [`PIN_FLOOR`] for when it is let go),
+    /// or hands the choice back to the estimate.
+    pub fn pin_high(&mut self, pinned: bool, now: Instant) {
+        if !pinned {
+            self.pin = None;
+        } else if self.pin.is_none() {
+            self.pin = Some(Pin {
+                since: now,
+                starved_since: None,
+            });
+            self.level = Layer::High;
         }
     }
 
@@ -82,6 +113,26 @@ impl ScreenLevel {
     /// Returns the layer to send now, which is the current one unless the inputs call for a change.
     pub fn decide(&mut self, now: Instant, inputs: ScreenInputs) -> Layer {
         let high = inputs.high_rate.unwrap_or(NOMINAL_HIGH_RATE) as f64 * TOLERANCE;
+        if let Some(pin) = &mut self.pin {
+            match self.level {
+                Layer::High => {
+                    let starved = now.saturating_duration_since(pin.since) >= PIN_GRACE
+                        && inputs.loss_based < high * PIN_FLOOR;
+                    if starved {
+                        let since = *pin.starved_since.get_or_insert(now);
+                        if now.saturating_duration_since(since) >= PIN_PATIENCE {
+                            pin.starved_since = None;
+                            self.level = Layer::Low;
+                        }
+                    } else {
+                        pin.starved_since = None;
+                    }
+                }
+                Layer::Low if inputs.loss_based > high * PIN_RESUME => self.level = Layer::High,
+                Layer::Low => {}
+            }
+            return self.level;
+        }
         let wanted = match self.level {
             // Dropping needs both halves of the estimate to agree; the delay-based half alone
             // swings with every burst, and the loss-based one only falls when packets are lost.
@@ -163,6 +214,53 @@ mod tests {
             loss_based: target,
             high_rate: Some(1_000_000),
         }
+    }
+
+    #[test]
+    fn a_pinned_receiver_stays_on_the_large_layer_through_the_estimates_ramp_up() {
+        let mut level = ScreenLevel::new();
+        let t0 = Instant::now();
+        level.pin_high(true, t0);
+        assert_eq!(level.level(), Layer::High);
+        // An estimate that has not found its level yet does not take the layer away.
+        for s in 0..29 {
+            assert_eq!(
+                level.decide(t0 + Duration::from_secs(s), inputs(10_000.0)),
+                Layer::High
+            );
+        }
+    }
+
+    #[test]
+    fn a_pinned_receiver_whose_link_is_starved_falls_back_and_returns() {
+        let mut level = ScreenLevel::new();
+        let t0 = Instant::now();
+        level.pin_high(true, t0);
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        // Starved from 30 s on: still High for the patience, then Low.
+        assert_eq!(level.decide(at(30), inputs(10_000.0)), Layer::High);
+        assert_eq!(level.decide(at(39), inputs(10_000.0)), Layer::High);
+        assert_eq!(level.decide(at(41), inputs(10_000.0)), Layer::Low);
+        // The link recovers (the large layer is 1 Mbit/s here): back to it.
+        assert_eq!(level.decide(at(50), inputs(2_000_000.0)), Layer::High);
+        // A dip shorter than the patience changes nothing.
+        assert_eq!(level.decide(at(60), inputs(10_000.0)), Layer::High);
+        assert_eq!(level.decide(at(65), inputs(2_000_000.0)), Layer::High);
+        assert_eq!(level.decide(at(80), inputs(10_000.0)), Layer::High);
+        assert_eq!(level.decide(at(85), inputs(10_000.0)), Layer::High);
+    }
+
+    #[test]
+    fn handing_the_choice_back_restores_the_estimate() {
+        let mut level = ScreenLevel::new();
+        let t0 = Instant::now();
+        level.pin_high(true, t0);
+        level.pin_high(false, t0);
+        assert_eq!(
+            level.decide(t0, inputs(10_000.0)),
+            Layer::Low,
+            "the estimate decides again, and a starved link drops at once"
+        );
     }
 
     #[test]

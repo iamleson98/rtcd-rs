@@ -86,6 +86,7 @@ impl Engine {
             dc_queue: VecDeque::new(),
             up: Uplink::default(),
             down: Downlink::default(),
+            quality: Default::default(),
         };
         let session_id = session.cfg.session_id.clone();
         let key = self.sessions.insert(session);

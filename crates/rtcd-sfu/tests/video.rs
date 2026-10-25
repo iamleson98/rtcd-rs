@@ -435,6 +435,36 @@ fn a_receiver_with_bandwidth_to_spare_gets_the_large_screen_layer() {
 }
 
 #[test]
+fn a_receiver_that_asks_for_the_sharp_screen_gets_it_from_the_first_packet() {
+    // The estimate is capped far below the large layer's rate: only the request puts bob on it.
+    let cfg = rtcd_sfu::config::EngineConfig {
+        min_bitrate: 300_000,
+        max_bitrate: 600_000,
+        ..support::engine_config()
+    };
+    let mut w = World::with_config(cfg);
+    let a = w.join("alice", "call1");
+    let b = w.join("bob", "call1");
+    let c = w.join("carol", "call1");
+    w.dc_send(b, rtcd_proto::dc::DcMessage::SharpScreen(true));
+    w.share_screen(a);
+    w.run_for(Duration::from_secs(1));
+    w.stream_video(a, true, 4.0, 30, &BOTH);
+
+    let sharp = video_of(&w, b, "screen_");
+    assert!(
+        !sharp.is_empty() && sharp.iter().all(|(l, _)| *l == Layer::High),
+        "bob asked for the sharp layer, so he never gets the small one: {sharp:?}"
+    );
+    let plain = video_of(&w, c, "screen_");
+    assert_eq!(
+        plain.first().map(|(l, _)| *l),
+        Some(Layer::Low),
+        "carol starts on the small layer, as every receiver does"
+    );
+}
+
+#[test]
 fn a_subscription_with_null_lists_means_none_as_go_clients_encode_it() {
     let mut w = World::new();
     let a = w.join_with_camera("alice", "call1");

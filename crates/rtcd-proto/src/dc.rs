@@ -46,6 +46,10 @@ pub enum DcMessage {
     Unlock,
     /// Which mid carries which track, sent with every offer.
     MediaMap(BTreeMap<String, TrackInfo>),
+    /// A receiver that always wants a shared screen at its sharpest, whatever its bandwidth
+    /// estimate says (the session recorder: it keeps what it gets). An extension of this
+    /// service; the Go service never sends or receives it.
+    SharpScreen(bool),
 }
 
 impl DcMessage {
@@ -60,6 +64,7 @@ impl DcMessage {
             Self::Lock(_) => 7,
             Self::Unlock => 8,
             Self::MediaMap(_) => 9,
+            Self::SharpScreen(_) => 10,
         }
     }
 
@@ -71,8 +76,8 @@ impl DcMessage {
         out.push(self.wire_type());
         match self {
             Self::Ping | Self::Pong | Self::Unlock | Self::Lock(None) => {}
-            Self::Lock(Some(granted)) => {
-                rmp::encode::write_bool(&mut out, *granted).expect("vec write")
+            Self::Lock(Some(on)) | Self::SharpScreen(on) => {
+                rmp::encode::write_bool(&mut out, *on).expect("vec write")
             }
             Self::LossRate(v) | Self::RoundTripTime(v) | Self::Jitter(v) => {
                 rmp::encode::write_f64(&mut out, *v).expect("vec write");
@@ -163,6 +168,10 @@ impl DcMessage {
                 }
                 Self::MediaMap(map)
             }
+            10 => Self::SharpScreen(payload()?.as_bool().ok_or(ProtoError::Type {
+                field: "dc payload",
+                expected: "boolean",
+            })?),
             other => return Err(ProtoError::UnknownDcMessage(other)),
         })
     }

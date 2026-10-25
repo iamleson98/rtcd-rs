@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use rtcd_proto::{ClientMessage, Hello, Message, MessageType, SessionConfig, SessionRef};
@@ -64,7 +65,13 @@ pub struct Service {
     conns: Mutex<HashMap<String, ConnHandle>>,
     /// The connection each session's messages go to.
     session_conn: Mutex<HashMap<String, String>>,
+    /// Sessions that ended a moment ago. A browser that hangs up closes its media connection, which
+    /// ends the session, before the server's own `leave` for it arrives: that one is expected.
+    closed: Mutex<HashMap<String, Instant>>,
 }
+
+/// How long a closed session is remembered.
+const CLOSED_MEMORY: Duration = Duration::from_secs(60);
 
 impl std::fmt::Debug for Service {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -89,6 +96,7 @@ impl Service {
             system: SystemMonitor::default(),
             conns: Mutex::new(HashMap::new()),
             session_conn: Mutex::new(HashMap::new()),
+            closed: Mutex::new(HashMap::new()),
         })
     }
 
@@ -155,6 +163,8 @@ impl Service {
                 if self.owns(client_id, &r.session_id) {
                     debug!(session = %r.session_id, "leave");
                     self.sfu.leave(&r.session_id);
+                } else if self.closed_lately(&r.session_id) {
+                    debug!(session = %r.session_id, "leave for a session that already ended");
                 } else {
                     warn!(session = %r.session_id, client = client_id, "leave for a session the client does not have");
                 }
@@ -202,12 +212,23 @@ impl Service {
             return;
         }
         if !self.owns(client_id, &msg.session_id) {
-            warn!(session = %msg.session_id, client = client_id, "message for a session the client does not have");
+            if self.closed_lately(&msg.session_id) {
+                debug!(session = %msg.session_id, "message for a session that already ended");
+            } else {
+                warn!(session = %msg.session_id, client = client_id, "message for a session the client does not have");
+            }
             return;
         }
         if let Err(err) = self.sfu.signal(msg) {
             error!(%err, "failed to pass a message to the SFU");
         }
+    }
+
+    fn closed_lately(&self, session_id: &str) -> bool {
+        self.closed
+            .lock()
+            .get(session_id)
+            .is_some_and(|t| t.elapsed() < CLOSED_MEMORY)
     }
 
     fn send_close(&self, conn_id: &str, session_id: &str) {
@@ -251,6 +272,11 @@ impl Service {
             } => {
                 let conn = self.session_conn.lock().remove(&session_id);
                 debug!(session = %session_id, ?reason, "session closed");
+                {
+                    let mut closed = self.closed.lock();
+                    closed.retain(|_, t| t.elapsed() < CLOSED_MEMORY);
+                    closed.insert(session_id.clone(), Instant::now());
+                }
                 if let Some(conn) = conn {
                     self.send_close(&conn, &session_id);
                 }

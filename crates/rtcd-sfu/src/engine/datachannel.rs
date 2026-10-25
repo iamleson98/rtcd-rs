@@ -105,6 +105,13 @@ impl Engine {
             DcMessage::Ping => self.dc_send(key, DcMessage::Pong, now),
             DcMessage::Pong | DcMessage::MediaMap(_) | DcMessage::Lock(Some(_)) => {}
             DcMessage::Sdp(json) => self.remote_description(key, &json, Channel::Dc, now),
+            DcMessage::SharpScreen(on) => {
+                if let Some(s) = self.sessions.get_mut(key) {
+                    debug!(session = %s.cfg.session_id, on, "the receiver wants the sharp screen layer");
+                    s.down.screen_level.pin_high(on, now);
+                }
+                self.review_screen_level(key, now);
+            }
             DcMessage::LossRate(v) => self.metrics.client_loss_rate(&group, v),
             DcMessage::RoundTripTime(v) => self.metrics.client_rtt(&group, v),
             DcMessage::Jitter(v) => self.metrics.client_jitter(&group, v),

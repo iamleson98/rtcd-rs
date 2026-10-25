@@ -80,11 +80,43 @@ pub trait Metrics: Send + Sync + 'static {
     fn net_traffic(&self, traffic: NetTraffic) {
         let _ = traffic;
     }
+    /// What one receiver's feedback and reports say about the streams it gets, since the last
+    /// time this was reported for it.
+    fn receiver_quality(&self, quality: ReceiverQuality) {
+        let _ = quality;
+    }
+    /// A receiver's bandwidth estimate, bits per second (sampled).
+    fn bandwidth_estimate(&self, bits_per_second: f64) {
+        let _ = bits_per_second;
+    }
+    /// Time a receiver spent on one layer of a shared screen.
+    fn screen_layer_time(&self, large: bool, took: Duration) {
+        let _ = (large, took);
+    }
+    /// A keyframe was asked of a sender (`sent`), or held back because it was asked a moment ago.
+    fn keyframe_request(&self, sent: bool) {
+        let _ = sent;
+    }
     /// How long writing one packet to one receiver took. Reported for a sample of the packets: the
     /// clock reads would cost more than they tell if every write were timed.
     fn rtp_write_time(&self, group: &str, kind: TrackType, took: Duration) {
         let _ = (group, kind, took);
     }
+}
+
+/// One receiver's feedback over a span, and what its last report said.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct ReceiverQuality {
+    /// Retransmission requests, keyframe requests (PLI) and full intra requests it sent.
+    pub nacks: u64,
+    pub plis: u64,
+    pub firs: u64,
+    /// Packets and bytes sent to it again because it asked.
+    pub retransmitted_packets: u64,
+    pub retransmitted_bytes: u64,
+    /// The fraction of packets it reports lost, and the round trip time it measures.
+    pub loss: Option<f64>,
+    pub rtt: Option<Duration>,
 }
 
 /// Traffic on the sockets over some span, per transport.
