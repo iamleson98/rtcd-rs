@@ -317,6 +317,18 @@ impl Session {
                     self.call.presence(data, false);
                 }
             }
+            "custom_calls_user_video_off" if in_room => {
+                if let Some(data) = &ev.data {
+                    self.call.stopped(data, crate::media::CAMERA);
+                }
+            }
+            "custom_calls_user_screen_off" if in_room => {
+                if let Some(data) = &ev.data {
+                    self.call.stopped(data, crate::media::SCREEN);
+                    // Its sound goes with it.
+                    self.call.stopped(data, crate::media::SCREEN_AUDIO);
+                }
+            }
             "custom_calls_call_start"
             | "custom_calls_call_end"
             | "custom_calls_user_joined"

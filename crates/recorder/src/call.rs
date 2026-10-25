@@ -254,6 +254,24 @@ impl Call {
         }
     }
 
+    /// A person turned their camera or share off (`user_video_off`, `user_screen_off`).
+    pub fn stopped(&self, data: &RawValue, kind: &'static str) {
+        #[derive(Deserialize)]
+        struct P {
+            #[serde(default)]
+            session_id: String,
+        }
+        let Some(peer) = &self.peer else { return };
+        if let Ok(p) = serde_json::from_str::<P>(data.get())
+            && !p.session_id.is_empty()
+        {
+            peer.send(Cmd::Stopped {
+                kind,
+                session_id: p.session_id,
+            });
+        }
+    }
+
     /// Whether nobody but the recorder is in the call.
     pub fn alone(&self) -> bool {
         self.others.is_empty()

@@ -39,6 +39,12 @@ use tracing::{debug, info, warn};
 pub use crate::media::Users;
 use crate::media::{Recording, StreamInfo, StreamRecorder, track_kind};
 
+/// Whether the environment asks for the screen at whatever size rtcd's estimate allows
+/// (`SCREEN_QUALITY=auto`) instead of the sharp layer.
+fn screen_quality_auto() -> bool {
+    std::env::var("SCREEN_QUALITY").is_ok_and(|v| v.trim().eq_ignore_ascii_case("auto"))
+}
+
 /// Upkeep of the streams (gaps given up, idle files closed, keyframes asked for).
 const HOUSEKEEPING: Duration = Duration::from_millis(250);
 
@@ -118,6 +124,12 @@ pub enum Cmd {
         sdp: String,
     },
     Candidate(RTCIceCandidateInit),
+    /// A person turned their camera or screen share off (the call's `user_video_off` and
+    /// `user_screen_off`): the file ends now, not when the silence has gone on long enough.
+    Stopped {
+        kind: &'static str,
+        session_id: String,
+    },
     /// End the connection and finish the files.
     Close,
 }
@@ -377,7 +389,15 @@ impl Task {
                 }
             }
             RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnOpen(id)) => {
-                self.dc = Some(id)
+                self.dc = Some(id);
+                // A recording keeps what it gets: the shared screen at its sharpest from the first
+                // frame, not at the size a bandwidth estimate (which a receiver of the small layer
+                // cannot raise) allows. rtcd honours it; the Go service ignores the frame. The
+                // sharp layer is two to three times the bytes of the small one, in storage and in
+                // every replay: SCREEN_QUALITY=auto leaves the choice to rtcd.
+                if !screen_quality_auto() {
+                    self.dc_send(&DcMessage::SharpScreen(true));
+                }
             }
             RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnClose(_)) => {
                 self.dc = None
@@ -390,7 +410,26 @@ impl Task {
                     init.ssrc,
                 );
             }
+            RTCPeerConnectionEvent::OnTrack(RTCTrackEvent::OnClose(id)) => self.track_closed(&id),
             _ => {}
+        }
+    }
+
+    /// The SFU removed a track (a camera or a share ended): its file ends now, with the picture
+    /// that was on screen held until this moment.
+    fn track_closed(&mut self, track_id: &str) {
+        self.ignored.retain(|i| i != track_id);
+        self.receivers.remove(track_id);
+        if let Some(mut s) = self.streams.remove(track_id) {
+            s.rec.finish(Instant::now(), "the track was removed");
+            if s.rec.lost > 0 {
+                info!(
+                    kind = s.rec.info().kind,
+                    session_id = s.rec.info().session_id,
+                    lost = s.rec.lost,
+                    "packets were lost"
+                );
+            }
         }
     }
 
@@ -508,6 +547,15 @@ impl Task {
                     warn!(error = %e, "candidate refused");
                 }
             }
+            Cmd::Stopped { kind, session_id } => {
+                let now = Instant::now();
+                for s in self.streams.values_mut() {
+                    let i = s.rec.info();
+                    if i.kind == kind && i.session_id == session_id {
+                        s.rec.stop(now, "the sender turned it off");
+                    }
+                }
+            }
             Cmd::Close => {}
         }
     }
@@ -585,7 +633,7 @@ impl Task {
     fn finish(&mut self) {
         let now = Instant::now();
         for (_, mut s) in self.streams.drain() {
-            s.rec.finish(now);
+            s.rec.finish(now, "the call ended");
             if s.rec.lost > 0 {
                 info!(
                     kind = s.rec.info().kind,

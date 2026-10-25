@@ -15,17 +15,28 @@ use std::time::{Duration, Instant};
 
 use rtc::rtp::packet::Packet;
 use serde::Serialize;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::disk::Disk;
 use crate::reorder::{Item, Reorder};
 use crate::vp8;
 use crate::webm::{Track, WebmWriter};
 
-/// Media that stops this long (a muted microphone, a camera turned off, a dropped connection)
-/// closes its file; the next frame opens a new one. Shorter gaps are bridged (audio with
-/// silence), so a file plays as one continuous stream.
+/// A voice that stops this long (a muted microphone, a dropped connection) closes its file; the
+/// next frame opens a new one. Shorter gaps are bridged with silence, so a file plays as one
+/// continuous stream.
 pub const SEGMENT_GAP: Duration = Duration::from_secs(2);
+/// A shared screen that sends nothing is still there: a still screen sends a frame a second at
+/// best and nothing at all for seconds at a time, and the player shows a file only while it
+/// covers the moment, so closing the file would blank the screen. The last picture is held (the
+/// file stays open) until the share ends, which the SFU and the server say; this is the longest
+/// silence waited for if they never do.
+pub const VIDEO_HOLD: Duration = Duration::from_secs(30);
+/// A camera sends all the time, so a camera that stops for this long is off or gone. Turning it
+/// off is announced too (`user_video_off`), and ends its file at once.
+pub const CAMERA_HOLD: Duration = Duration::from_secs(5);
+/// How long after a person turns a camera or share off the frames still arriving are dropped.
+const TURN_OFF_TAIL: Duration = Duration::from_millis(1500);
 /// Each recorded camera and screen is asked for a keyframe this often: a seek decodes from the
 /// keyframe before the target, and browsers otherwise send one only every few minutes.
 pub const KEYFRAME_EVERY: Duration = Duration::from_secs(20);
@@ -143,6 +154,8 @@ pub struct StreamInfo {
 
 struct Segment {
     entry: Entry,
+    /// The picture size the file was opened with (the first keyframe's).
+    size: (u32, u32),
     writer: WebmWriter,
     /// The last frame's RTP timestamp, and its time unwrapped, relative to the first.
     prev_ts: u32,
@@ -168,6 +181,8 @@ pub struct StreamRecorder {
     /// A video frame went missing: nothing is written until the next keyframe.
     need_key: bool,
     last_ask: Option<Instant>,
+    /// Frames before this are the tail of a stream the sender has just turned off.
+    ignore_until: Option<Instant>,
     /// Frames and packets lost, for the log at the end.
     pub lost: u64,
 }
@@ -201,6 +216,7 @@ impl StreamRecorder {
             last_media: None,
             need_key: false,
             last_ask: None,
+            ignore_until: None,
             lost: 0,
         }
     }
@@ -224,11 +240,22 @@ impl StreamRecorder {
         if self.seg.is_some()
             && self
                 .last_media
-                .is_some_and(|m| now.saturating_duration_since(m) > SEGMENT_GAP)
+                .is_some_and(|m| now.saturating_duration_since(m) > self.silence_limit())
         {
-            self.close_segment();
+            self.close_segment("silent", None);
         }
         self.want_keyframe(now)
+    }
+
+    /// How long a stream may send nothing before its file is closed.
+    fn silence_limit(&self) -> Duration {
+        if !self.info.video {
+            SEGMENT_GAP
+        } else if self.info.kind == CAMERA {
+            CAMERA_HOLD
+        } else {
+            VIDEO_HOLD
+        }
     }
 
     /// Whether to ask a video sender for a keyframe now: often while a file waits for its first
@@ -293,14 +320,27 @@ impl StreamRecorder {
     }
 
     fn video_frame(&mut self, arrived: Instant, ts: u32, key: bool, data: &[u8]) {
+        if self.ignore_until.is_some_and(|t| arrived < t) {
+            return;
+        }
         if self.seg.is_some()
             && self
                 .last_media
-                .is_some_and(|m| arrived.saturating_duration_since(m) > SEGMENT_GAP)
+                .is_some_and(|m| arrived.saturating_duration_since(m) > self.silence_limit())
         {
-            self.close_segment();
+            self.close_segment("silent", None);
         }
         self.last_media = Some(arrived);
+        // A keyframe of another size (the SFU moved the share to its other layer, or the sharer
+        // picked another window) starts a file of its own, so each file's header tells the truth.
+        // The old picture is held up to the new one.
+        if key
+            && let Some(seg) = &self.seg
+            && let Some(size) = vp8::size(data)
+            && seg.size != size
+        {
+            self.close_segment("the picture changed size", Some(arrived));
+        }
         if key {
             self.need_key = false;
         }
@@ -327,7 +367,7 @@ impl StreamRecorder {
     }
 
     fn audio_frame(&mut self, now: Instant, ts: u32, data: &[u8]) {
-        if data.is_empty() {
+        if data.is_empty() || self.ignore_until.is_some_and(|t| now < t) {
             return;
         }
         if self.seg.is_some()
@@ -335,7 +375,7 @@ impl StreamRecorder {
                 .last_media
                 .is_some_and(|m| now.saturating_duration_since(m) > SEGMENT_GAP)
         {
-            self.close_segment();
+            self.close_segment("silent", None);
         }
         self.last_media = Some(now);
         if self.seg.is_none()
@@ -372,8 +412,18 @@ impl StreamRecorder {
             size: 0,
             path,
         };
+        info!(
+            kind = self.info.kind,
+            session_id = self.info.session_id,
+            file = %entry.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            start_ms = entry.start_ms,
+            width = size.0,
+            height = size.1,
+            "file opened"
+        );
         self.seg = Some(Segment {
             entry,
+            size,
             writer,
             prev_ts: ts,
             ext: 0,
@@ -410,15 +460,33 @@ impl StreamRecorder {
         seg.end_ms = seg.end_ms.max(ms + span);
     }
 
-    fn close_segment(&mut self) {
+    /// Finishes the open file. `hold_until` is when a picture that is still on screen stops being
+    /// shown (the camera or share ended, or its next picture came), so the file covers that long;
+    /// `None` ends it with its last frame.
+    fn close_segment(&mut self, why: &'static str, hold_until: Option<Instant>) {
         let Some(mut seg) = self.seg.take() else {
             return;
         };
+        if self.info.video
+            && let Some(t) = hold_until
+        {
+            let held = self.rec.at(t) - seg.entry.start_ms;
+            seg.end_ms = seg.end_ms.max(held);
+        }
         let path = seg.entry.path.clone();
         match seg.writer.finish(seg.end_ms) {
             Ok(done) => {
                 seg.entry.size = done.size;
                 seg.entry.end_ms = seg.entry.start_ms + seg.end_ms;
+                info!(
+                    kind = self.info.kind,
+                    session_id = self.info.session_id,
+                    start_ms = seg.entry.start_ms,
+                    end_ms = seg.entry.end_ms,
+                    bytes = done.size,
+                    why,
+                    "file closed"
+                );
                 self.rec.add(seg.entry);
             }
             Err(e) => {
@@ -432,11 +500,27 @@ impl StreamRecorder {
         }
     }
 
-    /// The stream ended: what is held is released and the file is finished.
-    pub fn finish(&mut self, now: Instant) {
+    /// The stream ended at `now` (its track was removed, or the call ended): what is held is
+    /// released and the file is finished. A picture that was on screen stays until `now`.
+    pub fn finish(&mut self, now: Instant, why: &'static str) {
         // Packets behind a gap are released as they are.
         self.drain(now, now + Duration::from_secs(3600));
-        self.close_segment();
+        // A stream that had been silent beyond the limit ended before `now`; its last picture is
+        // not held up to it.
+        let held = self
+            .last_media
+            .is_some_and(|m| now.saturating_duration_since(m) <= self.silence_limit())
+            .then_some(now);
+        self.close_segment(why, held);
+    }
+
+    /// The sender turned this stream off (the call said so); the stream stays, a later frame
+    /// opens a new file.
+    pub fn stop(&mut self, now: Instant, why: &'static str) {
+        self.finish(now, why);
+        self.last_media = None;
+        // Packets already on their way would open a file for a stream that is over.
+        self.ignore_until = Some(now + TURN_OFF_TAIL);
     }
 }
 
@@ -565,7 +649,7 @@ mod tests {
             50,
         );
         speak(&mut s, start + Duration::from_secs(8), 200, 400_000, 25);
-        s.finish(start + Duration::from_secs(9));
+        s.finish(start + Duration::from_secs(9), "test");
 
         let files = rec.files();
         assert_eq!(files.len(), 2, "{files:?}");
@@ -607,7 +691,7 @@ mod tests {
                 opus(*seq, u32::from(*seq) * 960, &[0xfc, 1, 2]),
             );
         }
-        s.finish(start + Duration::from_millis(100));
+        s.finish(start + Duration::from_millis(100), "test");
         let files = rec.files();
         assert_eq!(
             files.len(),
@@ -636,7 +720,7 @@ mod tests {
             s.tick(start + Duration::from_millis(1000 + 400 * u64::from(i)));
         }
         speak(&mut s, start + Duration::from_secs(6), 163, 6 * 48_000, 50);
-        s.finish(start + Duration::from_secs(8));
+        s.finish(start + Duration::from_secs(8), "test");
 
         let files = rec.files();
         assert_eq!(files.len(), 1, "{files:?}");
@@ -675,13 +759,17 @@ mod tests {
                 opus(10 + i, u32::from(*i) * 960, &[0xfc, 1]),
             );
         }
-        s.finish(start + Duration::from_secs(1));
+        s.finish(start + Duration::from_secs(1), "test");
         let times = block_times(&rec.files()[0].path);
         assert_eq!(times, [0, 20, 40, 60, 80, 100, 120]);
     }
 
-    /// A one-packet VP8 frame; keyframes carry their size.
+    /// A one-packet VP8 frame; keyframes carry their size (640x360 here).
     fn vp8_frame(seq: u16, ts: u32, key: bool) -> Packet {
+        vp8_sized(seq, ts, key, 640, 360)
+    }
+
+    fn vp8_sized(seq: u16, ts: u32, key: bool, w: u16, h: u16) -> Packet {
         let mut p = Packet::default();
         p.header.sequence_number = seq;
         p.header.timestamp = ts;
@@ -690,7 +778,18 @@ mod tests {
         p.header.ssrc = 7;
         let frame: &[u8] = if key {
             &[
-                0x10, 0x00, 0x00, 0x00, 0x9d, 0x01, 0x2a, 0x80, 0x02, 0x68, 0x01, 0xaa,
+                0x10,
+                0x00,
+                0x00,
+                0x00,
+                0x9d,
+                0x01,
+                0x2a,
+                w as u8,
+                (w >> 8) as u8,
+                h as u8,
+                (h >> 8) as u8,
+                0xaa,
             ]
         } else {
             &[0x10, 0x01, 0x00, 0x00, 0x00]
@@ -709,7 +808,7 @@ mod tests {
             let now = start + Duration::from_millis(66 * u64::from(i));
             asked += usize::from(s.packet(now, vp8_frame(i as u16, i * 6000, key)));
         }
-        s.finish(start + Duration::from_secs(4));
+        s.finish(start + Duration::from_secs(4), "test");
         assert!(asked >= 1, "no keyframe was asked for while waiting");
         let files = rec.files();
         assert_eq!(files.len(), 1);
@@ -746,7 +845,7 @@ mod tests {
             }
             s.tick(now);
         }
-        s.finish(start + Duration::from_secs(5));
+        s.finish(start + Duration::from_secs(5), "test");
         let files = rec.files();
         assert_eq!(
             files.len(),
@@ -780,7 +879,7 @@ mod tests {
                 vp8_frame(*i, u32::from(*i) * 3000, *i == 0),
             );
         }
-        s.finish(start + Duration::from_secs(1));
+        s.finish(start + Duration::from_secs(1), "test");
         let files = rec.files();
         assert_eq!(files.len(), 1);
         assert_eq!(block_times(&files[0].path), [0, 33, 66, 100, 133]);
@@ -797,7 +896,7 @@ mod tests {
             "half a second of speech is under the limit"
         );
         speak(&mut s, start + Duration::from_secs(11), 100, 600_000, 6000);
-        s.finish(start + Duration::from_secs(140));
+        s.finish(start + Duration::from_secs(140), "test");
         assert!(
             rec.disk.is_full(),
             "two minutes of speech ({} bytes) passed the 32 KiB limit",
@@ -834,5 +933,125 @@ mod tests {
             serde_json::to_string(&e).unwrap(),
             r#"{"kind":"camera","session_id":"s","start_ms":5,"end_ms":9,"size":7}"#
         );
+    }
+
+    fn screen(rec: &Arc<Recording>) -> StreamRecorder {
+        StreamRecorder::new(
+            StreamInfo {
+                kind: SCREEN,
+                session_id: "s".into(),
+                video: true,
+            },
+            rec.clone(),
+            Users::default(),
+        )
+    }
+
+    #[test]
+    fn a_still_screen_stays_in_one_file_across_seconds_of_silence() {
+        let (rec, start) = setup("still", u64::MAX);
+        let mut s = screen(&rec);
+        // A frame a second, then nothing for 6 s (more than the voice gap), then frames again.
+        for i in 0..4u32 {
+            let now = start + Duration::from_secs(u64::from(i));
+            s.packet(now, vp8_frame(i as u16, i * 90_000, i == 0));
+            s.tick(now);
+        }
+        for t in 4..10u64 {
+            s.tick(start + Duration::from_secs(t));
+        }
+        for i in 10..13u32 {
+            let now = start + Duration::from_secs(u64::from(i));
+            s.packet(now, vp8_frame(i as u16 - 6, i * 90_000, false));
+            s.tick(now);
+        }
+        // The share ends at 14 s: the last picture stays up until then.
+        s.finish(start + Duration::from_secs(14), "the track was removed");
+        let files = rec.files();
+        assert_eq!(
+            files.len(),
+            1,
+            "the silence must not blank the screen: {files:?}"
+        );
+        assert_eq!((files[0].start_ms, files[0].end_ms), (0, 14_000));
+        assert_eq!(block_times(&files[0].path).len(), 7);
+    }
+
+    #[test]
+    fn a_screen_that_never_says_it_ended_is_closed_after_the_hold() {
+        let (rec, start) = setup("hold", u64::MAX);
+        let mut s = screen(&rec);
+        s.packet(start, vp8_frame(0, 0, true));
+        s.tick(start + VIDEO_HOLD - Duration::from_secs(1));
+        assert!(rec.files().is_empty());
+        s.tick(start + VIDEO_HOLD + Duration::from_secs(1));
+        let files = rec.files();
+        assert_eq!(files.len(), 1);
+        assert!(
+            files[0].end_ms < 1000,
+            "ends with its last frame: {files:?}"
+        );
+    }
+
+    #[test]
+    fn a_new_picture_size_starts_a_new_file_without_a_hole() {
+        let (rec, start) = setup("resize", u64::MAX);
+        let mut s = screen(&rec);
+        for i in 0..10u32 {
+            let now = start + Duration::from_millis(100 * u64::from(i));
+            s.packet(now, vp8_sized(i as u16, i * 9000, i == 0, 1791, 1120));
+        }
+        // 2.1 s with no frame (the SFU switching layers), then a keyframe of the other size.
+        let at = start + Duration::from_millis(3000);
+        s.packet(at, vp8_sized(10, 30 * 9000, true, 3584, 1952));
+        s.finish(start + Duration::from_secs(4), "test");
+        let files = rec.files();
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert_eq!((files[0].width, files[0].height), (1791, 1120));
+        assert_eq!((files[1].width, files[1].height), (3584, 1952));
+        assert_eq!(
+            files[0].end_ms, files[1].start_ms,
+            "the old picture is held until the new one: {files:?}"
+        );
+    }
+
+    #[test]
+    fn frames_still_in_flight_after_a_camera_is_turned_off_open_no_file() {
+        let (rec, start) = setup("tail", u64::MAX);
+        let mut s = camera(&rec);
+        for i in 0..10u32 {
+            s.packet(
+                start + Duration::from_millis(33 * u64::from(i)),
+                vp8_frame(i as u16, i * 3000, i == 0),
+            );
+        }
+        // Turned off at 400 ms; a keyframe and more frames were already on their way.
+        s.stop(
+            start + Duration::from_millis(400),
+            "the sender turned it off",
+        );
+        for i in 10..20u32 {
+            s.packet(
+                start + Duration::from_millis(400 + 33 * u64::from(i - 10)),
+                vp8_frame(i as u16, i * 3000, i == 10),
+            );
+        }
+        s.tick(start + Duration::from_secs(20));
+        s.finish(start + Duration::from_secs(20), "test");
+        let files = rec.files();
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(
+            files[0].end_ms, 400,
+            "the picture is held until it was turned off"
+        );
+        // And it can be turned on again.
+        for i in 20..30u32 {
+            s.packet(
+                start + Duration::from_secs(5) + Duration::from_millis(33 * u64::from(i - 20)),
+                vp8_frame(i as u16, i * 3000, i == 20),
+            );
+        }
+        s.finish(start + Duration::from_secs(6), "test");
+        assert_eq!(rec.files().len(), 2);
     }
 }

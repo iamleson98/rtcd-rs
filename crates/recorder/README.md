@@ -10,9 +10,22 @@ endpoints, the same manifest, the same files, the same JSON log lines, the same 
   sound rtcd forwards is written as it arrives, VP8 and Opus straight into WebM, with no decoding or
   re-encoding. A file is one continuous stretch of one person's stream (a camera from on to off, a voice
   while unmuted); short holes are bridged (audio with silence), longer ones start a new file, and a file
-  that stays quiet is finished at once, not at the end. Video files open on a keyframe, and the recorder
-  asks for one every 20 s so the player seeks quickly. Files carry cues and a duration, so browsers seek in
-  them.
+  that stays quiet is finished at once, not at the end. A shared screen or a camera is different: a still
+  screen sends nothing for seconds at a time, and the replay shows a file only while it covers the moment, so
+  a video file stays open (its last picture held) until the person turns it off (`user_video_off`,
+  `user_screen_off`), the SFU removes the track, or the call ends; a camera that vanishes without saying so is
+  closed after 5 s, a screen after 30 s. A picture that changes size (the screen moved to another layer or
+  window) starts a file of its own with no hole, so each header tells the truth. Video files open on a
+  keyframe, and the recorder asks for one every 20 s so the player seeks quickly. Files carry cues and a
+  duration, so browsers seek in them.
+- **Quality**: the shared screen is recorded on its sharp simulcast layer from the first frame (the recorder
+  asks rtcd over the data channel; rtcd lets go of it only when the link is starved). Left to rtcd's bandwidth
+  estimate a receiver of the small layer cannot raise the estimate, and a real class was recorded at half
+  resolution for most of its length. The sharp layer is two to three times the bytes in storage and in every
+  replay; `SCREEN_QUALITY=auto` in the recorder's environment leaves the choice to rtcd, as the Go recorder
+  did.
+- **Log**: one line when a file opens and one when it closes, with why (`silent`, `the track was removed`,
+  `the sender turned it off`, `the picture changed size`, `the call ended`).
 - **Board** (`board.rs`): the whiteboard's snapshot at the start and every change after (strokes, moves,
   deletes, clears, the lock, people's pointers and the strokes they are drawing), with its time, as
   gzipped NDJSON.
@@ -30,7 +43,10 @@ endpoints, the same manifest, the same files, the same JSON log lines, the same 
 |---|---|---|
 | A video frame that is lost for good | the frames after it are written, though they refer to it | the file holds its last good picture, the sender is asked for a keyframe at once, and the next one resumes the picture. The simulator cannot show a difference: the SFU's retransmissions recover every loss it can inject on loopback, so this is a safeguard, not a measured gain |
 | Packets arriving out of order | a 50-packet sample builder | a reorder ring that waits for a retransmission (300 ms for video, 120 ms for voice), then gives the gap up |
-| A camera that goes quiet | its file is finished when the next frame arrives, or at the end of the recording | finished 2 s after the last frame, so a crash later loses nothing already closed |
+| A camera that goes quiet | its file is finished when the next frame arrives, or at the end of the recording | finished at once when the person turns it off, 5 s after the last frame if they never say so, so a crash later loses nothing already closed |
+| A still screen share | closed after 2 s without a frame; the replay shows no screen until the next file starts (2 s and 5 s holes in a real 5-minute class) | one file, the last picture held until the share ends |
+| Screen share quality | whatever size rtcd's bandwidth estimate allows: the small layer for 212 of 282 s in a real class | the sharp layer, asked for |
+| A picture that changes size | the file header keeps the first size | a new file with no hole, with its own size |
 | Who a file belongs to | read when the track appears, which can be before the server has said who it is | read when the file opens |
 | Opus in WebM | no `CodecDelay` / `SeekPreRoll` | both, as the spec asks |
 

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use lms_sim::assets::Assets;
 use lms_sim::class::{self, Ctl, Participant, Spec};
-use lms_sim::host::Rtcd;
+use lms_sim::host::{Impair, Rtcd};
 use lms_sim::lms::{CHAN_ID, Lms, REC_ID};
 use recorder::api::Api;
 use recorder::config::Config;
@@ -52,9 +52,13 @@ struct Class {
 
 impl Class {
     async fn start(tag: &str, assets: Arc<Assets>) -> Self {
+        Self::start_impaired(tag, assets, Impair::default()).await
+    }
+
+    async fn start_impaired(tag: &str, assets: Arc<Assets>, impair: Impair) -> Self {
         let dir = std::env::temp_dir().join(format!("recorder-e2e-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let rtcd = Arc::new(Rtcd::start().await);
+        let rtcd = Arc::new(Rtcd::start_impaired(impair).await);
         let lms = Lms::start(Some(rtcd.clone()), dir.join("lms")).await;
         Self {
             rtcd,
@@ -405,6 +409,11 @@ async fn a_camera_turned_off_and_on_makes_two_files() {
     c.recorder_in().await;
     tokio::time::sleep(Duration::from_secs(3)).await;
     c.people[0].control(Ctl::Camera(false));
+    c.lms.emit(
+        "custom_calls_user_video_off",
+        CHAN_ID,
+        json!({ "userID": c.people[0].user_id, "session_id": c.people[0].session_id }),
+    );
     tokio::time::sleep(Duration::from_secs(4)).await;
     c.people[0].control(Ctl::Camera(true));
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -423,6 +432,126 @@ async fn a_camera_turned_off_and_on_makes_two_files() {
         let p = probe(e);
         assert_eq!(p.codec, "vp8");
     }
+    c.finish().await;
+}
+
+/// A shared screen that does not change sends nothing for seconds: the replay must still show it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_still_screen_share_is_one_file_and_ends_when_the_share_does() {
+    let Some(assets) = assets() else { return };
+    let mut c = Class::start("still-screen", assets).await;
+    c.join(Spec {
+        name: "p0".into(),
+        voice: false,
+        camera: false,
+        screen: true,
+    })
+    .await;
+    let rec = c.record();
+    c.recorder_in().await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Nothing is sent for 6 s, longer than a voice is waited for.
+    c.people[0].control(Ctl::Screen(false));
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    c.people[0].control(Ctl::Screen(true));
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    c.people[0].control(Ctl::Screen(false));
+    c.lms.emit(
+        "custom_calls_user_screen_off",
+        CHAN_ID,
+        json!({ "userID": c.people[0].user_id, "session_id": c.people[0].session_id }),
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    c.stop();
+    rec.await.unwrap().expect("the recording completes");
+
+    let m = c.manifest();
+    let screens = of_kind(&m, "screen");
+    assert_eq!(
+        screens.len(),
+        1,
+        "the silence must not split the share: {m:#?}"
+    );
+    let s = screens[0];
+    let p = probe(s);
+    assert_eq!(p.codec, "vp8");
+    // About 12 s of share: 3 s, 6 s of silence, 3 s; the picture is held to where it ended and
+    // not to the end of the recording.
+    let span = s.end_ms - s.start_ms;
+    assert!((11_000..=14_500).contains(&span), "{span} ms: {m:#?}");
+    c.finish().await;
+}
+
+/// The value of a metric line in Prometheus text, summed over its labels.
+fn metric(text: &str, name: &str) -> f64 {
+    text.lines()
+        .filter(|l| l.starts_with(name) && l[name.len()..].starts_with([' ', '{']))
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+        .sum()
+}
+
+/// 5 % of the packets lost in each direction, 40 ms each way with 30 ms of jitter (so packets
+/// overtake one another): the SFU asks the senders for what it is missing, the recorder asks the
+/// SFU, and the files come out as if the network were fine.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_network_costs_the_recording_nothing_it_can_get_back() {
+    let Some(assets) = assets() else { return };
+    let mut c = Class::start_impaired(
+        "bad-network",
+        assets,
+        Impair {
+            down_loss: 0.05,
+            up_loss: 0.05,
+            delay_ms: 40,
+            jitter_ms: 30,
+            ..Default::default()
+        },
+    )
+    .await;
+    for (name, camera, screen) in [("p0", true, true), ("p1", true, false)] {
+        c.join(Spec {
+            name: name.into(),
+            voice: true,
+            camera,
+            screen,
+        })
+        .await;
+    }
+    let rec = c.record();
+    c.recorder_in().await;
+    tokio::time::sleep(Duration::from_secs(14)).await;
+    let metrics = c.rtcd.metrics();
+    c.stop();
+    rec.await.unwrap().expect("the recording completes");
+
+    let m = c.manifest();
+    for e in m.iter().filter(|e| e.kind != "board") {
+        let p = probe(e);
+        let seconds = (e.end_ms - e.start_ms) as f64 / 1000.0;
+        let (fps, floor) = match e.kind.as_str() {
+            "voice" => (50.0, 0.95),
+            "camera" => (30.0, 0.85),
+            "screen" => (15.0, 0.85),
+            _ => unreachable!(),
+        };
+        // Written frames over the frames of the time the file covers. The recorder's silence
+        // bridging counts for voice; a video frame lost for good is skipped until a keyframe.
+        let got = p.frames as f64 / (seconds * fps);
+        eprintln!("{} {:.0} %", e.kind, got * 100.0);
+        assert!(
+            got >= floor,
+            "{e:?}: {} frames in {seconds} s is {:.0} % of what was sent",
+            p.frames,
+            got * 100.0
+        );
+    }
+    // The SFU saw the loss, and its metrics say so.
+    assert!(
+        metric(&metrics, "rtcd_rtc_receiver_feedback_total") > 0.0,
+        "receivers asked for packets again"
+    );
+    assert!(metric(&metrics, "rtcd_rtc_receiver_rtt_count") > 0.0);
+    assert!(metric(&metrics, "rtcd_rtc_bandwidth_estimate_bps_count") > 0.0);
     c.finish().await;
 }
 
