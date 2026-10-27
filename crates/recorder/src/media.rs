@@ -42,6 +42,10 @@ const TURN_OFF_TAIL: Duration = Duration::from_millis(1500);
 pub const KEYFRAME_EVERY: Duration = Duration::from_secs(20);
 /// While a file waits for its first keyframe, or after a loss, the sender is asked this often.
 const KEYFRAME_RETRY: Duration = Duration::from_secs(1);
+/// A keyframe of another size than the open file's is a new picture size only if the sender
+/// stays at it: encoders step the resolution down and back within a fraction of a second, and a
+/// file for each step would make the player load a new file for one frame.
+const SIZE_SETTLE: Duration = Duration::from_secs(1);
 /// How long a missing video packet is waited for (the sender's answer to a NACK), and how many
 /// packets are held behind the gap: a keyframe is dozens of packets, a voice frame one.
 const VIDEO_WAIT: Duration = Duration::from_millis(300);
@@ -180,6 +184,8 @@ pub struct StreamRecorder {
     last_media: Option<Instant>,
     /// A video frame went missing: nothing is written until the next keyframe.
     need_key: bool,
+    /// Since when the keyframes seen are of another size than the open file's.
+    size_since: Option<Instant>,
     last_ask: Option<Instant>,
     /// Frames before this are the tail of a stream the sender has just turned off.
     ignore_until: Option<Instant>,
@@ -215,6 +221,7 @@ impl StreamRecorder {
             last_packet: None,
             last_media: None,
             need_key: false,
+            size_since: None,
             last_ask: None,
             ignore_until: None,
             lost: 0,
@@ -333,13 +340,25 @@ impl StreamRecorder {
         self.last_media = Some(arrived);
         // A keyframe of another size (the SFU moved the share to its other layer, or the sharer
         // picked another window) starts a file of its own, so each file's header tells the truth.
-        // The old picture is held up to the new one.
+        // The old picture is held up to the new one. Until the new size has lasted, the frames of
+        // the other size are left out (they do not decode in this file), and a keyframe of the
+        // file's own size takes up where it left off.
         if key
             && let Some(seg) = &self.seg
             && let Some(size) = vp8::size(data)
-            && seg.size != size
         {
-            self.close_segment("the picture changed size", Some(arrived));
+            if seg.size == size {
+                self.size_since = None;
+            } else {
+                let since = *self.size_since.get_or_insert(arrived);
+                if arrived.saturating_duration_since(since) >= SIZE_SETTLE {
+                    self.close_segment("the picture changed size", Some(arrived));
+                } else {
+                    self.need_key = true;
+                    self.last_ask = None;
+                    return;
+                }
+            }
         }
         if key {
             self.need_key = false;
@@ -467,6 +486,7 @@ impl StreamRecorder {
         let Some(mut seg) = self.seg.take() else {
             return;
         };
+        self.size_since = None;
         if self.info.video
             && let Some(t) = hold_until
         {
@@ -1001,10 +1021,13 @@ mod tests {
             let now = start + Duration::from_millis(100 * u64::from(i));
             s.packet(now, vp8_sized(i as u16, i * 9000, i == 0, 1791, 1120));
         }
-        // 2.1 s with no frame (the SFU switching layers), then a keyframe of the other size.
+        // 2.1 s with no frame (the SFU switching layers), then keyframes of the other size: the
+        // first is left out until the size lasts, the second starts the file.
         let at = start + Duration::from_millis(3000);
         s.packet(at, vp8_sized(10, 30 * 9000, true, 3584, 1952));
-        s.finish(start + Duration::from_secs(4), "test");
+        let settled = at + SIZE_SETTLE;
+        s.packet(settled, vp8_sized(11, 40 * 9000, true, 3584, 1952));
+        s.finish(start + Duration::from_secs(6), "test");
         let files = rec.files();
         assert_eq!(files.len(), 2, "{files:?}");
         assert_eq!((files[0].width, files[0].height), (1791, 1120));
@@ -1012,6 +1035,41 @@ mod tests {
         assert_eq!(
             files[0].end_ms, files[1].start_ms,
             "the old picture is held until the new one: {files:?}"
+        );
+        assert_eq!(files[1].start_ms, 4000, "{files:?}");
+    }
+
+    #[test]
+    fn a_picture_size_that_does_not_last_leaves_the_file_whole() {
+        let (rec, start) = setup("stray", u64::MAX);
+        let mut s = screen(&rec);
+        let mut asked = false;
+        for i in 0..40u32 {
+            let now = start + Duration::from_millis(100 * u64::from(i));
+            // Frames 10 and 11 are keyframes of other sizes; the sender is back at its size with
+            // the keyframe at 12.
+            let (key, w, h) = match i {
+                0 | 12 => (true, 1920, 1080),
+                10 => (true, 1664, 936),
+                11 => (true, 1600, 900),
+                _ => (false, 1920, 1080),
+            };
+            asked |= s.packet(now, vp8_sized(i as u16, i * 9000, key, w, h)) && i == 10;
+            s.tick(now);
+        }
+        s.finish(start + Duration::from_secs(5), "test");
+        let files = rec.files();
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!((files[0].width, files[0].height), (1920, 1080));
+        assert!(asked, "the sender was asked for a keyframe of its picture");
+        let times = block_times(&files[0].path);
+        assert!(
+            !times.contains(&1000) && !times.contains(&1100),
+            "the other sizes are not in the file: {times:?}"
+        );
+        assert!(
+            times.contains(&1200) && times.contains(&3900),
+            "it goes on from the keyframe of its size: {times:?}"
         );
     }
 
