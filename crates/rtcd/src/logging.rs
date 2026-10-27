@@ -42,10 +42,22 @@ fn is_library(target: &str) -> bool {
     .any(|p| target.starts_with(p))
 }
 
+/// The library's packet pipeline, which warns for every packet the sender sent twice (a
+/// retransmission that arrived after the original: "srtp ... duplicated"): hundreds a minute on an
+/// ordinary call, and the packet is dropped as it should be. Its other records are errors.
+fn is_packet_pipeline(target: &str) -> bool {
+    target == "rtc::peer_connection::handler"
+}
+
 /// Whether to keep a record of `level` from `target`, given the configured level: the service's
-/// own records at that level and above, the libraries' at `warn` and above (everything at `debug`).
+/// own records at that level and above, the libraries' at `warn` and above (everything at `debug`),
+/// the library's packet pipeline at `error` and above.
 fn keeps(target: &str, level: Level, configured: Level) -> bool {
-    let limit = if is_library(target) && configured != Level::DEBUG {
+    let limit = if configured == Level::DEBUG {
+        configured
+    } else if is_packet_pipeline(target) {
+        Level::ERROR
+    } else if is_library(target) {
         Level::WARN
     } else {
         configured
@@ -235,6 +247,22 @@ mod tests {
         assert!(keeps(
             "rtc::peer_connection::handler::dtls",
             Level::DEBUG,
+            Level::DEBUG
+        ));
+        // The packet pipeline's duplicates are not worth a warning, its errors are.
+        assert!(!keeps(
+            "rtc::peer_connection::handler",
+            Level::WARN,
+            Level::INFO
+        ));
+        assert!(keeps(
+            "rtc::peer_connection::handler",
+            Level::ERROR,
+            Level::INFO
+        ));
+        assert!(keeps(
+            "rtc::peer_connection::handler",
+            Level::WARN,
             Level::DEBUG
         ));
         assert!(!keeps("hyper_util::server", Level::INFO, Level::INFO));
