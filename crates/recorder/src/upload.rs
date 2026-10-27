@@ -9,6 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
+use futures_util::stream::{self, StreamExt};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::{Body, Method};
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,11 @@ const BATCH_BYTES: u64 = 256 << 20;
 /// The slowest an upload may go before it is cut off (and retried): far below the cluster's capped
 /// 10 Mb/s.
 const UPLOAD_RATE: u64 = 256 << 10;
+/// How many files, and how many parts of one file, are in flight at once. One connection to
+/// storage carries a few MB/s, far below what the node's link does, and the recording is not
+/// watchable before the last byte is in.
+const FILES_AT_ONCE: usize = 4;
+const PARTS_AT_ONCE: usize = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum UploadError {
@@ -120,7 +126,8 @@ fn expired(e: &UploadError) -> bool {
 }
 
 impl Api {
-    /// Sends every file (in manifest order) and returns the uploads in parts to finish.
+    /// Sends every file and returns the uploads in parts to finish. The biggest go first, so the
+    /// last to finish is never a big one started late.
     pub async fn upload(&self, files: &[Entry]) -> Result<Vec<MultipartDone>, UploadError> {
         if files.is_empty() {
             return Err(UploadError::Empty);
@@ -146,15 +153,19 @@ impl Api {
                 })
                 .collect();
             let targets = self.targets(&batch).await?;
-            if !targets.direct {
-                for (n, f) in files.iter().enumerate().take(end).skip(start) {
-                    self.upload_to_server(n, f)
+            let done = if !targets.direct {
+                let mut order: Vec<usize> = (start..end).collect();
+                order.sort_by_key(|&n| std::cmp::Reverse(files[n].size));
+                self.in_parallel(order.into_iter().map(|n| async move {
+                    self.upload_to_server(n, &files[n])
                         .await
                         .map_err(|e| UploadError::File {
                             index: n,
                             source: Box::new(e),
                         })?;
-                }
+                    Ok(None)
+                }))
+                .await?
             } else {
                 if targets.uploads.len() != batch.len() {
                     return Err(UploadError::Protocol(format!(
@@ -163,35 +174,57 @@ impl Api {
                         targets.uploads.len()
                     )));
                 }
-                for t in targets.uploads {
-                    let n = t.index;
-                    if n < start || n >= end {
+                let mut uploads = targets.uploads;
+                for t in &uploads {
+                    if t.index < start || t.index >= end {
                         return Err(UploadError::Protocol(format!(
-                            "told where file {n} goes, not asked"
+                            "told where file {} goes, not asked",
+                            t.index
                         )));
                     }
+                }
+                uploads.sort_by_key(|t| std::cmp::Reverse(files[t.index].size));
+                self.in_parallel(uploads.into_iter().map(|t| async move {
+                    let n = t.index;
                     let f = &files[n];
                     let result = if t.upload_id.is_empty() {
-                        self.upload_whole(n, f, t).await
+                        self.upload_whole(n, f, t).await.map(|()| None)
                     } else {
-                        let id = t.upload_id.clone();
-                        let r = self.upload_parts(n, f, t).await;
-                        multipart.push(MultipartDone {
-                            index: n,
-                            upload_id: id,
-                        });
-                        r
+                        let upload_id = t.upload_id.clone();
+                        self.upload_parts(n, f, t).await.map(|()| {
+                            Some(MultipartDone {
+                                index: n,
+                                upload_id,
+                            })
+                        })
                     };
                     result.map_err(|e| UploadError::File {
                         index: n,
                         source: Box::new(e),
-                    })?;
-                }
-            }
+                    })
+                }))
+                .await?
+            };
+            multipart.extend(done.into_iter().flatten());
             info!(files = end, of = files.len(), "uploaded files");
             start = end;
         }
+        multipart.sort_by_key(|m| m.index);
         Ok(multipart)
+    }
+
+    /// Runs the uploads a few at a time; the first failure ends them all.
+    async fn in_parallel<F>(
+        &self,
+        jobs: impl Iterator<Item = F>,
+    ) -> Result<Vec<Option<MultipartDone>>, UploadError>
+    where
+        F: Future<Output = Result<Option<MultipartDone>, UploadError>>,
+    {
+        stream::iter(jobs)
+            .buffer_unordered(FILES_AT_ONCE)
+            .try_collect()
+            .await
     }
 
     async fn targets(&self, files: &[UploadRequest<'_>]) -> Result<Targets, UploadError> {
@@ -242,44 +275,60 @@ impl Api {
         }
     }
 
-    /// Sends a file's parts in order, asking for the next parts' URLs as it goes (and once more
-    /// for a part whose URL ran out).
+    /// Sends a file's parts a few at a time, asking for the next parts' URLs as it goes (and once
+    /// more for a part whose URL ran out).
     async fn upload_parts(&self, n: usize, f: &Entry, mut t: Target) -> Result<(), UploadError> {
         if t.part_size == 0 {
             return Err(UploadError::Protocol("no part size".into()));
         }
-        let total = f.size.div_ceil(t.part_size) as usize;
-        let mut reminted = 0;
-        let mut next = 1;
-        while next <= total {
-            if t.parts.first().is_none_or(|p| p.number != next) {
+        let part_size = t.part_size;
+        let total = f.size.div_ceil(part_size) as usize;
+        let mut pending: Vec<usize> = (1..=total).collect();
+        let mut reminted = Vec::new();
+        while let Some(&first) = pending.first() {
+            if t.parts.first().is_none_or(|p| p.number != first) {
                 t = self
                     .target(UploadRequest {
                         index: n,
                         kind: &f.kind,
                         size: f.size,
                         upload_id: &t.upload_id,
-                        first_part: next,
+                        first_part: first,
                     })
                     .await?;
+                if t.parts.first().is_none_or(|p| p.number != first) {
+                    return Err(UploadError::Protocol(format!("no URL for part {first}")));
+                }
             }
-            let parts = std::mem::take(&mut t.parts);
-            for p in parts {
-                let offset = (p.number as u64 - 1) * t.part_size;
-                let len = t.part_size.min(f.size - offset);
-                match self.put(&p.url, None, None, &f.path, offset, len).await {
-                    Err(e) if expired(&e) && reminted != p.number => {
-                        reminted = p.number;
-                        break;
-                    }
+            let urls: Vec<Part> = std::mem::take(&mut t.parts)
+                .into_iter()
+                .filter(|p| pending.contains(&p.number))
+                .collect();
+            let results: Vec<(usize, Result<(), UploadError>)> =
+                stream::iter(urls.into_iter().map(|p| async move {
+                    let offset = (p.number as u64 - 1) * part_size;
+                    let len = part_size.min(f.size - offset);
+                    (
+                        p.number,
+                        self.put(&p.url, None, None, &f.path, offset, len).await,
+                    )
+                }))
+                .buffer_unordered(PARTS_AT_ONCE)
+                .collect()
+                .await;
+            for (number, result) in results {
+                match result {
+                    Ok(()) => pending.retain(|&p| p != number),
+                    // The part stays to send, with a fresh URL (once: a URL that keeps running
+                    // out is an error).
+                    Err(e) if expired(&e) && !reminted.contains(&number) => reminted.push(number),
                     Err(e) => {
                         return Err(UploadError::Part {
-                            part: p.number,
+                            part: number,
                             total,
                             source: Box::new(e),
                         });
                     }
-                    Ok(()) => next = p.number + 1,
                 }
             }
         }
@@ -438,7 +487,8 @@ mod tests {
         );
 
         let seen = fake.seen();
-        let calls: Vec<String> = seen
+        // Files and parts go at the same time: what was sent, not in which order.
+        let mut calls: Vec<String> = seen
             .iter()
             .map(|r| {
                 format!(
@@ -448,18 +498,19 @@ mod tests {
                 )
             })
             .collect();
+        calls.sort();
         assert_eq!(
             calls,
             [
                 "POST /uploads",
-                "PUT /store/voice",
                 "POST /uploads",
-                "PUT /store/voice-again",
+                "POST /uploads",
                 "PUT /store/up/1",
                 "PUT /store/up/2",
                 "PUT /store/up/2",
-                "POST /uploads",
-                "PUT /store/up/3"
+                "PUT /store/up/3",
+                "PUT /store/voice",
+                "PUT /store/voice-again",
             ]
         );
         for r in &seen {
@@ -505,27 +556,29 @@ mod tests {
             .unwrap();
 
         let seen = fake.seen();
-        let calls: Vec<String> = seen
+        let mut calls: Vec<String> = seen
             .iter()
             .map(|r| format!("{} {}", r.method, r.path.strip_prefix(REC_PATH).unwrap()))
             .collect();
-        assert_eq!(
-            calls,
-            [
-                "POST /uploads",
-                "PUT /files/0",
-                "PUT /files/1",
-                "PUT /files/1",
-                "POST /complete"
-            ]
-        );
+        // The two files go at the same time, the biggest started first; the completion comes last.
+        assert_eq!(calls.pop().as_deref(), Some("POST /complete"));
+        assert_eq!(calls.remove(0), "POST /uploads");
+        calls.sort();
+        assert_eq!(calls, ["PUT /files/0", "PUT /files/1", "PUT /files/1"]);
         assert!(seen.iter().all(|r| r.auth == "Bearer bot-token"));
-        assert_eq!(seen[1].body, bodies[0]);
+        let sent = |path: &str| -> Vec<Vec<u8>> {
+            seen.iter()
+                .filter(|r| r.method == "PUT" && r.path == format!("{REC_PATH}{path}"))
+                .map(|r| r.body.clone())
+                .collect()
+        };
+        assert_eq!(sent("/files/0"), [bodies[0].clone()]);
         assert_eq!(
-            seen[3].body, bodies[1],
+            sent("/files/1"),
+            [bodies[1].clone(), bodies[1].clone()],
             "the file is sent whole again after a failure"
         );
-        let body: Value = serde_json::from_slice(&seen[4].body).unwrap();
+        let body: Value = serde_json::from_slice(&seen.last().unwrap().body).unwrap();
         assert_eq!(body["duration_ms"], 93_500);
         assert_eq!(body["files"].as_array().unwrap().len(), 2);
         assert_eq!(body["files"][1]["size"], 25);
