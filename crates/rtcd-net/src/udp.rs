@@ -291,12 +291,19 @@ struct Run {
 #[cfg(any(target_os = "linux", test))]
 /// Orders `items` so that those for one peer are together, keeping each peer's datagrams in order.
 fn group_by_peer(items: &mut [Outgoing]) {
-    let mut first_seen = std::collections::HashMap::with_capacity(items.len().min(64));
+    let mut first_seen =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(items.len().min(64), Default::default());
+    // Each session's datagrams are queued together, so a batch is usually grouped already.
+    let (mut grouped, mut last) = (true, 0);
     for o in items.iter() {
         let next = first_seen.len();
-        first_seen.entry(o.peer).or_insert(next);
+        let rank = *first_seen.entry(o.peer).or_insert(next);
+        grouped &= rank >= last;
+        last = rank;
     }
-    items.sort_by_key(|o| first_seen[&o.peer]);
+    if !grouped {
+        items.sort_by_cached_key(|o| first_seen[&o.peer]);
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -510,6 +517,34 @@ mod tests {
         group_by_peer(&mut items);
         let order: Vec<u8> = items.iter().map(|o| o.data[0]).collect();
         assert_eq!(order, vec![1, 3, 5, 2, 4]);
+    }
+
+    #[test]
+    fn a_batch_that_is_grouped_already_is_left_as_it_is() {
+        let mut items = vec![
+            out("10.0.0.1:1", 10, 1),
+            out("10.0.0.1:1", 10, 2),
+            out("10.0.0.2:1", 10, 3),
+            out("10.0.0.3:1", 10, 4),
+            out("10.0.0.3:1", 10, 5),
+        ];
+        group_by_peer(&mut items);
+        let order: Vec<u8> = items.iter().map(|o| o.data[0]).collect();
+        assert_eq!(order, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn peers_in_the_order_they_first_appear() {
+        let mut items = vec![
+            out("10.0.0.3:1", 10, 1),
+            out("10.0.0.1:1", 10, 2),
+            out("10.0.0.3:1", 10, 3),
+            out("10.0.0.2:1", 10, 4),
+            out("10.0.0.1:1", 10, 5),
+        ];
+        group_by_peer(&mut items);
+        let order: Vec<u8> = items.iter().map(|o| o.data[0]).collect();
+        assert_eq!(order, vec![1, 3, 2, 5, 4]);
     }
 
     #[test]

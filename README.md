@@ -105,6 +105,18 @@ docker run --rm -p 8045:8045 -p 8443:8443/udp -p 8443:8443 \
   -e RTCD_ICE_HOST_OVERRIDE=<public ip> rtcd-rust
 ```
 
+### What the engine costs per packet
+
+```bash
+cargo test --release -p rtcd-sfu --test engine_cost -- --ignored --nocapture
+```
+
+A call of 32 participants, three of them talking, run in virtual time: it prints the nanoseconds the
+engine spends per delivery, the best of five rounds. That number moves by a few percent from one run to
+the next, where a CPU percentage under load moves by tens, so it is what to compare before and after a
+change to the engine or to `vendor/rtc`. `ENGINE_COST_FRAMES` and `ENGINE_COST_ROUNDS` lengthen it for
+profiling.
+
 ## Continuous integration
 
 `ci.yml` runs rustfmt, clippy (warnings are errors), the whole test suite on Linux and macOS, a

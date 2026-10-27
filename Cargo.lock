@@ -2220,6 +2220,7 @@ dependencies = [
  "memchr",
  "rand 0.10.3",
  "rtc-shared",
+ "rustc-hash",
  "smol_str",
  "url",
 ]
@@ -2324,6 +2325,7 @@ dependencies = [
  "bytes",
  "libc",
  "nix",
+ "rustc-hash",
  "socket2",
  "thiserror 2.0.21",
 ]

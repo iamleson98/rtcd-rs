@@ -143,6 +143,8 @@ pub struct World {
     pub group: String,
     /// Sends from the engine to the browsers at this address are lost while set.
     pub blackhole: bool,
+    /// Time spent inside the engine (datagrams in, timeouts), for the cost tests.
+    pub engine_spent: Duration,
 }
 
 pub fn engine_config() -> EngineConfig {
@@ -200,6 +202,7 @@ impl World {
             next_browser: 1,
             group: "group".into(),
             blackhole: false,
+            engine_spent: Duration::ZERO,
         }
     }
 
@@ -601,8 +604,10 @@ impl World {
             let Some(w) = b.pc.poll_write() else { break };
             moved = true;
             if w.transport.peer_addr == self.server && !self.blackhole && !b.unreachable {
+                let started = Instant::now();
                 self.engine
                     .handle_datagram(now, Proto::Udp, self.server, b.addr, w.message);
+                self.engine_spent += started.elapsed();
             }
         }
         loop {
@@ -681,7 +686,7 @@ impl World {
             if next > self.now {
                 self.now = next;
             }
-            self.engine.handle_timeout(self.now);
+            self.tick_engine();
             for b in &mut self.browsers {
                 let _ = b.pc.handle_timeout(self.now);
             }
@@ -705,11 +710,17 @@ impl World {
             }
             let next = self.next_wake().filter(|&t| t <= end).unwrap_or(end);
             self.now = next.max(self.now);
-            self.engine.handle_timeout(self.now);
+            self.tick_engine();
             for b in &mut self.browsers {
                 let _ = b.pc.handle_timeout(self.now);
             }
         }
+    }
+
+    fn tick_engine(&mut self) {
+        let started = Instant::now();
+        self.engine.handle_timeout(self.now);
+        self.engine_spent += started.elapsed();
     }
 
     fn next_wake(&mut self) -> Option<Instant> {
