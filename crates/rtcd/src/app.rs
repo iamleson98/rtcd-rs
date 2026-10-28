@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rtcd_sfu::config::{EngineConfig, LocalAddress};
 use rtcd_sfu::engine::Event;
-use rtcd_sfu::runtime::{Sfu, SfuConfig};
+use rtcd_sfu::runtime::{ScalingPolicy, Sfu, SfuConfig};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -96,12 +96,21 @@ pub fn sfu_config(cfg: &Config, addresses: Vec<LocalAddress>) -> SfuConfig {
         (rtc.shards as usize, 0)
     } else {
         let cores = std::thread::available_parallelism().map_or(1, usize::from);
-        (1, cores.saturating_sub(1).clamp(1, 32))
+        let max = cores.saturating_sub(1).clamp(1, 32);
+        // Two from the start where there are cores for two: a class that begins at the bell is
+        // placed call by call before its participants arrive, so with one shard they all land on it
+        // (three lectures of 130 to 180 people filled one thread to 96 to 100 % while a second sat
+        // idle, then refused people; on two shards the threads ran at 51 and 70 %).
+        (max.min(2), max)
     };
     SfuConfig {
         engine,
         shards,
         max_shards,
+        scaling: ScalingPolicy {
+            min_shards: shards,
+            ..Default::default()
+        },
         refuse_when_saturated: rtc.refuse_when_saturated,
         ..Default::default()
     }

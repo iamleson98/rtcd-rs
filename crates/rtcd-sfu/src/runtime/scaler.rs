@@ -46,6 +46,10 @@ pub struct ScalingPolicy {
     /// call is placed. Counting what a call will bring spreads them. A call with more sessions
     /// counts for what it has.
     pub expected_call_size: usize,
+    /// How many shards are always kept, however long they have been empty. With one, a class that
+    /// starts at the bell lands entirely on the only shard (calls are placed before the first
+    /// participant arrives, and a call cannot move), where two share it.
+    pub min_shards: usize,
 }
 
 impl Default for ScalingPolicy {
@@ -57,6 +61,7 @@ impl Default for ScalingPolicy {
             empty_for: EMPTY_FOR,
             sessions_per_shard: SESSIONS_PER_SHARD,
             expected_call_size: EXPECTED_CALL_SIZE,
+            min_shards: 1,
         }
     }
 }
@@ -125,7 +130,7 @@ impl Scaler {
 
         // Give one back when it has been empty long enough and the rest are not hot: stopping
         // one just before the load needs it again would only be a restart.
-        if shards.len() > 1 {
+        if shards.len() > self.policy.min_shards.max(1) {
             let hot = self.policy.hot;
             let rest_cool = |slot: usize| {
                 shards
@@ -407,6 +412,25 @@ mod tests {
             p.update(0.99),
             Level::Shedding,
             "a single reading at the limit is a burst"
+        );
+    }
+
+    #[test]
+    fn the_shards_that_are_always_kept_are_not_retired() {
+        let t = Instant::now();
+        let policy = ScalingPolicy {
+            min_shards: 2,
+            ..ScalingPolicy::default()
+        };
+        let mut s = Scaler::new(4, policy);
+        let idle = [load(0, 0.0, 0), load(1, 0.0, 0)];
+        let steps = ticks(&mut s, t, 0, 200, &idle, 3);
+        assert!(steps.iter().all(|s| *s == Step::Hold), "two shards stay");
+        let three = [load(0, 0.0, 0), load(1, 0.0, 0), load(2, 0.0, 0)];
+        let steps = ticks(&mut s, t, 200, 200, &three, 3);
+        assert!(
+            steps.contains(&Step::Retire(2)),
+            "the one above the floor goes"
         );
     }
 }

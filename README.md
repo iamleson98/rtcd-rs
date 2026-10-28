@@ -58,11 +58,14 @@ whatever places new calls (the LMS server does, from its DNS-discovered pool) ca
 lighter instance. Calls stay on the instance they start on.
 
 Within an instance, threads called shards serve the calls, and a call lives on one of them. With
-`RTCD_RTC_SHARDS=0` (the default) the number follows the load, from one shard up to one fewer than
-the cores. A new call that finds every shard holding 300 sessions' worth (each call counts for at
+`RTCD_RTC_SHARDS=0` (the default) the number follows the load, from two shards (one where there
+are fewer than three cores) up to one fewer than the cores. Two from the start because a class
+that begins at the bell is placed call by call before its participants arrive: with one shard,
+three lectures of 130 to 180 people landed on it together and ran it at 96 to 100 % while a
+second sat idle, then refused people; on two shards the threads ran at 51 and 70 %. A new call that finds every shard holding 300 sessions' worth (each call counts for at
 least 20, since a class fills over the seconds after it starts, and a bell starts many at once) gets
 a shard of its own, which a burst of classes needs because they are all placed before their
-participants have arrived; and a shard is added as well when every shard has been over half busy for three seconds. A shard that has had no
+participants have arrived; and a shard is added as well when every shard has been over half busy for three seconds. A shard above the two that are kept and that has had no
 sessions for two minutes is stopped. A call stays on the shard it started on, and new calls go to
 the shard carrying the least. Measured on four cores at 900 participants, one shard dropped a third
 of the voice packets and the automatic two dropped about 5 % (the load generator shares the machine,
