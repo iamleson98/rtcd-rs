@@ -62,6 +62,10 @@ pub(crate) struct Source {
     pub last_packet: Option<Instant>,
     /// When a keyframe was last asked of the sender for this stream.
     pub last_pli: Option<Instant>,
+    /// Whether packets of this voice were left out (muted, or not among the loudest) since one
+    /// was last forwarded: the receivers' sequence numbers must then carry on from where they
+    /// were (see `Rewriter::resume_after_gap`).
+    pub gap: bool,
 }
 
 /// What a participant sends.

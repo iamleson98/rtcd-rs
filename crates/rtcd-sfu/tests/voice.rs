@@ -464,3 +464,47 @@ fn no_voice_limit_forwards_everyone() {
         assert!(*n > 100, "speaker {i} was heard {n} times");
     }
 }
+
+/// The sequence numbers a listener saw on the voice of speaker `name`, in order.
+fn sequence_heard(w: &World, listener: usize, name: &str) -> Vec<u16> {
+    let prefix = format!("voice_session-{name}");
+    w.browsers[listener]
+        .rtp
+        .iter()
+        .filter(|(t, _)| t.starts_with(&prefix))
+        .map(|(_, p)| p.header.sequence_number)
+        .collect()
+}
+
+#[test]
+fn a_voice_that_returns_after_being_left_out_carries_on_without_a_gap() {
+    // One voice is forwarded at a time. The talkers swap twice, so each voice is left out and then
+    // comes back: a receiver that saw a jump in sequence numbers would count it as lost packets and
+    // may restart its jitter buffer, at the first syllable of every turn.
+    let mut w = World::with_config(EngineConfig {
+        audio_loudest: 1,
+        ..engine_config()
+    });
+    let a = w.join("a", "call1");
+    let b = w.join("b", "call1");
+    let listener = w.join("listener", "call1");
+    wait_tracks(&mut w, listener, 0);
+    for (a_level, b_level) in [(20, 100), (100, 20), (20, 100)] {
+        for _ in 0..150 {
+            w.send_audio(a, a_level);
+            w.send_audio(b, b_level);
+            w.run_for(Duration::from_millis(20));
+        }
+    }
+    w.run_for(Duration::from_millis(200));
+    for name in ["a", "b"] {
+        let seqs = sequence_heard(&w, listener, name);
+        assert!(seqs.len() > 100, "{name} was heard {} times", seqs.len());
+        let gaps: Vec<(u16, u16)> = seqs
+            .windows(2)
+            .filter(|p| p[1].wrapping_sub(p[0]) != 1)
+            .map(|p| (p[0], p[1]))
+            .collect();
+        assert!(gaps.is_empty(), "{name}'s sequence jumped: {gaps:?}");
+    }
+}

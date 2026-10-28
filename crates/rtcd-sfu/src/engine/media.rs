@@ -37,6 +37,9 @@ pub(crate) struct Fan {
     pub vp8: bool,
     /// What the stream carries, for the uplink counter.
     pub ty: TrackType,
+    /// The next packet follows a stretch that was left out: receivers carry on their sequence
+    /// numbers from where they were.
+    pub resume: bool,
 }
 
 #[derive(Deserialize)]
@@ -171,6 +174,7 @@ impl Engine {
         match src.ty {
             TrackType::Voice => {
                 if s.up.muted {
+                    src.gap = true;
                     return false;
                 }
                 // The level is the low seven bits; the top bit says whether the frame is voice.
@@ -195,18 +199,44 @@ impl Engine {
                     );
                 }
                 // A sender that reports no level cannot be ranked: it is always forwarded.
-                match (level, self.sessions.get(key)) {
+                let forward = match (level, self.sessions.get(key)) {
                     (Some(level), Some(s)) => self
                         .calls
                         .get_mut(&s.call)
                         .is_none_or(|c| c.voices.hear(key, level, now)),
                     _ => true,
-                }
+                };
+                self.note_voice_gap(key, source, forward);
+                forward
             }
             TrackType::ScreenAudio => true,
             TrackType::Screen | TrackType::Video => {
                 src.rate.push(now, packet.marshal_size());
                 true
+            }
+        }
+    }
+
+    /// Remembers that a voice was left out, and when it comes back tells its receivers to carry on
+    /// their sequence numbers (see `Rewriter::resume_after_gap`): otherwise a listener sees the
+    /// packets left out as lost, at the first syllable of every turn.
+    fn note_voice_gap(&mut self, key: SessionKey, source: u32, forwarded: bool) {
+        let Some(src) = self
+            .sessions
+            .get_mut(key)
+            .and_then(|s| s.up.sources.iter_mut().find(|x| x.id == source))
+        else {
+            return;
+        };
+        if !forwarded {
+            src.gap = true;
+        } else if src.gap {
+            src.gap = false;
+            if let Some(fan) = self.fanout.get_mut(&SourceKey {
+                session: key,
+                source,
+            }) {
+                fan.resume = true;
             }
         }
     }
@@ -299,6 +329,7 @@ impl Engine {
             rate: RateMonitor::new(window),
             last_packet: Some(now),
             last_pli: None,
+            gap: false,
         });
         info!(session = %s.cfg.session_id, %ty, ?layer, ssrc = init.ssrc, "track received");
         self.metrics
@@ -313,6 +344,7 @@ impl Engine {
                 waiting: Vec::new(),
                 vp8: is_vp8,
                 ty,
+                resume: false,
             },
         );
 
@@ -550,9 +582,11 @@ impl Engine {
                 session: key,
                 source,
             };
-            let Some(fan) = self.fanout.get(&sk) else {
+            let Some(fan) = self.fanout.get_mut(&sk) else {
                 continue;
             };
+            let resume = std::mem::take(&mut fan.resume);
+            let fan = &*fan;
             // The uplink counts whether or not anyone receives the stream.
             let size = packet.marshal_size() as u64;
             self.metrics.rtp_bytes_received(fan.ty, size);
@@ -598,6 +632,9 @@ impl Engine {
                     continue;
                 };
                 let started = (timed && n == 0).then(Instant::now);
+                if resume && let Some(ds) = r.down.get_mut(sub.stream) {
+                    ds.rewrite.resume_after_gap(&packet);
+                }
                 let wrote = write_down(r, sub, &packet, now, &mut self.dirty);
                 let ty = r.down.get(sub.stream).map_or(TrackType::Voice, |d| d.ty);
                 if wrote {
