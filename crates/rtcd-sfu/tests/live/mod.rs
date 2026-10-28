@@ -10,7 +10,7 @@ use rtcd_proto::{Message, MessageType, SessionConfig};
 use rtcd_sfu::config::{EngineConfig, LocalAddress};
 use rtcd_sfu::engine::{CloseReason, Event};
 use rtcd_sfu::metrics::{Metrics, NetTraffic};
-use rtcd_sfu::runtime::{Sfu, SfuConfig};
+use rtcd_sfu::runtime::{ScalingPolicy, Sfu, SfuConfig};
 use rtcd_testkit::{Browser, Signal};
 
 /// Counts the socket traffic the shards report.
@@ -39,6 +39,11 @@ pub struct Live {
 
 impl Live {
     pub fn start(shards: usize) -> Live {
+        Self::start_up_to(shards, 0, ScalingPolicy::default())
+    }
+
+    /// Starts with `shards` and lets the SFU grow to `max_shards` by `scaling`.
+    pub fn start_up_to(shards: usize, max_shards: usize, scaling: ScalingPolicy) -> Live {
         let engine = EngineConfig {
             addresses: vec![LocalAddress {
                 bind: "127.0.0.1".parse().unwrap(),
@@ -54,6 +59,8 @@ impl Live {
         let cfg = SfuConfig {
             engine,
             shards,
+            max_shards,
+            scaling,
             udp_recv_buffer: 1 << 20,
             udp_send_buffer: 1 << 20,
             ..Default::default()

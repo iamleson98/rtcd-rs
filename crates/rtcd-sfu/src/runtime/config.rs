@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use super::scaler::ScalingPolicy;
 use crate::config::{ConfigError, EngineConfig};
 
 /// How the SFU runs: what it listens on and how many threads serve it.
@@ -9,8 +10,16 @@ use crate::config::{ConfigError, EngineConfig};
 pub struct SfuConfig {
     /// The engine's settings, including the addresses to listen on.
     pub engine: EngineConfig,
-    /// Threads serving sessions. A call lives on one of them; more threads carry more calls.
+    /// Threads serving sessions when the SFU starts. A call lives on one of them; more threads
+    /// carry more calls.
     pub shards: usize,
+    /// The most threads the SFU may grow to by itself. When it is above `shards`, the SFU starts
+    /// another shard whenever all of them have been busy for a few seconds, and stops a shard that
+    /// has had no sessions for a couple of minutes (never going below `shards`' worth of one);
+    /// when it is not, the number of shards stays `shards`.
+    pub max_shards: usize,
+    /// When the SFU adds and stops shards, if `max_shards` lets it.
+    pub scaling: ScalingPolicy,
     /// Kernel receive buffer asked for each UDP socket; a burst the loop has not read yet waits
     /// in it.
     pub udp_recv_buffer: usize,
@@ -32,6 +41,8 @@ impl Default for SfuConfig {
         Self {
             engine: EngineConfig::default(),
             shards: 1,
+            max_shards: 0,
+            scaling: ScalingPolicy::default(),
             udp_recv_buffer: 16 * 1024 * 1024,
             udp_send_buffer: 16 * 1024 * 1024,
             recv_batch: 64,
@@ -51,11 +62,18 @@ pub enum SfuConfigError {
     NoAddresses,
     #[error("shards must be between 1 and 256, got {0}")]
     Shards(usize),
+    #[error("max_shards must be 0 or between shards and 256, got {0}")]
+    MaxShards(usize),
     #[error("recv_batch must be between 1 and 1024, got {0}")]
     RecvBatch(usize),
 }
 
 impl SfuConfig {
+    /// The most shards that can run at once.
+    pub fn shard_slots(&self) -> usize {
+        self.max_shards.max(self.shards)
+    }
+
     pub fn validate(&self) -> Result<(), SfuConfigError> {
         self.engine.validate()?;
         if self.engine.addresses.is_empty() {
@@ -63,6 +81,9 @@ impl SfuConfig {
         }
         if !(1..=256).contains(&self.shards) {
             return Err(SfuConfigError::Shards(self.shards));
+        }
+        if self.max_shards != 0 && !(self.shards..=256).contains(&self.max_shards) {
+            return Err(SfuConfigError::MaxShards(self.max_shards));
         }
         if !(1..=1024).contains(&self.recv_batch) {
             return Err(SfuConfigError::RecvBatch(self.recv_batch));

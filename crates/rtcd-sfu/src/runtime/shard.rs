@@ -3,8 +3,9 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
@@ -17,6 +18,7 @@ use super::EventSink;
 use super::config::SfuConfig;
 use super::directory::Directory;
 use super::registry::Registry;
+use super::table::ShardTable;
 use super::tcp::TcpConn;
 use crate::engine::{Command, Engine, Event, FastMap, Proto, RouteUpdate};
 use crate::metrics::{Metrics, NetTraffic};
@@ -32,6 +34,10 @@ const PEER_RECV_BUFFER: usize = 256 * 1024;
 const MAX_ROUNDS: usize = 16;
 /// How often idle TCP connections are looked for.
 const SWEEP_EVERY: Duration = Duration::from_secs(1);
+/// How long the busy fraction is measured over before it is published.
+const BUSY_WINDOW: Duration = Duration::from_secs(1);
+/// The busy fraction is published in parts per thousand.
+const BUSY_SCALE: f32 = 1000.0;
 
 /// A datagram another shard read and found to be this one's.
 #[derive(Debug)]
@@ -77,11 +83,19 @@ pub(crate) enum Undelivered {
 pub(crate) struct ShardHandle {
     tx: SyncSender<ShardCommand>,
     waker: Arc<Waker>,
+    /// The fraction of its time the shard spent working over its last window, in parts per
+    /// thousand.
+    busy: Arc<AtomicU32>,
 }
 
 impl ShardHandle {
-    pub fn new(tx: SyncSender<ShardCommand>, waker: Arc<Waker>) -> Self {
-        Self { tx, waker }
+    pub fn new(tx: SyncSender<ShardCommand>, waker: Arc<Waker>, busy: Arc<AtomicU32>) -> Self {
+        Self { tx, waker, busy }
+    }
+
+    /// How busy the shard has been lately, 0 to 1.
+    pub fn busy(&self) -> f32 {
+        self.busy.load(Ordering::Relaxed) as f32 / BUSY_SCALE
     }
 
     /// Queues a command and wakes the shard; fails if its queue is full or it has stopped.
@@ -130,8 +144,10 @@ pub(crate) struct ShardParts {
     /// Present when there are several shards.
     pub metrics: Arc<dyn Metrics>,
     pub directory: Option<Arc<Directory>>,
-    /// Every shard's handle, set once they all exist.
-    pub peers: Arc<OnceLock<Vec<ShardHandle>>>,
+    /// The shards that are running, this one included once it has been started.
+    pub peers: Arc<ShardTable>,
+    /// Where this shard publishes how busy it is.
+    pub busy: Arc<AtomicU32>,
 }
 
 pub(crate) struct Shard {
@@ -159,9 +175,14 @@ pub(crate) struct Shard {
     /// What crossed the sockets since it was last reported.
     traffic: NetTraffic,
     directory: Option<Arc<Directory>>,
-    peers: Arc<OnceLock<Vec<ShardHandle>>>,
-    /// Datagrams read for other shards, collected per shard until the end of a read round.
+    peers: Arc<ShardTable>,
+    /// Datagrams read for other shards, collected per shard until the end of a read round. Grown
+    /// as shards appear.
     forward: Vec<Vec<Forwarded>>,
+    busy: Arc<AtomicU32>,
+    /// Time spent working since `window_start`.
+    worked: Duration,
+    window_start: Instant,
     stopping: bool,
     next_sweep: Instant,
 }
@@ -180,6 +201,7 @@ impl Shard {
             metrics,
             directory,
             peers,
+            busy,
         } = parts;
         for (i, u) in udp.iter_mut().enumerate() {
             poll.registry()
@@ -188,7 +210,6 @@ impl Shard {
         let n = udp.len();
         let mut engine = engine;
         engine.publish_routes(directory.is_some());
-        let shards = cfg.shards;
         Ok(Self {
             id,
             engine,
@@ -212,7 +233,10 @@ impl Shard {
             traffic: NetTraffic::default(),
             directory,
             peers,
-            forward: (0..shards).map(|_| Vec::new()).collect(),
+            forward: Vec::new(),
+            busy,
+            worked: Duration::ZERO,
+            window_start: Instant::now(),
             stopping: false,
             next_sweep: Instant::now() + SWEEP_EVERY,
         })
@@ -263,10 +287,27 @@ impl Shard {
                 self.sweep_tcp(now);
             }
             self.flush();
+            self.publish_busy(now);
             if self.stopping && self.engine.session_count() == 0 {
                 debug!(shard = self.id, "stopped");
                 return;
             }
+        }
+    }
+
+    /// Counts the work of the turn that began at `woke`, and once a window has passed publishes
+    /// what fraction of it was work. The scaler reads it to tell a shard that has room from one
+    /// that is about to drop packets.
+    fn publish_busy(&mut self, woke: Instant) {
+        let done = Instant::now();
+        self.worked += done.saturating_duration_since(woke);
+        let window = done.saturating_duration_since(self.window_start);
+        if window >= BUSY_WINDOW {
+            let fraction = (self.worked.as_secs_f32() / window.as_secs_f32()).clamp(0.0, 1.0);
+            self.busy
+                .store((fraction * BUSY_SCALE) as u32, Ordering::Relaxed);
+            self.worked = Duration::ZERO;
+            self.window_start = done;
         }
     }
 
@@ -305,6 +346,9 @@ impl Shard {
                     && let Some(owner) = dir.owner(Proto::Udp, peer, data)
                     && owner != self.id
                 {
+                    if owner >= self.forward.len() {
+                        self.forward.resize_with(owner + 1, Vec::new);
+                    }
                     self.forward[owner].push(Forwarded {
                         proto: Proto::Udp,
                         local: advertised,
@@ -439,16 +483,18 @@ impl Shard {
 
     /// Passes the datagrams read for other shards on, one wake-up per shard.
     fn send_forwards(&mut self) {
-        let Some(peers) = self.peers.get() else {
-            return;
-        };
         for (owner, batch) in self.forward.iter_mut().enumerate() {
             if batch.is_empty() {
                 continue;
             }
             self.traffic.udp_forwarded_packets += batch.len() as u64;
             // A shard that is full or gone loses them, as a congested network would.
-            let _ = peers[owner].send(ShardCommand::Datagrams(std::mem::take(batch)));
+            match self.peers.get(owner) {
+                Some(peer) => {
+                    let _ = peer.send(ShardCommand::Datagrams(std::mem::take(batch)));
+                }
+                None => batch.clear(),
+            }
         }
     }
 
@@ -500,10 +546,10 @@ impl Shard {
             self.tcp_by_peer.remove(&conn.peer);
         }
         self.tcp_free.push(idx);
-        if let Some(peers) = self.peers.get() {
+        if let Some(peer) = self.peers.get(owner) {
             // If the owner cannot take it the connection is dropped, which the participant
             // answers by connecting again.
-            let _ = peers[owner].send(ShardCommand::TcpHandover {
+            let _ = peer.send(ShardCommand::TcpHandover {
                 conn: Box::new(conn),
                 frames,
             });

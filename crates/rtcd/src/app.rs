@@ -82,16 +82,23 @@ pub fn sfu_config(cfg: &Config, addresses: Vec<LocalAddress>) -> SfuConfig {
     if rtc.nack_buffer_size != 0 {
         engine.nack_buffer_size = rtc.nack_buffer_size as u16;
     }
-    // One shard per four cores serves the calls (measured: a shard carries about 700 participants,
-    // and each shard beyond what the load needs costs CPU for nothing); an operator can pin it.
-    let shards = if rtc.shards > 0 {
-        rtc.shards as usize
+    // A shard is a thread, a call lives on one, and one carries a few hundred participants before it
+    // saturates (measured: a single shard dropped 3 % of the voice packets at 600 participants on
+    // four cores, and lost two thirds at 900, where two shards lost 7 %). Another is not free
+    // either: its sockets batch less and datagrams are passed between threads. So by default the
+    // SFU starts with one and adds a shard when all of them have been busy for a few seconds, up to
+    // one fewer than the cores (the rest serve the API, the kernel's network work and the
+    // recorder), and stops one that has been empty for a while. An operator can pin the number.
+    let (shards, max_shards) = if rtc.shards > 0 {
+        (rtc.shards as usize, 0)
     } else {
-        std::thread::available_parallelism().map_or(1, |n| n.get().div_ceil(4).min(32))
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        (1, cores.saturating_sub(1).clamp(1, 32))
     };
     SfuConfig {
         engine,
         shards,
+        max_shards,
         ..Default::default()
     }
 }

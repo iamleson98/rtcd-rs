@@ -13,6 +13,8 @@ pub enum AdmitError {
     Duplicate,
     #[error("the SFU is shutting down")]
     ShuttingDown,
+    #[error("no shard is running to serve the session")]
+    NoShard,
 }
 
 #[derive(Debug)]
@@ -23,10 +25,15 @@ struct Entry {
 
 #[derive(Debug, Default)]
 struct State {
+    /// Sessions a call counts for at least when shards are compared (0: just its sessions).
+    expected_call_size: usize,
     sessions: HashMap<String, Entry>,
     /// Sessions of each call, and the shard the call lives on.
     calls: HashMap<(String, String), (usize, HashSet<String>)>,
+    /// Sessions on each shard slot.
     load: Vec<usize>,
+    /// Which slots have a shard that takes new sessions.
+    active: Vec<bool>,
     closing: bool,
 }
 
@@ -37,10 +44,23 @@ pub(crate) struct Registry {
 }
 
 impl Registry {
+    #[cfg(test)]
     pub fn new(shards: usize) -> Self {
+        Self::with_slots(shards, shards)
+    }
+
+    /// Counts each call as at least `size` sessions when choosing a shard for a new one.
+    pub fn expecting_calls_of(self, size: usize) -> Self {
+        self.lock().expected_call_size = size;
+        self
+    }
+
+    /// Room for `slots` shards, the first `active` of which are running.
+    pub fn with_slots(slots: usize, active: usize) -> Self {
         Self {
             state: Mutex::new(State {
-                load: vec![0; shards],
+                load: vec![0; slots],
+                active: (0..slots).map(|i| i < active).collect(),
                 ..Default::default()
             }),
         }
@@ -54,8 +74,18 @@ impl Registry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// What each shard slot is carrying: its calls, each counted for at least the size a call is
+    /// expected to reach.
+    fn weights(st: &State) -> Vec<usize> {
+        let mut weights = vec![0; st.load.len()];
+        for (shard, members) in st.calls.values() {
+            weights[*shard] += members.len().max(st.expected_call_size);
+        }
+        weights
+    }
+
     /// Records a new session and returns the shard to serve it: the one its call lives on, else
-    /// the one with the fewest sessions.
+    /// the running one with the fewest sessions.
     pub fn admit(&self, cfg: &SessionConfig) -> Result<usize, AdmitError> {
         let mut st = self.lock();
         if st.closing {
@@ -67,12 +97,13 @@ impl Registry {
         let call = (cfg.group_id.clone(), cfg.call_id.clone());
         let shard = match st.calls.get(&call) {
             Some((shard, _)) => *shard,
-            None => st
-                .load
-                .iter()
+            None => Self::weights(&st)
+                .into_iter()
                 .enumerate()
-                .min_by_key(|&(_, n)| *n)
-                .map_or(0, |(i, _)| i),
+                .filter(|&(i, _)| st.active[i])
+                .min_by_key(|&(_, n)| n)
+                .map(|(i, _)| i)
+                .ok_or(AdmitError::NoShard)?,
         };
         st.load[shard] += 1;
         st.calls
@@ -155,8 +186,60 @@ impl Registry {
             }
         }
         st.calls.retain(|_, (s, _)| *s != shard);
-        st.load[shard] = usize::MAX / 2;
+        st.load[shard] = 0;
+        st.active[shard] = false;
         lost
+    }
+
+    /// Whether `cfg` starts a call and every running shard already has `per_shard` sessions or
+    /// more: a call that is already placed stays where it is, so only a new one can use a new
+    /// shard.
+    pub fn needs_new_shard(&self, cfg: &SessionConfig, per_shard: usize) -> bool {
+        let st = self.lock();
+        if st.closing
+            || st
+                .calls
+                .contains_key(&(cfg.group_id.clone(), cfg.call_id.clone()))
+        {
+            return false;
+        }
+        Self::weights(&st)
+            .into_iter()
+            .enumerate()
+            .filter(|&(i, _)| st.active[i])
+            .all(|(_, n)| n >= per_shard)
+    }
+
+    /// Lets new sessions go to `shard`, whose thread is running.
+    pub fn activate(&self, shard: usize) {
+        let mut st = self.lock();
+        if let Some(active) = st.active.get_mut(shard) {
+            *active = true;
+        }
+    }
+
+    /// Stops sending new sessions to `shard`, if it has none and is not the last shard running.
+    /// Done under the same lock as admitting, so a session cannot be placed on it after the
+    /// answer is yes.
+    pub fn retire(&self, shard: usize) -> bool {
+        let mut st = self.lock();
+        let running = st.active.iter().filter(|&&a| a).count();
+        if running <= 1 || !st.active.get(shard).copied().unwrap_or(false) || st.load[shard] != 0 {
+            return false;
+        }
+        st.active[shard] = false;
+        true
+    }
+
+    /// The sessions on each running shard, with its slot.
+    pub fn running(&self) -> Vec<(usize, usize)> {
+        let st = self.lock();
+        st.active
+            .iter()
+            .enumerate()
+            .filter(|&(_, &a)| a)
+            .map(|(i, _)| (i, st.load[i]))
+            .collect()
     }
 
     /// Refuses new sessions from now on.
@@ -227,6 +310,96 @@ mod tests {
         let other = r.shard_of("s4").unwrap();
         assert_ne!(again, other);
         let _ = first;
+    }
+
+    #[test]
+    fn a_shard_added_later_takes_the_next_calls() {
+        let r = Registry::with_slots(3, 1);
+        assert_eq!(r.admit(&cfg("c1", "s1")).unwrap(), 0);
+        assert_eq!(r.admit(&cfg("c2", "s2")).unwrap(), 0, "only one is running");
+        r.activate(1);
+        assert_eq!(
+            r.admit(&cfg("c3", "s3")).unwrap(),
+            1,
+            "the empty one takes it"
+        );
+        assert_eq!(r.running(), vec![(0, 2), (1, 1)]);
+    }
+
+    #[test]
+    fn a_shard_with_sessions_or_the_last_one_is_not_retired() {
+        let r = Registry::with_slots(2, 2);
+        r.admit(&cfg("c1", "s1")).unwrap();
+        let used = r.shard_of("s1").unwrap();
+        assert!(!r.retire(used), "it has a session");
+        let empty = 1 - used;
+        assert!(r.retire(empty));
+        assert!(!r.retire(empty), "already retired");
+        assert_eq!(
+            r.admit(&cfg("c2", "s2")).unwrap(),
+            used,
+            "new calls avoid it"
+        );
+        r.release("s1");
+        r.release("s2");
+        assert!(!r.retire(used), "the last one stays");
+    }
+
+    #[test]
+    fn with_no_shard_running_nothing_is_admitted() {
+        let r = Registry::with_slots(2, 1);
+        r.admit(&cfg("c1", "s1")).unwrap();
+        assert_eq!(r.take_shard(0).len(), 1);
+        assert_eq!(r.admit(&cfg("c2", "s2")), Err(AdmitError::NoShard));
+    }
+
+    #[test]
+    fn only_a_new_call_on_full_shards_needs_another_shard() {
+        let r = Registry::with_slots(3, 1);
+        assert!(!r.needs_new_shard(&cfg("c1", "s1"), 2), "there is room");
+        r.admit(&cfg("c1", "s1")).unwrap();
+        r.admit(&cfg("c1", "s2")).unwrap();
+        assert!(
+            !r.needs_new_shard(&cfg("c1", "s3"), 2),
+            "the call is placed already"
+        );
+        assert!(
+            r.needs_new_shard(&cfg("c2", "s4"), 2),
+            "a new call, and the only shard is full"
+        );
+        r.activate(1);
+        assert!(
+            !r.needs_new_shard(&cfg("c2", "s4"), 2),
+            "the new shard is empty"
+        );
+        r.close();
+        assert!(
+            !r.needs_new_shard(&cfg("c2", "s4"), 2),
+            "nothing is admitted any more"
+        );
+    }
+
+    #[test]
+    fn calls_are_counted_at_the_size_they_are_expected_to_reach() {
+        // Four calls start at once, one session each; two shards, a call counts for ten.
+        let r = Registry::with_slots(2, 2).expecting_calls_of(10);
+        let shards: Vec<usize> = (0..4)
+            .map(|i| r.admit(&cfg(&format!("c{i}"), &format!("s{i}"))).unwrap())
+            .collect();
+        let on_first = shards.iter().filter(|&&s| s == shards[0]).count();
+        assert_eq!(
+            on_first, 2,
+            "{shards:?}: two and two, not decided by one session each"
+        );
+
+        // A call that has grown past it counts for what it has.
+        let r = Registry::with_slots(2, 2).expecting_calls_of(3);
+        let big = r.admit(&cfg("big", "b0")).unwrap();
+        for i in 1..6 {
+            assert_eq!(r.admit(&cfg("big", &format!("b{i}"))).unwrap(), big);
+        }
+        assert_ne!(r.admit(&cfg("next", "n0")).unwrap(), big);
+        assert_ne!(r.admit(&cfg("then", "t0")).unwrap(), big, "6 against 3");
     }
 
     #[test]

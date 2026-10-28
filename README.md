@@ -57,7 +57,18 @@ transport-wide sequence number (8 bytes on a 65-byte packet, both ways) and nobo
 whatever places new calls (the LMS server does, from its DNS-discovered pool) can send them to the
 lighter instance. Calls stay on the instance they start on.
 
-Within an instance, `RTCD_RTC_SHARDS` threads serve the calls (0 chooses one per four cores). The shards
+Within an instance, threads called shards serve the calls, and a call lives on one of them. With
+`RTCD_RTC_SHARDS=0` (the default) the number follows the load, from one shard up to one fewer than
+the cores. A new call that finds every shard holding 300 sessions' worth (each call counts for at
+least 20, since a class fills over the seconds after it starts, and a bell starts many at once) gets
+a shard of its own, which a burst of classes needs because they are all placed before their
+participants have arrived; and a shard is added as well when every shard has been over half busy for three seconds. A shard that has had no
+sessions for two minutes is stopped. A call stays on the shard it started on, and new calls go to
+the shard carrying the least. Measured on four cores at 900 participants, one shard dropped a third
+of the voice packets and the automatic two dropped about 5 % (the load generator shares the machine,
+and more shards did not do better and cost a fifth more CPU); a shard that is not needed costs a
+little (about 7 % more CPU and 9 MiB at 300 participants). A positive `RTCD_RTC_SHARDS` pins the
+number. The shards
 share the media port; the kernel hands a datagram to one of them, and a shard that gets one that is
 not its own passes it on. Once a shard has learned a participant's address it opens a socket
 connected to that address, bound to the same port, which the kernel serves directly: after the first

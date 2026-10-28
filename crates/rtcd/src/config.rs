@@ -179,7 +179,9 @@ pub struct RtcConfig {
     pub nack_buffer_size: i64,
     /// Kept for compatibility: packets are always stored by value here, there is no unsafe mode.
     pub nack_disable_copy: bool,
-    /// Threads serving calls; 0 picks the number the build supports (currently one).
+    /// Threads serving calls. 0 lets the SFU choose: it starts with one, adds another when every
+    /// shard has been busy for a few seconds (up to one fewer than the cores) and stops one that has
+    /// been empty for two minutes. A positive number pins it.
     pub shards: i64,
     /// Seconds to let running sessions end on shutdown before ending them; 0 waits for them
     /// without limit, as the Go service does (a second signal ends them at once).

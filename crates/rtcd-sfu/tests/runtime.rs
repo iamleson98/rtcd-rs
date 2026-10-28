@@ -8,6 +8,7 @@ use std::time::Duration;
 use live::Live;
 use rtcd_proto::MessageType;
 use rtcd_sfu::engine::{CloseReason, Event};
+use rtcd_sfu::runtime::ScalingPolicy;
 
 #[test]
 fn two_browsers_connect_and_hear_each_other_over_real_sockets() {
@@ -247,3 +248,209 @@ fn shutdown_gives_running_sessions_time_to_end_on_their_own() {
 
 #[allow(dead_code)]
 fn _unused(_: Event) {}
+
+/// The number of shards can change while calls run: the calls already there are not disturbed (the
+/// kernel hands their datagrams to other sockets once the new one joins the port, and the shards
+/// pass them on), and the new shard takes the next calls.
+#[test]
+fn a_shard_added_while_calls_run_takes_the_next_calls_and_leaves_the_running_ones_alone() {
+    let mut live = Live::start_up_to(1, 3, ScalingPolicy::default());
+    assert_eq!(live.sfu.shard_count(), 1);
+    let a = live.join("alice", "call1");
+    let b = live.join("bob", "call1");
+    live.speak(a, 20);
+    live.run(Duration::from_millis(200));
+    let heard = live.browsers[b].received("voice_session-alice");
+    assert!(heard > 5, "bob heard {heard}");
+
+    assert_eq!(live.sfu.add_shard().expect("room for another"), 1);
+    assert_eq!(live.sfu.shard_count(), 2);
+
+    live.speak(a, 40);
+    live.run(Duration::from_millis(300));
+    assert!(
+        live.browsers[b].received("voice_session-alice") > heard + 20,
+        "the running call stopped when the shard was added"
+    );
+
+    // The empty shard takes the next call.
+    let c = live.join("carol", "call2");
+    let d = live.join("dave", "call2");
+    live.speak(c, 30);
+    live.speak(d, 30);
+    live.run(Duration::from_millis(300));
+    assert!(live.browsers[d].received("voice_session-carol") > 15);
+    assert!(live.browsers[c].received("voice_session-dave") > 15);
+    assert_eq!(
+        live.browsers[d].received("voice_"),
+        live.browsers[d].received("voice_session-carol"),
+        "dave heard someone outside his call"
+    );
+
+    // It has sessions, so it stays; once they are gone it can be stopped, the other never.
+    assert!(!live.sfu.retire_shard(1));
+    live.sfu.leave("session-carol");
+    live.sfu.leave("session-dave");
+    assert!(live.run_until(Duration::from_secs(5), |l| l.sfu.session_count() == 2));
+    assert!(live.sfu.retire_shard(1));
+    assert_eq!(live.sfu.shard_count(), 1);
+    assert!(!live.sfu.retire_shard(0), "the last shard stays");
+
+    // The calls go on, new ones are served, and a shard can be added again.
+    let e = live.join("erin", "call3");
+    let f = live.join("frank", "call3");
+    live.speak(e, 30);
+    live.speak(f, 30);
+    live.speak(a, 30);
+    live.run(Duration::from_millis(300));
+    assert!(live.browsers[f].received("voice_session-erin") > 15);
+    assert!(live.browsers[b].received("voice_session-alice") > heard + 40);
+    assert_eq!(live.sfu.add_shard().expect("room again"), 1);
+}
+
+#[test]
+fn a_fixed_number_of_shards_does_not_grow() {
+    let live = Live::start(2);
+    assert!(live.sfu.add_shard().is_err());
+    assert_eq!(live.sfu.shard_count(), 2);
+
+    let capped = Live::start_up_to(1, 2, ScalingPolicy::default());
+    assert!(capped.sfu.add_shard().is_ok());
+    assert!(capped.sfu.add_shard().is_err(), "two is the most");
+}
+
+/// With every shard counted as hot the SFU adds shards by itself up to its limit, one after the
+/// other, and the calls it has keep working through it.
+#[test]
+fn shards_are_added_on_their_own_when_all_are_busy() {
+    let scaling = ScalingPolicy {
+        tick: Duration::from_millis(40),
+        hot: 0.0,
+        hot_ticks: 2,
+        empty_for: Duration::from_secs(3600),
+        sessions_per_shard: 0,
+        expected_call_size: 0,
+    };
+    let mut live = Live::start_up_to(1, 3, scaling);
+    let a = live.join("alice", "call1");
+    let b = live.join("bob", "call1");
+    assert!(
+        live.run_until(Duration::from_secs(5), |l| l.sfu.shard_count() == 3),
+        "{} shards",
+        live.sfu.shard_count()
+    );
+    live.speak(a, 30);
+    live.run(Duration::from_millis(300));
+    assert!(live.browsers[b].received("voice_session-alice") > 15);
+    live.run(Duration::from_millis(400));
+    assert_eq!(live.sfu.shard_count(), 3, "it went past its limit");
+}
+
+/// A shard that has had nothing to do for long enough is stopped by the SFU itself, and calls
+/// that start afterwards are served.
+#[test]
+fn an_empty_shard_is_stopped_on_its_own_after_a_while() {
+    let scaling = ScalingPolicy {
+        tick: Duration::from_millis(40),
+        hot: 0.5,
+        hot_ticks: 3,
+        empty_for: Duration::from_millis(300),
+        sessions_per_shard: 0,
+        expected_call_size: 0,
+    };
+    let mut live = Live::start_up_to(1, 3, scaling);
+    let a = live.join("alice", "call1");
+    let b = live.join("bob", "call1");
+    live.sfu.add_shard().unwrap();
+    live.sfu.add_shard().unwrap();
+    assert_eq!(live.sfu.shard_count(), 3);
+    assert!(
+        live.run_until(Duration::from_secs(5), |l| l.sfu.shard_count() == 1),
+        "{} shards",
+        live.sfu.shard_count()
+    );
+    live.speak(a, 30);
+    live.run(Duration::from_millis(300));
+    assert!(live.browsers[b].received("voice_session-alice") > 15);
+    let c = live.join("carol", "call2");
+    let d = live.join("dave", "call2");
+    live.speak(c, 30);
+    live.run(Duration::from_millis(300));
+    assert!(live.browsers[d].received("voice_session-carol") > 15);
+}
+
+/// Classes that start together cannot wait for a shard to be seen busy: every call is placed
+/// before the load shows. A new call that finds the shards holding their share gets a shard of its
+/// own, and the calls that are there stay where they are.
+#[test]
+fn a_call_that_finds_the_shards_full_gets_a_new_shard() {
+    let scaling = ScalingPolicy {
+        tick: Duration::from_secs(3600),
+        sessions_per_shard: 4,
+        expected_call_size: 0,
+        ..ScalingPolicy::default()
+    };
+    let mut live = Live::start_up_to(1, 3, scaling);
+    let a = live.join("alice", "call1");
+    let b = live.join("bob", "call1");
+    live.join("carol", "call2");
+    live.join("dave", "call2");
+    assert_eq!(
+        live.sfu.shard_count(),
+        1,
+        "four sessions are the shard's share"
+    );
+
+    // The fifth session starts a call, and the shard is full: it gets its own.
+    let e = live.join("erin", "call3");
+    let f = live.join("frank", "call3");
+    assert_eq!(live.sfu.shard_count(), 2);
+    // A session of a call already placed does not start another.
+    live.join("gina", "call3");
+    live.join("hugo", "call3");
+    live.join("iris", "call3");
+    assert_eq!(live.sfu.shard_count(), 2, "call3 is on the second shard");
+
+    // The next call goes where there is room, the one after has none and takes the third; the
+    // limit is three.
+    live.join("jon", "call4");
+    live.join("kim", "call4");
+    live.join("lee", "call5");
+    live.join("max", "call6");
+    live.join("ned", "call7");
+    assert_eq!(live.sfu.shard_count(), 3, "the most it may have");
+
+    for (x, y) in [(a, b), (e, f)] {
+        live.speak(x, 30);
+        live.speak(y, 30);
+    }
+    live.run(Duration::from_millis(300));
+    assert!(live.browsers[b].received("voice_session-alice") > 15);
+    assert!(live.browsers[f].received("voice_session-erin") > 15);
+}
+
+/// A bell starts many classes at once, each with its first participant: the shards are chosen by
+/// what the calls will bring, so they are spread (and shards started) before the participants have
+/// arrived.
+#[test]
+fn calls_that_start_together_are_spread_before_their_participants_arrive() {
+    let scaling = ScalingPolicy {
+        tick: Duration::from_secs(3600),
+        sessions_per_shard: 40,
+        expected_call_size: 20,
+        ..ScalingPolicy::default()
+    };
+    let mut live = Live::start_up_to(1, 3, scaling);
+    live.join("a1", "call1");
+    live.join("b1", "call2");
+    assert_eq!(
+        live.sfu.shard_count(),
+        1,
+        "two calls of twenty fill the share"
+    );
+    live.join("c1", "call3");
+    assert_eq!(live.sfu.shard_count(), 2, "the third call does not fit");
+    live.join("d1", "call4");
+    live.join("e1", "call5");
+    assert_eq!(live.sfu.shard_count(), 3, "and the fifth finds both full");
+}
