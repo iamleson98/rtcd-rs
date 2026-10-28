@@ -442,6 +442,16 @@ impl Sfu {
         self.core.registry.len()
     }
 
+    /// What the node sends now, in bits per second (the shards' smoothed total).
+    pub fn egress_bps(&self) -> u64 {
+        self.core.cfg.engine.egress.rate_bps()
+    }
+
+    /// Whether receivers are held to the small video layers because the send budget is reached.
+    pub fn egress_squeezed(&self) -> bool {
+        self.core.cfg.engine.egress.squeezed()
+    }
+
     /// How many threads serve sessions right now.
     pub fn shard_count(&self) -> usize {
         self.core.table.len()

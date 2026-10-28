@@ -60,13 +60,18 @@ impl Engine {
                     return None;
                 }
                 // The small layer while the receiver asked for it or the sender has paused the large.
-                let small =
-                    r.down.low_video.contains(&p.cfg.session_id) || p.up.camera_stall.stalled();
+                let small = r.down.squeezed
+                    || r.down.low_video.contains(&p.cfg.session_id)
+                    || p.up.camera_stall.stalled();
                 let preferred = if small { Layer::Low } else { Layer::High };
                 self.pick_layer(&mut candidates, preferred)
             }
             TrackType::Screen => {
-                let preferred = r.down.screen_level.level();
+                let preferred = if r.down.squeezed {
+                    Layer::Low
+                } else {
+                    r.down.screen_level.level()
+                };
                 self.pick_layer(&mut candidates, preferred)
             }
         }
@@ -241,10 +246,35 @@ impl Engine {
     /// Once-a-second upkeep of a session's video: the sender's large layer pausing and resuming,
     /// the receiver's keyframe requests that went unanswered, and its screen share layer.
     pub(super) fn housekeeping(&mut self, key: SessionKey, now: Instant) {
+        self.cfg.egress.update(now, self.cfg.egress_budget_bps);
+        self.follow_budget(key, now);
         self.watch_camera(key, now);
         self.retry_keyframes(key, now);
         self.review_screen_level(key, now);
         self.report_quality(key, now);
+    }
+
+    /// Holds a receiver to the small layers while the node is near its send budget, and lets it
+    /// back up when it is not.
+    fn follow_budget(&mut self, key: SessionKey, now: Instant) {
+        let squeeze = self.cfg.egress_budget_bps > 0 && self.cfg.egress.squeezed();
+        let Some(s) = self.sessions.get_mut(key) else {
+            return;
+        };
+        if s.down.squeezed == squeeze {
+            return;
+        }
+        s.down.squeezed = squeeze;
+        debug!(session = %s.cfg.session_id, squeeze, "send budget changed the layers");
+        if !s.down.ready {
+            return;
+        }
+        for member in self.call_members(key) {
+            if member != key {
+                self.sync_stream(key, member, TrackType::Video, now);
+                self.sync_stream(key, member, TrackType::Screen, now);
+            }
+        }
     }
 
     /// Moves the receivers of a camera between its layers as the large one pauses and resumes.

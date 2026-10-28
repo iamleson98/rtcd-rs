@@ -123,6 +123,9 @@ pub(crate) struct DownStream {
 #[derive(Debug, Default)]
 pub(crate) struct Downlink {
     pub streams: Vec<Option<DownStream>>,
+    /// Its cameras and screen share are held to the small layers because the node is near its
+    /// send budget (see `egress`).
+    pub squeezed: bool,
     /// The data channel is open, so tracks may be pushed.
     pub ready: bool,
     /// Whose cameras the participant wants (all, until it says otherwise).

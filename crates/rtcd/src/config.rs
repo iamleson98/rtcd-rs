@@ -187,6 +187,11 @@ pub struct RtcConfig {
     /// loudest ones, as Meet and Jitsi do. A listener follows two or three speakers, and every open
     /// microphone is a stream to every listener. 0 (the default) forwards all of them.
     pub audio_loudest: i64,
+    /// The most this node should send, in megabits per second. Near it every receiver's cameras
+    /// and screen shares fall back to their small layer, so the node slows down evenly instead of
+    /// losing packets for everyone. 0 (the default) sets no budget; the rate is reported on
+    /// `GET /system` either way.
+    pub egress_budget_mbps: i64,
     /// Seconds to let running sessions end on shutdown before ending them; 0 waits for them
     /// without limit, as the Go service does (a second signal ends them at once).
     pub drain_timeout_seconds: i64,
@@ -270,6 +275,7 @@ impl Default for RtcConfig {
             nack_disable_copy: true,
             shards: 0,
             audio_loudest: 0,
+            egress_budget_mbps: 0,
             drain_timeout_seconds: 0,
         }
     }
@@ -396,6 +402,7 @@ impl Config {
         boolean!("RTC_NACKDISABLECOPY", self.rtc.nack_disable_copy);
         integer!("RTC_SHARDS", self.rtc.shards);
         integer!("RTC_AUDIOLOUDEST", self.rtc.audio_loudest);
+        integer!("RTC_EGRESSBUDGETMBPS", self.rtc.egress_budget_mbps);
         integer!("RTC_DRAINTIMEOUTSECONDS", self.rtc.drain_timeout_seconds);
         text!("STORE_DATASOURCE", self.store.data_source);
         boolean!("LOGGER_ENABLECONSOLE", self.logger.enable_console);
@@ -496,6 +503,9 @@ impl Config {
         }
         if rtc.shards < 0 || rtc.shards > 256 {
             return Err(invalid("Shards", "must be between 0 and 256"));
+        }
+        if !(0..=100_000).contains(&rtc.egress_budget_mbps) {
+            return Err(invalid("EgressBudgetMbps", "must be between 0 and 100000"));
         }
         if !(0..=64).contains(&rtc.audio_loudest) {
             return Err(invalid("AudioLoudest", "must be between 0 and 64"));
@@ -753,6 +763,7 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
             ("RTCD_API_SECURITY_ALLOWSELFREGISTRATION", "true"),
             ("RTCD_RTC_ICEPORTUDP", "30000"),
             ("RTCD_RTC_AUDIOLOUDEST", "5"),
+            ("RTCD_RTC_EGRESSBUDGETMBPS", "250"),
             ("RTCD_STORE_DATASOURCE", "/data/db"),
             ("RTCD_LOGGER_ENABLEFILE", "false"),
             ("RTCD_LOGGER_CONSOLEJSON", "1"),
@@ -764,6 +775,7 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
         assert!(c.api.security.allow_self_registration);
         assert_eq!(c.rtc.ice_port_udp, 30000);
         assert_eq!(c.rtc.audio_loudest, 5);
+        assert_eq!(c.rtc.egress_budget_mbps, 250);
         assert_eq!(c.store.data_source, "/data/db");
         assert!(!c.logger.enable_file);
         assert!(c.logger.console_json);
@@ -816,6 +828,7 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
         assert!(bad(&|c| c.rtc.nack_buffer_size = 16384).contains("exceed 8192"));
         assert!(bad(&|c| c.rtc.audio_loudest = -1).contains("between 0 and 64"));
         assert!(bad(&|c| c.rtc.audio_loudest = 65).contains("between 0 and 64"));
+        assert!(bad(&|c| c.rtc.egress_budget_mbps = -1).contains("between 0 and 100000"));
         assert!(
             bad(&|c| c.rtc.ice_servers = vec![IceServer {
                 urls: vec!["http://x".into()],

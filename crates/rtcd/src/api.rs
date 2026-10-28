@@ -334,10 +334,16 @@ async fn system(State(svc): State<Arc<Service>>, method: axum::http::Method) -> 
         sessions: usize,
         /// Threads serving them.
         shards: usize,
+        /// What the instance sends now, in bits per second.
+        egress_bps: u64,
+        /// Receivers are held to the small video layers: the send budget is reached.
+        egress_squeezed: bool,
     }
     json_response(&Body {
         cpu_load: svc.system.info().cpu_load,
         sessions: svc.sfu.session_count(),
         shards: svc.sfu.shard_count(),
+        egress_bps: svc.sfu.egress_bps(),
+        egress_squeezed: svc.sfu.egress_squeezed(),
     })
 }

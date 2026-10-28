@@ -1,6 +1,7 @@
 //! Settings of the media plane.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// An address the SFU listens on and the candidates it offers for it.
@@ -71,6 +72,12 @@ pub struct EngineConfig {
     /// How many voices of one call are forwarded when more microphones are open than that: the
     /// loudest (see `loudest`). 0 forwards every voice, as the Go rtcd does.
     pub audio_loudest: usize,
+    /// The most this node should send, in bits per second. Near it (see `egress`) every receiver's
+    /// cameras and screen shares fall back to their small layer instead of the node losing packets
+    /// for everyone. 0 sets no budget.
+    pub egress_budget_bps: u64,
+    /// What the node's shards have sent, shared by all of them.
+    pub egress: Arc<crate::egress::Gauge>,
     /// How many sessions one shard serves at most; joins beyond are refused.
     pub max_sessions: usize,
 }
@@ -92,6 +99,8 @@ impl Default for EngineConfig {
             ice_lite: true,
             pacing: false,
             audio_loudest: 0,
+            egress_budget_bps: 0,
+            egress: Arc::default(),
             max_sessions: 10_000,
         }
     }

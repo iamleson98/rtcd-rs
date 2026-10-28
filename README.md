@@ -88,6 +88,18 @@ always forwarded, and 0 (the default) forwards everything as before. Packets of 
 not forwarded are dropped before any receiver is written to, so nothing is renegotiated and the
 people's voice indicators (`voice_on`/`voice_off`) do not change.
 
+## Large calls: a send budget
+
+A node asked for more than its network carries does not slow down evenly: its send queues overflow
+and every receiver loses packets at once (the production load test saw 50 to 75 % loss for
+everyone past about 320 Mbit/s). With `RTCD_RTC_EGRESSBUDGETMBPS=N` (`rtc.egress_budget_mbps`) the
+shards add what they send to one gauge, and when its smoothed rate reaches 85 % of `N` every
+receiver's cameras and screen shares fall back to their small layer (no renegotiation, the same
+switch a receiver's own request makes); they go back up only after the rate has stayed under 65 %
+for twenty seconds, so the drop itself does not release it. Voice is never touched. 0 (the
+default) sets no budget. `GET /system` reports `egress_bps` and `egress_squeezed` either way, for
+whatever places new calls (`src/egress.rs`).
+
 ## Using it from class-management
 
 - Bring it in as a submodule: `git submodule add https://github.com/iamleson98/rtcd-rs.git rtcd-rust`
