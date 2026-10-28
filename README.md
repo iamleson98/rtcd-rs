@@ -95,6 +95,19 @@ packets a second (`rtcd_net_packets_total`), 140 Mbit/s of it voice; the shard t
 not forwarded are dropped before any receiver is written to, so nothing is renegotiated and the
 people's voice indicators (`voice_on`/`voice_off`) do not change.
 
+
+### Voice packet time
+
+Opus fits 20 ms in a packet by default, so a microphone is 50 packets a second, and an open
+microphone is that to every listener. `RTCD_RTC_AUDIOPTIMEMS=40` (`rtc.audio_ptime_ms`) asks the
+browsers to send 40 ms in a packet instead, by writing `a=ptime` and `a=maxptime` into every audio
+section the node receives on, in each description it sends (a browser given a description without
+one goes back to 20). That halves the voice packets of a call and the header bytes with them, at 20
+ms more delay and 40 ms lost to a lost packet instead of 20 (Opus's in-band repair covers it).
+Chromium applies it to what it sends (checked: 50.8 packets a second without, 25.6 with 40 and 17.6
+with 60); a browser that ignores it stays at 20. Forwarded voice keeps the packet time it was sent
+with. The value is 0 (the browser decides, the default) or a multiple of 10 up to 120.
+
 ## Large calls: a send budget
 
 A node asked for more than its network carries does not slow down evenly: its send queues overflow

@@ -83,6 +83,7 @@ pub fn sfu_config(cfg: &Config, addresses: Vec<LocalAddress>) -> SfuConfig {
         engine.nack_buffer_size = rtc.nack_buffer_size as u16;
     }
     engine.audio_loudest = rtc.audio_loudest.clamp(0, 64) as usize;
+    engine.audio_ptime_ms = rtc.audio_ptime_ms.clamp(0, 120) as u32;
     engine.egress_budget_bps = rtc.egress_budget_mbps.clamp(0, 100_000) as u64 * 1_000_000;
     engine.egress_budget_pps = rtc.egress_budget_pps.clamp(0, 100_000_000) as u64;
     // A shard is a thread, a call lives on one, and one carries a few hundred participants before it

@@ -72,6 +72,11 @@ pub struct EngineConfig {
     /// How many voices of one call are forwarded when more microphones are open than that: the
     /// loudest (see `loudest`). 0 forwards every voice, as the Go rtcd does.
     pub audio_loudest: usize,
+    /// The packet time, in milliseconds, browsers are asked to send their voice with (`a=ptime` in
+    /// the descriptions they are given). A longer one makes fewer, larger packets: 40 ms halves the
+    /// packets a call's microphones cost every listener, for 20 ms more delay. 0 leaves it to the
+    /// browser (20 ms).
+    pub audio_ptime_ms: u32,
     /// The most this node should send, in bits per second. Near it (see `egress`) every receiver's
     /// cameras and screen shares fall back to their small layer instead of the node losing packets
     /// for everyone. 0 sets no budget.
@@ -103,6 +108,7 @@ impl Default for EngineConfig {
             ice_lite: true,
             pacing: false,
             audio_loudest: 0,
+            audio_ptime_ms: 0,
             egress_budget_bps: 0,
             egress_budget_pps: 0,
             egress: Arc::default(),

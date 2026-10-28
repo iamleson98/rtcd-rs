@@ -411,6 +411,46 @@ fn a_participant_that_closes_its_connection_is_dropped_at_once() {
     assert_eq!(w.engine.session_count(), 1);
 }
 
+#[test]
+fn browsers_are_asked_to_send_voice_with_the_configured_packet_time() {
+    let mut w = World::with_config(EngineConfig {
+        audio_ptime_ms: 40,
+        ..engine_config()
+    });
+    let a = w.join("alice", "call1");
+    let b = w.join("bob", "call1");
+    for i in [a, b] {
+        let answer = &w.browsers[i].descriptions[0];
+        assert!(
+            answer.contains("\r\na=ptime:40\r\na=maxptime:40\r\n"),
+            "{} was told no packet time:\n{answer}",
+            w.browsers[i].name
+        );
+    }
+    // Every later description repeats it: a browser that is given an offer without a packet time
+    // goes back to its own.
+    talk(&mut w, a);
+    wait_tracks(&mut w, b, 1);
+    assert!(
+        w.browsers[b].descriptions.len() > 1,
+        "an offer for alice's microphone"
+    );
+    for sdp in &w.browsers[b].descriptions {
+        assert_eq!(
+            sdp.matches("m=audio").count(),
+            sdp.matches("a=ptime:40").count(),
+            "{sdp}"
+        );
+    }
+}
+
+#[test]
+fn the_browser_chooses_its_packet_time_unless_one_is_configured() {
+    let mut w = World::new();
+    let a = w.join("alice", "call1");
+    assert!(!w.browsers[a].descriptions[0].contains("a=ptime"));
+}
+
 /// A call where `levels` speak at once (browser `i` at audio level `levels[i]`, -dBov) for three
 /// seconds, plus one listener that never speaks. Returns how many packets the listener received
 /// from each speaker.

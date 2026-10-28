@@ -88,6 +88,8 @@ pub struct Browser {
     pub dc_frames: Vec<DcMessage>,
     pub offers_received: usize,
     pub answers_sent: usize,
+    /// The text of every description the SFU sent this browser, in order.
+    pub descriptions: Vec<String>,
     pub mic: RTCRtpSenderId,
     pub mic_ssrc: u32,
     pub mic_seq: u16,
@@ -339,6 +341,7 @@ impl World {
             dc_frames: vec![],
             offers_received: 0,
             answers_sent: 0,
+            descriptions: Vec::new(),
             mic,
             mic_ssrc,
             mic_seq: 0,
@@ -566,6 +569,7 @@ impl World {
         let desc: RTCSessionDescription = serde_json::from_slice(json).unwrap();
         let now = self.now;
         let b = &mut self.browsers[i];
+        b.descriptions.push(desc.sdp.clone());
         match desc.sdp_type {
             RTCSdpType::Answer => {
                 b.pc.set_remote_description(now, desc)
