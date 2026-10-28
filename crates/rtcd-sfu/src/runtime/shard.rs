@@ -21,7 +21,7 @@ use super::registry::Registry;
 use super::scaler::{Level, Pressure};
 use super::table::ShardTable;
 use super::tcp::TcpConn;
-use crate::engine::{Command, Engine, Event, FastMap, Proto, RouteUpdate};
+use crate::engine::{Command, Engine, Event, FastMap, Load, Proto, RouteUpdate};
 use crate::metrics::{Metrics, NetTraffic};
 
 const WAKER: Token = Token(0);
@@ -324,7 +324,11 @@ impl Shard {
         if window >= BUSY_WINDOW {
             let fraction = (self.worked.as_secs_f32() / window.as_secs_f32()).clamp(0.0, 1.0);
             let level = self.pressure.update(fraction);
-            self.engine.set_overloaded(level != Level::Ok);
+            self.engine.set_load(match level {
+                Level::Ok => Load::Ok,
+                Level::Shedding => Load::Shedding,
+                Level::Saturated => Load::Saturated,
+            });
             let flags = match level {
                 Level::Ok => 0,
                 Level::Shedding => PRESSURE_FLAG,

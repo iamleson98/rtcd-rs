@@ -43,6 +43,18 @@ use crate::ids::Rng;
 use crate::loudest::Selector;
 use crate::metrics::Metrics;
 
+/// How much a shard is asked for compared with what its thread can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Load {
+    /// Room to spare.
+    #[default]
+    Ok,
+    /// No room left: small video layers and fewer voices.
+    Shedding,
+    /// At the limit: the same, harder, and the shard takes no new sessions.
+    Saturated,
+}
+
 /// A call: the sessions that hear each other.
 #[derive(Debug)]
 pub(crate) struct Call {
@@ -74,8 +86,9 @@ pub(crate) struct CallId {
 pub struct Engine {
     /// Counts packet writes, to time one in a few.
     write_clock: u32,
-    /// Whether the shard this engine runs on has no room left (see `runtime::scaler::Pressure`).
-    overloaded: bool,
+    /// How much the shard this engine runs on is asked for compared with what it can do (see
+    /// `runtime::scaler::Pressure`).
+    load: Load,
     cfg: Arc<EngineConfig>,
     metrics: Arc<dyn Metrics>,
     rng: Rng,
@@ -103,16 +116,16 @@ impl std::fmt::Debug for Engine {
 }
 
 impl Engine {
-    /// Tells the engine whether its shard has no room left: while it has not, its receivers are
-    /// held to the small video layers and its calls forward fewer voices.
-    pub fn set_overloaded(&mut self, overloaded: bool) {
-        self.overloaded = overloaded;
+    /// Tells the engine how loaded its shard is: from `Shedding` on, its receivers are held to the
+    /// small video layers and its calls forward fewer voices (one, when `Saturated`).
+    pub fn set_load(&mut self, load: Load) {
+        self.load = load;
     }
 
     pub fn new(cfg: Arc<EngineConfig>, metrics: Arc<dyn Metrics>, rng: Rng) -> Self {
         Self {
             write_clock: 0,
-            overloaded: false,
+            load: Load::Ok,
             cfg,
             metrics,
             rng,

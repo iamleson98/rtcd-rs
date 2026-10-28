@@ -164,10 +164,12 @@ const PRESSURE_FOR: u32 = 2;
 /// brought it down, and giving it back at once would bring the shard straight back up.
 const PRESSURE_RELEASE: f32 = 0.7;
 const RELEASE_FOR: u32 = 30;
-/// A shard this close to all of its time working for [`SATURATED_FOR`] is dropping packets however
-/// much it sheds: the thread is the limit, and the sessions it has are all it can serve.
-const SATURATED_AT: f32 = 0.985;
-const SATURATED_FOR: u32 = 5;
+/// A shard this close to all of its time working for [`SATURATED_FOR`] is at the edge of a cliff:
+/// measured, a thread at 97 % lost 0.2 % of its packets and at 100 % a third, because losses are
+/// asked for again and the thread has no time left for them. The sessions it has are all it
+/// should serve, and it must ease off before it reaches 100 %.
+const SATURATED_AT: f32 = 0.95;
+const SATURATED_FOR: u32 = 3;
 /// It leaves that state after this many seconds under [`PRESSURE_AT`].
 const SATURATED_RELEASE_FOR: u32 = 10;
 
@@ -381,10 +383,14 @@ mod tests {
     #[test]
     fn a_thread_at_its_limit_refuses_new_sessions_until_it_has_eased_for_a_while() {
         let mut p = Pressure::default();
-        for _ in 0..4 {
+        for _ in 0..2 {
             p.update(1.0);
         }
-        assert_eq!(p.update(1.0), Level::Saturated, "five seconds at the limit");
+        assert_eq!(
+            p.update(1.0),
+            Level::Saturated,
+            "three seconds at the limit"
+        );
         // Eases a little, still hot: not released.
         for _ in 0..30 {
             assert_eq!(p.update(0.93), Level::Saturated);

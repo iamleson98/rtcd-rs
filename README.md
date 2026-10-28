@@ -128,6 +128,15 @@ two seconds is under pressure: its receivers are held to the small layers and it
 voices at most, the same fall back as the send budget, but local to the shard. It is released after
 thirty seconds under 70 % (`src/runtime/scaler.rs`, `Pressure`).
 
+Past that there is a cliff. Measured on the OVH video VPS, a shard thread at 97 % lost 0.2 % of its
+packets and at 100 % about a third, because lost packets are asked for again and the thread has no
+time left for them, so it does not recover by itself. A shard at 95 % busy for three seconds is
+saturated: its calls forward the loudest voice only, and it refuses new sessions (a call that lives
+on it cannot move, so its next participant is refused; a new call goes to a shard that is not
+saturated, and is refused when none is), so the sessions it has keep their quality. It leaves that
+state after ten seconds under 90 %. `RTCD_RTC_REFUSEWHENSATURATED=false` turns the refusal off.
+`GET /system` reports `shards_pressured` and `shards_saturated`.
+
 ## Using it from class-management
 
 - Bring it in as a submodule: `git submodule add https://github.com/iamleson98/rtcd-rs.git rtcd-rust`

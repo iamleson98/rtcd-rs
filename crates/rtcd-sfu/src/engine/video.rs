@@ -14,8 +14,8 @@ use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use super::Engine;
 use super::session::{DownPhase, SessionKey, SourceKey, SubRef};
+use super::{Engine, Load};
 use crate::ids::TrackType;
 use crate::layers::{Layer, ScreenInputs, WATCH_EVERY};
 
@@ -27,6 +27,8 @@ const KEYFRAME_INTERVAL: Duration = Duration::from_secs(1);
 /// How many voices of a call are forwarded while the node is shedding load, whatever the
 /// configured limit is (a smaller configured limit stays).
 const SHEDDING_VOICES: usize = 2;
+/// And on a shard at its limit: the loudest voice only.
+const SATURATED_VOICES: usize = 1;
 
 #[derive(Deserialize)]
 struct Subscription {
@@ -265,7 +267,7 @@ impl Engine {
     fn shedding(&self) -> bool {
         let budgeted = (self.cfg.egress_budget_bps > 0 || self.cfg.egress_budget_pps > 0)
             && self.cfg.egress.squeezed();
-        budgeted || self.overloaded
+        budgeted || self.load != Load::Ok
     }
 
     /// Lets a call forward fewer voices while the node is shedding: a call with many open
@@ -273,7 +275,9 @@ impl Engine {
     /// two or three.
     fn follow_voice_limit(&mut self, key: SessionKey) {
         let configured = self.cfg.audio_loudest;
-        let limit = if self.shedding() {
+        let limit = if self.load == Load::Saturated {
+            SATURATED_VOICES
+        } else if self.shedding() {
             match configured {
                 0 => SHEDDING_VOICES,
                 n => n.min(SHEDDING_VOICES),

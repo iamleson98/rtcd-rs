@@ -7,7 +7,7 @@ use std::time::Duration;
 use rtcd_proto::MessageType;
 use rtcd_proto::dc::DcMessage;
 use rtcd_sfu::config::EngineConfig;
-use rtcd_sfu::engine::CloseReason;
+use rtcd_sfu::engine::{CloseReason, Load};
 use rtcd_sfu::ids::{TrackType, parse_track_id};
 use support::{World, engine_config};
 
@@ -535,7 +535,7 @@ fn a_shard_with_no_room_left_forwards_two_voices_at_most_and_gives_them_back() {
     assert!((0..4).all(|i| heard(&w, i) > 60), "everyone is heard");
 
     // Once the shard is under pressure (the upkeep runs once a second) the quiet voices stop.
-    w.engine.set_overloaded(true);
+    w.engine.set_load(Load::Shedding);
     w.run_for(Duration::from_secs(2));
     let before: Vec<usize> = (0..4).map(|i| heard(&w, i)).collect();
     talk_for(&mut w, 150);
@@ -549,8 +549,20 @@ fn a_shard_with_no_room_left_forwards_two_voices_at_most_and_gives_them_back() {
         "the others are left out: {gained:?}"
     );
 
+    // At its limit: the loudest voice only.
+    w.engine.set_load(Load::Saturated);
+    w.run_for(Duration::from_secs(2));
+    let before: Vec<usize> = (0..4).map(|i| heard(&w, i)).collect();
+    talk_for(&mut w, 150);
+    let gained: Vec<usize> = (0..4).map(|i| heard(&w, i) - before[i]).collect();
+    assert!(gained[0] > 100, "the loudest goes on: {gained:?}");
+    assert!(
+        gained[1] < 30 && gained[2] < 30 && gained[3] < 30,
+        "the others are left out: {gained:?}"
+    );
+
     // And come back when it has room again.
-    w.engine.set_overloaded(false);
+    w.engine.set_load(Load::Ok);
     w.run_for(Duration::from_secs(2));
     let before: Vec<usize> = (0..4).map(|i| heard(&w, i)).collect();
     talk_for(&mut w, 100);
