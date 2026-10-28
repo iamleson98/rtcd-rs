@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use rtcd_proto::MessageType;
 use rtcd_sfu::config::EngineConfig;
+use rtcd_sfu::engine::Load;
 use rtcd_sfu::ids::{TrackType, parse_track_id};
 use support::{Layer, World, describe, engine_config};
 
@@ -522,6 +523,56 @@ fn without_a_budget_the_large_layer_stays() {
 #[test]
 fn a_budget_far_above_the_traffic_changes_nothing() {
     let tail = tail_layers(1_000_000_000, 8.0);
+    assert!(!tail.is_empty());
+    assert!(tail.iter().all(|l| *l == Layer::High));
+}
+
+/// Like `tail_layers`, for a node configured by `cfg` whose engine has been told its shard is at
+/// `load`.
+fn tail_layers_with(cfg: EngineConfig, load: Load, secs: f64) -> Vec<Layer> {
+    let mut w = World::with_config(cfg);
+    w.engine.set_load(load);
+    let a = w.join_with_camera("alice", "call1");
+    let b = w.join("bob", "call1");
+    w.stream_video(a, false, secs, 30, &BOTH);
+    let all = video_of(&w, b, "video_");
+    let last = all.len().saturating_sub(30);
+    all[last..].iter().map(|(l, _)| *l).collect()
+}
+
+#[test]
+fn receivers_fall_back_to_the_small_layer_when_the_packet_budget_is_reached() {
+    // The budget in packets: the test camera sends a few dozen a second, far over a budget of 1.
+    let tail = tail_layers_with(
+        EngineConfig {
+            egress_budget_pps: 1,
+            ..engine_config()
+        },
+        Load::Ok,
+        8.0,
+    );
+    assert!(!tail.is_empty());
+    assert!(
+        tail.iter().all(|l| *l == Layer::Low),
+        "still on the large layer over the packet budget"
+    );
+}
+
+#[test]
+fn receivers_fall_back_to_the_small_layer_while_the_shard_is_shedding() {
+    for load in [Load::Shedding, Load::Saturated] {
+        let tail = tail_layers_with(engine_config(), load, 8.0);
+        assert!(!tail.is_empty());
+        assert!(
+            tail.iter().all(|l| *l == Layer::Low),
+            "still on the large layer on a shard that is {load:?}"
+        );
+    }
+}
+
+#[test]
+fn a_shard_with_room_keeps_the_large_layer() {
+    let tail = tail_layers_with(engine_config(), Load::Ok, 8.0);
     assert!(!tail.is_empty());
     assert!(tail.iter().all(|l| *l == Layer::High));
 }
