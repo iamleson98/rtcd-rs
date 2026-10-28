@@ -41,6 +41,11 @@ impl SessionProps {
             .and_then(Value::as_bool)
             .unwrap_or(false)
     }
+
+    /// Whether the participant is the call's host (absent from older servers: false).
+    pub fn host(&self) -> bool {
+        self.0.get("host").and_then(Value::as_bool).unwrap_or(false)
+    }
 }
 
 /// A session, as the join request defined it and the HTTP API reports it. The field names are the
@@ -70,6 +75,7 @@ impl SessionConfig {
         );
         props.insert("av1Support".to_owned(), Value::Bool(join.av1_support));
         props.insert("dcSignaling".to_owned(), Value::Bool(join.dc_signaling));
+        props.insert("host".to_owned(), Value::Bool(join.host));
         Self {
             group_id: group_id.to_owned(),
             call_id: join.call_id.clone(),

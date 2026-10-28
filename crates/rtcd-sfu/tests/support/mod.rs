@@ -249,6 +249,7 @@ impl World {
                     channel_id: "ch".into(),
                     av1_support: false,
                     dc_signaling: true,
+                    host: false,
                 },
             )
             .props,

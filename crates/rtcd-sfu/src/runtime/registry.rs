@@ -109,8 +109,11 @@ impl Registry {
             return Err(AdmitError::Duplicate);
         }
         let call = (cfg.group_id.clone(), cfg.call_id.clone());
+        // The call's host is never refused: without the teacher a class cannot start, or goes on
+        // without one (a teacher whose connection dropped comes back as a new session).
+        let host = cfg.props.host();
         let shard = match st.calls.get(&call) {
-            Some((shard, _)) if saturated(*shard) => return Err(AdmitError::Saturated),
+            Some((shard, _)) if saturated(*shard) && !host => return Err(AdmitError::Saturated),
             Some((shard, _)) => *shard,
             None => {
                 let open: Vec<(usize, usize)> = Self::weights(&st)
@@ -121,11 +124,21 @@ impl Registry {
                 if open.is_empty() {
                     return Err(AdmitError::NoShard);
                 }
-                open.into_iter()
+                let with_room = open
+                    .iter()
+                    .copied()
                     .filter(|&(i, _)| !saturated(i))
-                    .min_by_key(|&(_, n)| n)
-                    .map(|(i, _)| i)
-                    .ok_or(AdmitError::Saturated)?
+                    .min_by_key(|&(_, n)| n);
+                match with_room {
+                    Some((i, _)) => i,
+                    // Every shard is saturated: only the host starts a call, on the emptiest.
+                    None if host => open
+                        .into_iter()
+                        .min_by_key(|&(_, n)| n)
+                        .map(|(i, _)| i)
+                        .ok_or(AdmitError::NoShard)?,
+                    None => return Err(AdmitError::Saturated),
+                }
             }
         };
         st.load[shard] += 1;
@@ -306,6 +319,44 @@ mod tests {
         assert!(
             r.admit_unless(&cfg("c1", "s5"), &|_| false).is_ok(),
             "and room again"
+        );
+    }
+
+    #[test]
+    fn the_host_is_never_refused_by_a_saturated_shard() {
+        let host = |call: &str, session: &str| {
+            SessionConfig::from_join(
+                "g",
+                &rtcd_proto::JoinRequest {
+                    call_id: call.into(),
+                    user_id: "teacher".into(),
+                    session_id: session.into(),
+                    host: true,
+                    ..Default::default()
+                },
+            )
+        };
+        let r = Registry::new(2);
+        let a = r.admit(&cfg("c1", "s1")).unwrap();
+        let saturated = |slot: usize| slot == a;
+        assert_eq!(
+            r.admit_unless(&cfg("c1", "s2"), &saturated),
+            Err(AdmitError::Saturated),
+            "a student is refused"
+        );
+        assert_eq!(
+            r.admit_unless(&host("c1", "teacher"), &saturated),
+            Ok(a),
+            "the teacher of that class is not"
+        );
+        assert_eq!(
+            r.admit_unless(&cfg("c2", "s3"), &|_| true),
+            Err(AdmitError::Saturated),
+            "nobody else starts a call on a node whose shards are all saturated"
+        );
+        assert!(
+            r.admit_unless(&host("c2", "teacher2"), &|_| true).is_ok(),
+            "a teacher does, on the emptiest shard"
         );
     }
 

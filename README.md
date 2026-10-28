@@ -137,7 +137,10 @@ time left for them, so it does not recover by itself. A shard at 95 % busy for t
 saturated: its calls forward the loudest voice only, and it refuses new sessions (a call that lives
 on it cannot move, so its next participant is refused; a new call goes to a shard that is not
 saturated, and is refused when none is), so the sessions it has keep their quality. It leaves that
-state after ten seconds under 90 %. `RTCD_RTC_REFUSEWHENSATURATED=false` turns the refusal off.
+state after ten seconds under 90 %. The call's host (the join request's `host` field, which the LMS
+server sets for a class's teacher) is never refused: a teacher whose connection dropped comes back
+as a new session, and a node with no room still lets the teacher open the class.
+`RTCD_RTC_REFUSEWHENSATURATED=false` turns the refusal off.
 `GET /system` reports `shards_pressured` and `shards_saturated`.
 
 ## Using it from class-management
