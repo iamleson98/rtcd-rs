@@ -32,6 +32,9 @@ const RELEASE_BELOW: f64 = 0.65;
 const RELEASE_AFTER: Duration = Duration::from_secs(20);
 /// The rate is measured over windows of at least this long and smoothed over two of them.
 const WINDOW: Duration = Duration::from_secs(1);
+/// The gauge is updated by the sessions' upkeep, so while no session exists it is not. A gap this
+/// long between two updates was a quiet node: what it held before says nothing about now.
+const IDLE_GAP: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Default)]
 struct State {
@@ -105,8 +108,9 @@ impl Gauge {
             return;
         }
         let secs = elapsed.as_secs_f64();
+        let idle = elapsed >= IDLE_GAP;
         let smooth = |old: f64, instant: f64| {
-            if old == 0.0 {
+            if old == 0.0 || idle {
                 instant
             } else {
                 (old + instant) / 2.0
@@ -130,6 +134,11 @@ impl Gauge {
             self.kernel_drops.store(drops, Ordering::Relaxed);
         }
 
+        if idle {
+            // The quiet was the calm spell: a class that starts now does not begin held to the
+            // small layers because the last one ended squeezed.
+            st.calm_since = Some(at);
+        }
         let squeezed = decide(&mut st, now, budget_bps, budget_pps);
         self.squeezed.store(squeezed, Ordering::Relaxed);
     }
@@ -295,5 +304,24 @@ mod tests {
         run_packets(&g, &mut now, 10, 10 * MBIT, 900_000, 600, 0);
         assert!(!g.squeezed());
         assert_eq!(g.rate_pps(), 900_000);
+    }
+
+    #[test]
+    fn a_node_that_was_squeezed_and_then_idle_starts_the_next_call_released() {
+        let g = Gauge::default();
+        let mut now = Instant::now();
+        g.update(now, 300_000_000, 0);
+        run(&g, &mut now, 6, 290, 300);
+        assert!(g.squeezed());
+        // The last session leaves: nothing updates the gauge for ten minutes.
+        now += Duration::from_secs(600);
+        g.add(5 * MBIT, 100);
+        g.update(now, 300_000_000, 0);
+        assert!(!g.squeezed(), "the idle spell released it");
+        assert!(
+            g.rate_bps() < 1_000_000,
+            "the rate is the idle one, not the old {}",
+            g.rate_bps()
+        );
     }
 }
