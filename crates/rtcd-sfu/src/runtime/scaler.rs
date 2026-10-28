@@ -164,38 +164,63 @@ const PRESSURE_FOR: u32 = 2;
 /// brought it down, and giving it back at once would bring the shard straight back up.
 const PRESSURE_RELEASE: f32 = 0.7;
 const RELEASE_FOR: u32 = 30;
+/// A shard this close to all of its time working for [`SATURATED_FOR`] is dropping packets however
+/// much it sheds: the thread is the limit, and the sessions it has are all it can serve.
+const SATURATED_AT: f32 = 0.985;
+const SATURATED_FOR: u32 = 5;
+/// It leaves that state after this many seconds under [`PRESSURE_AT`].
+const SATURATED_RELEASE_FOR: u32 = 10;
 
-/// Whether one shard is asked for more than its thread can do, from the busy fraction it reports
-/// once a second. A shard past its limit drops packets for every call on it at once, and a call
-/// cannot move to another shard, so the shard has to ask less of what it carries: while this says
-/// so, its receivers are held to the small video layers and its calls forward fewer voices.
+/// How much a shard is asked for compared with what its thread can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Level {
+    /// Room to spare.
+    #[default]
+    Ok,
+    /// No room left: its receivers are held to the small video layers and its calls forward two
+    /// voices at most.
+    Shedding,
+    /// Shedding is not enough: the thread is at its limit and the shard refuses new sessions, so
+    /// the ones it has keep their quality instead of everyone losing packets.
+    Saturated,
+}
+
+/// The [`Level`] of one shard, from the busy fraction it reports once a second. A call lives on
+/// one shard and cannot move, so a shard past its limit drops packets for every call on it at
+/// once while another shard may be idle: it has to ask less of what it carries, and past that
+/// take no more.
 #[derive(Debug, Default)]
 pub(crate) struct Pressure {
+    /// Readings in a row at or over [`PRESSURE_AT`], [`SATURATED_AT`], under [`PRESSURE_AT`] and
+    /// under [`PRESSURE_RELEASE`].
     hot: u32,
+    full: u32,
+    below: u32,
     calm: u32,
-    on: bool,
+    level: Level,
 }
 
 impl Pressure {
-    /// Takes one more reading and says whether the shard is under pressure.
-    pub fn update(&mut self, busy: f32) -> bool {
-        if busy >= PRESSURE_AT {
-            self.hot += 1;
-            self.calm = 0;
-        } else if busy < PRESSURE_RELEASE {
-            self.calm += 1;
-            self.hot = 0;
+    /// Takes one more reading and returns the shard's level.
+    pub fn update(&mut self, busy: f32) -> Level {
+        let run = |count: u32, holds: bool| if holds { count + 1 } else { 0 };
+        self.hot = run(self.hot, busy >= PRESSURE_AT);
+        self.full = run(self.full, busy >= SATURATED_AT);
+        self.below = run(self.below, busy < PRESSURE_AT);
+        self.calm = run(self.calm, busy < PRESSURE_RELEASE);
+        self.level = if self.full >= SATURATED_FOR {
+            Level::Saturated
         } else {
-            // Between the marks: neither entering nor leaving.
-            self.hot = 0;
-            self.calm = 0;
-        }
-        if !self.on && self.hot >= PRESSURE_FOR {
-            self.on = true;
-        } else if self.on && self.calm >= RELEASE_FOR {
-            self.on = false;
-        }
-        self.on
+            match self.level {
+                Level::Ok if self.hot >= PRESSURE_FOR => Level::Shedding,
+                // Out of the harder level once clearly under the shedding mark for a while; it
+                // keeps shedding, since what it sheds is what holds it down.
+                Level::Saturated if self.below >= SATURATED_RELEASE_FOR => Level::Shedding,
+                Level::Shedding if self.calm >= RELEASE_FOR => Level::Ok,
+                level => level,
+            }
+        };
+        self.level
     }
 }
 
@@ -326,26 +351,56 @@ mod tests {
     }
 
     #[test]
-    fn a_shard_with_no_room_for_a_few_seconds_is_under_pressure_and_stays_so_for_a_while() {
+    fn a_shard_with_no_room_for_a_few_seconds_is_shedding_and_stays_so_for_a_while() {
         let mut p = Pressure::default();
-        assert!(!p.update(0.95), "one hot second is a burst");
-        assert!(p.update(0.95), "two are not");
+        assert_eq!(p.update(0.95), Level::Ok, "one hot second is a burst");
+        assert_eq!(p.update(0.95), Level::Shedding, "two are not");
         for _ in 0..29 {
-            assert!(p.update(0.3), "what it shed is what brought it down");
+            assert_eq!(
+                p.update(0.3),
+                Level::Shedding,
+                "what it shed is what brought it down"
+            );
         }
-        assert!(!p.update(0.3), "thirty calm seconds give it back");
+        assert_eq!(p.update(0.3), Level::Ok, "thirty calm seconds give it back");
     }
 
     #[test]
     fn a_shard_hovering_between_the_marks_neither_enters_nor_leaves() {
         let mut p = Pressure::default();
         for _ in 0..60 {
-            assert!(!p.update(0.8));
+            assert_eq!(p.update(0.8), Level::Ok);
         }
         p.update(0.95);
-        assert!(p.update(0.95));
+        assert_eq!(p.update(0.95), Level::Shedding);
         for _ in 0..60 {
-            assert!(p.update(0.8));
+            assert_eq!(p.update(0.8), Level::Shedding);
         }
+    }
+
+    #[test]
+    fn a_thread_at_its_limit_refuses_new_sessions_until_it_has_eased_for_a_while() {
+        let mut p = Pressure::default();
+        for _ in 0..4 {
+            p.update(1.0);
+        }
+        assert_eq!(p.update(1.0), Level::Saturated, "five seconds at the limit");
+        // Eases a little, still hot: not released.
+        for _ in 0..30 {
+            assert_eq!(p.update(0.93), Level::Saturated);
+        }
+        for _ in 0..9 {
+            assert_eq!(p.update(0.8), Level::Saturated);
+        }
+        assert_eq!(
+            p.update(0.8),
+            Level::Shedding,
+            "ten seconds under the shedding mark"
+        );
+        assert_eq!(
+            p.update(0.99),
+            Level::Shedding,
+            "a single reading at the limit is a burst"
+        );
     }
 }

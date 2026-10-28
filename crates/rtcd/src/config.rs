@@ -200,6 +200,12 @@ pub struct RtcConfig {
     /// its transmit ring stays full. Set it to about 80 % of what the card was measured to take.
     /// 0 (the default) sets no budget.
     pub egress_budget_pps: i64,
+    /// Whether a join is refused while the shard that would serve it is at its limit (a thread
+    /// busy for five seconds at 98.5 % or more, after shedding what it can): the participants it
+    /// has keep their quality, where letting more in makes every call on the shard lose packets.
+    /// The default is on; a refused participant is told the call could not be joined and tries
+    /// again, and a new call goes to a shard that is not at its limit when there is one.
+    pub refuse_when_saturated: bool,
     /// Seconds to let running sessions end on shutdown before ending them; 0 waits for them
     /// without limit, as the Go service does (a second signal ends them at once).
     pub drain_timeout_seconds: i64,
@@ -285,6 +291,7 @@ impl Default for RtcConfig {
             audio_loudest: 3,
             egress_budget_mbps: 0,
             egress_budget_pps: 0,
+            refuse_when_saturated: true,
             drain_timeout_seconds: 0,
         }
     }
@@ -413,6 +420,7 @@ impl Config {
         integer!("RTC_AUDIOLOUDEST", self.rtc.audio_loudest);
         integer!("RTC_EGRESSBUDGETMBPS", self.rtc.egress_budget_mbps);
         integer!("RTC_EGRESSBUDGETPPS", self.rtc.egress_budget_pps);
+        boolean!("RTC_REFUSEWHENSATURATED", self.rtc.refuse_when_saturated);
         integer!("RTC_DRAINTIMEOUTSECONDS", self.rtc.drain_timeout_seconds);
         text!("STORE_DATASOURCE", self.store.data_source);
         boolean!("LOGGER_ENABLECONSOLE", self.logger.enable_console);
@@ -685,6 +693,10 @@ mod tests {
             c.rtc.audio_loudest, 3,
             "the three loudest voices of a call are forwarded unless asked otherwise"
         );
+        assert!(
+            c.rtc.refuse_when_saturated,
+            "a saturated shard refuses joins unless told not to"
+        );
         assert_eq!(c.store.data_source, "/tmp/rtcd_db");
         assert_eq!(c.api.security.session_cache.expiration_minutes, 1440);
         c.validate().unwrap();
@@ -781,6 +793,7 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
             ("RTCD_RTC_AUDIOLOUDEST", "5"),
             ("RTCD_RTC_EGRESSBUDGETMBPS", "250"),
             ("RTCD_RTC_EGRESSBUDGETPPS", "120000"),
+            ("RTCD_RTC_REFUSEWHENSATURATED", "false"),
             ("RTCD_STORE_DATASOURCE", "/data/db"),
             ("RTCD_LOGGER_ENABLEFILE", "false"),
             ("RTCD_LOGGER_CONSOLEJSON", "1"),
@@ -794,6 +807,7 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
         assert_eq!(c.rtc.audio_loudest, 5);
         assert_eq!(c.rtc.egress_budget_mbps, 250);
         assert_eq!(c.rtc.egress_budget_pps, 120_000);
+        assert!(!c.rtc.refuse_when_saturated);
         assert_eq!(c.store.data_source, "/data/db");
         assert!(!c.logger.enable_file);
         assert!(c.logger.console_json);

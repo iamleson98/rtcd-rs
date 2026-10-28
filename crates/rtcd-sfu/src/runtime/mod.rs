@@ -381,7 +381,13 @@ impl Sfu {
     pub fn join(&self, cfg: SessionConfig) -> Result<(), JoinError> {
         cfg.validate().map_err(JoinError::Invalid)?;
         self.core.make_room(&cfg);
-        let shard = self.core.registry.admit(&cfg)?;
+        let shard = if self.core.cfg.refuse_when_saturated {
+            self.core
+                .registry
+                .admit_unless(&cfg, &|slot| self.core.table.saturated(slot))?
+        } else {
+            self.core.registry.admit(&cfg)?
+        };
         let session_id = cfg.session_id.clone();
         let sent = match self.core.table.get(shard) {
             Some(handle) => handle.send(ShardCommand::Engine(Command::Join(cfg))),
@@ -471,6 +477,11 @@ impl Sfu {
     /// How many of them have no room left and are shedding load.
     pub fn shards_pressured(&self) -> usize {
         self.core.table.pressured()
+    }
+
+    /// How many of those are at their limit and refuse new sessions.
+    pub fn shards_saturated(&self) -> usize {
+        self.core.table.saturated_count()
     }
 
     /// Starts one more shard, if the configuration leaves room for it. The SFU does this itself

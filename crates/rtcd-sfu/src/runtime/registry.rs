@@ -15,6 +15,8 @@ pub enum AdmitError {
     ShuttingDown,
     #[error("no shard is running to serve the session")]
     NoShard,
+    #[error("every shard that could serve the session is at its limit")]
+    Saturated,
 }
 
 #[derive(Debug)]
@@ -87,6 +89,18 @@ impl Registry {
     /// Records a new session and returns the shard to serve it: the one its call lives on, else
     /// the running one with the fewest sessions.
     pub fn admit(&self, cfg: &SessionConfig) -> Result<usize, AdmitError> {
+        self.admit_unless(cfg, &|_| false)
+    }
+
+    /// Like [`admit`](Self::admit), but refuses a session whose shard is `saturated` (the one its
+    /// call lives on, or for a new call every shard that takes new sessions): a shard at its
+    /// limit loses packets for every call on it, and the sessions it has are all it can serve. A
+    /// new call goes to the emptiest shard that is not saturated.
+    pub fn admit_unless(
+        &self,
+        cfg: &SessionConfig,
+        saturated: &dyn Fn(usize) -> bool,
+    ) -> Result<usize, AdmitError> {
         let mut st = self.lock();
         if st.closing {
             return Err(AdmitError::ShuttingDown);
@@ -96,14 +110,23 @@ impl Registry {
         }
         let call = (cfg.group_id.clone(), cfg.call_id.clone());
         let shard = match st.calls.get(&call) {
+            Some((shard, _)) if saturated(*shard) => return Err(AdmitError::Saturated),
             Some((shard, _)) => *shard,
-            None => Self::weights(&st)
-                .into_iter()
-                .enumerate()
-                .filter(|&(i, _)| st.active[i])
-                .min_by_key(|&(_, n)| n)
-                .map(|(i, _)| i)
-                .ok_or(AdmitError::NoShard)?,
+            None => {
+                let open: Vec<(usize, usize)> = Self::weights(&st)
+                    .into_iter()
+                    .enumerate()
+                    .filter(|&(i, _)| st.active[i])
+                    .collect();
+                if open.is_empty() {
+                    return Err(AdmitError::NoShard);
+                }
+                open.into_iter()
+                    .filter(|&(i, _)| !saturated(i))
+                    .min_by_key(|&(_, n)| n)
+                    .map(|(i, _)| i)
+                    .ok_or(AdmitError::Saturated)?
+            }
         };
         st.load[shard] += 1;
         st.calls
@@ -260,6 +283,30 @@ mod tests {
             session_id: session.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_saturated_shard_refuses_new_sessions_and_new_calls_go_to_a_shard_with_room() {
+        let r = Registry::new(2);
+        let a = r.admit(&cfg("c1", "s1")).unwrap();
+        let saturated = |slot: usize| slot == a;
+        assert_eq!(
+            r.admit_unless(&cfg("c1", "s2"), &saturated),
+            Err(AdmitError::Saturated),
+            "a call cannot move: its next participant is refused"
+        );
+        let b = r.admit_unless(&cfg("c2", "s3"), &saturated).unwrap();
+        assert_ne!(a, b, "a new call goes where there is room");
+        assert_eq!(r.len(), 2, "nothing is recorded for the refused one");
+        assert_eq!(
+            r.admit_unless(&cfg("c3", "s4"), &|_| true),
+            Err(AdmitError::Saturated),
+            "every shard is at its limit"
+        );
+        assert!(
+            r.admit_unless(&cfg("c1", "s5"), &|_| false).is_ok(),
+            "and room again"
+        );
     }
 
     #[test]

@@ -102,6 +102,7 @@ pub fn sfu_config(cfg: &Config, addresses: Vec<LocalAddress>) -> SfuConfig {
         engine,
         shards,
         max_shards,
+        refuse_when_saturated: rtc.refuse_when_saturated,
         ..Default::default()
     }
 }
