@@ -389,12 +389,12 @@ impl Engine {
         }
     }
 
-    /// Whether a session has video to look after once a second.
+    /// Whether a session has media to look after once a second: video (its layers, keyframes,
+    /// quality) or voice (how many voices its call forwards while the node sheds load).
     pub(super) fn needs_tick(&self, key: SessionKey) -> bool {
-        self.sessions.get(key).is_some_and(|s| {
-            s.up.sources.iter().any(|x| x.ty.is_video())
-                || s.down.iter().any(|(_, d)| d.ty.is_video())
-        })
+        self.sessions
+            .get(key)
+            .is_some_and(|s| !s.up.sources.is_empty() || s.down.iter().next().is_some())
     }
 
     /// The interval of the upkeep.

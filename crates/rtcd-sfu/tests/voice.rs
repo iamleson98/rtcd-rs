@@ -508,3 +508,54 @@ fn a_voice_that_returns_after_being_left_out_carries_on_without_a_gap() {
         assert!(gaps.is_empty(), "{name}'s sequence jumped: {gaps:?}");
     }
 }
+
+#[test]
+fn a_shard_with_no_room_left_forwards_two_voices_at_most_and_gives_them_back() {
+    let mut w = World::with_config(EngineConfig {
+        audio_loudest: 0,
+        ..engine_config()
+    });
+    let speakers: Vec<usize> = (0..4).map(|i| w.join(&format!("s{i}"), "call1")).collect();
+    let listener = w.join("listener", "call1");
+    wait_tracks(&mut w, listener, 0);
+    let levels = [25u8, 30, 90, 100];
+    let talk_for = |w: &mut World, frames: usize| {
+        for _ in 0..frames {
+            for (&i, &level) in speakers.iter().zip(&levels) {
+                w.send_audio(i, level);
+            }
+            w.run_for(Duration::from_millis(20));
+        }
+    };
+    let heard =
+        |w: &World, i: usize| w.browsers[listener].received_on(&format!("voice_session-s{i}"));
+
+    // With room to spare nobody is left out.
+    talk_for(&mut w, 100);
+    assert!((0..4).all(|i| heard(&w, i) > 60), "everyone is heard");
+
+    // Once the shard is under pressure (the upkeep runs once a second) the quiet voices stop.
+    w.engine.set_overloaded(true);
+    w.run_for(Duration::from_secs(2));
+    let before: Vec<usize> = (0..4).map(|i| heard(&w, i)).collect();
+    talk_for(&mut w, 150);
+    let gained: Vec<usize> = (0..4).map(|i| heard(&w, i) - before[i]).collect();
+    assert!(
+        gained[0] > 100 && gained[1] > 100,
+        "the two loudest go on: {gained:?}"
+    );
+    assert!(
+        gained[2] < 30 && gained[3] < 30,
+        "the others are left out: {gained:?}"
+    );
+
+    // And come back when it has room again.
+    w.engine.set_overloaded(false);
+    w.run_for(Duration::from_secs(2));
+    let before: Vec<usize> = (0..4).map(|i| heard(&w, i)).collect();
+    talk_for(&mut w, 100);
+    assert!(
+        (0..4).all(|i| heard(&w, i) - before[i] > 60),
+        "everyone is heard again"
+    );
+}

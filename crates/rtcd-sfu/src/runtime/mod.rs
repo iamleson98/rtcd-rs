@@ -468,6 +468,11 @@ impl Sfu {
         self.core.table.len()
     }
 
+    /// How many of them have no room left and are shedding load.
+    pub fn shards_pressured(&self) -> usize {
+        self.core.table.pressured()
+    }
+
     /// Starts one more shard, if the configuration leaves room for it. The SFU does this itself
     /// when the shards are busy; it is public for operators and tests.
     pub fn add_shard(&self) -> io::Result<usize> {

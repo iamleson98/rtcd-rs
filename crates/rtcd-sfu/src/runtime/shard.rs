@@ -39,6 +39,8 @@ const SWEEP_EVERY: Duration = Duration::from_secs(1);
 const BUSY_WINDOW: Duration = Duration::from_secs(1);
 /// The busy fraction is published in parts per thousand.
 const BUSY_SCALE: f32 = 1000.0;
+/// Set in the published value while the shard is under pressure (see `Pressure`).
+const PRESSURE_FLAG: u32 = 1 << 31;
 
 /// A datagram another shard read and found to be this one's.
 #[derive(Debug)]
@@ -96,7 +98,13 @@ impl ShardHandle {
 
     /// How busy the shard has been lately, 0 to 1.
     pub fn busy(&self) -> f32 {
-        self.busy.load(Ordering::Relaxed) as f32 / BUSY_SCALE
+        (self.busy.load(Ordering::Relaxed) & !PRESSURE_FLAG) as f32 / BUSY_SCALE
+    }
+
+    /// Whether the shard has no room left and is shedding load: its receivers are held to the
+    /// small video layers and its calls forward fewer voices.
+    pub fn pressured(&self) -> bool {
+        self.busy.load(Ordering::Relaxed) & PRESSURE_FLAG != 0
     }
 
     /// Queues a command and wakes the shard; fails if its queue is full or it has stopped.
@@ -307,10 +315,11 @@ impl Shard {
         let window = done.saturating_duration_since(self.window_start);
         if window >= BUSY_WINDOW {
             let fraction = (self.worked.as_secs_f32() / window.as_secs_f32()).clamp(0.0, 1.0);
-            self.busy
-                .store((fraction * BUSY_SCALE) as u32, Ordering::Relaxed);
             let pressed = self.pressure.update(fraction);
             self.engine.set_overloaded(pressed);
+            let flag = if pressed { PRESSURE_FLAG } else { 0 };
+            self.busy
+                .store((fraction * BUSY_SCALE) as u32 | flag, Ordering::Relaxed);
             self.worked = Duration::ZERO;
             self.window_start = done;
         }

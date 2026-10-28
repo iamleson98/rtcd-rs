@@ -334,6 +334,8 @@ async fn system(State(svc): State<Arc<Service>>, method: axum::http::Method) -> 
         sessions: usize,
         /// Threads serving them.
         shards: usize,
+        /// Of those, the ones with no room left, shedding load (small video layers, fewer voices).
+        shards_pressured: usize,
         /// What the instance sends now, in bits per second.
         egress_bps: u64,
         /// What the instance sends now, in packets per second.
@@ -347,6 +349,7 @@ async fn system(State(svc): State<Arc<Service>>, method: axum::http::Method) -> 
         cpu_load: svc.system.info().cpu_load,
         sessions: svc.sfu.session_count(),
         shards: svc.sfu.shard_count(),
+        shards_pressured: svc.sfu.shards_pressured(),
         egress_bps: svc.sfu.egress_bps(),
         egress_pps: svc.sfu.egress_pps(),
         kernel_send_drops: svc.sfu.kernel_send_drops(),

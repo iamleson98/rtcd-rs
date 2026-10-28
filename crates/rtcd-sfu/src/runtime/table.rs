@@ -35,6 +35,15 @@ impl ShardTable {
         self.read().get(slot).cloned().flatten()
     }
 
+    /// How many running shards have no room left and are shedding load.
+    pub fn pressured(&self) -> usize {
+        self.read()
+            .iter()
+            .flatten()
+            .filter(|h| h.pressured())
+            .count()
+    }
+
     /// How many shards are running.
     pub fn len(&self) -> usize {
         self.read().iter().flatten().count()
