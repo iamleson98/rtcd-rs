@@ -84,6 +84,7 @@ pub fn sfu_config(cfg: &Config, addresses: Vec<LocalAddress>) -> SfuConfig {
     }
     engine.audio_loudest = rtc.audio_loudest.clamp(0, 64) as usize;
     engine.egress_budget_bps = rtc.egress_budget_mbps.clamp(0, 100_000) as u64 * 1_000_000;
+    engine.egress_budget_pps = rtc.egress_budget_pps.clamp(0, 100_000_000) as u64;
     // A shard is a thread, a call lives on one, and one carries a few hundred participants before it
     // saturates (measured: a single shard dropped 3 % of the voice packets at 600 participants on
     // four cores, and lost two thirds at 900, where two shards lost 7 %). Another is not free

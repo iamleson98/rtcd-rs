@@ -615,7 +615,9 @@ impl Engine {
                 }
             }
             // What the node's budget counts is on the wire: the IP and UDP headers add 28 bytes.
-            self.cfg.egress.add(sent.iter().sum::<u64>() + writes * 28);
+            self.cfg
+                .egress
+                .add(sent.iter().sum::<u64>() + writes * 28, writes);
             for sub in switched {
                 self.complete_switch(sk, sub);
             }

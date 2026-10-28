@@ -74,6 +74,8 @@ pub(crate) struct CallId {
 pub struct Engine {
     /// Counts packet writes, to time one in a few.
     write_clock: u32,
+    /// Whether the shard this engine runs on has no room left (see `runtime::scaler::Pressure`).
+    overloaded: bool,
     cfg: Arc<EngineConfig>,
     metrics: Arc<dyn Metrics>,
     rng: Rng,
@@ -101,9 +103,16 @@ impl std::fmt::Debug for Engine {
 }
 
 impl Engine {
+    /// Tells the engine whether its shard has no room left: while it has not, its receivers are
+    /// held to the small video layers and its calls forward fewer voices.
+    pub fn set_overloaded(&mut self, overloaded: bool) {
+        self.overloaded = overloaded;
+    }
+
     pub fn new(cfg: Arc<EngineConfig>, metrics: Arc<dyn Metrics>, rng: Rng) -> Self {
         Self {
             write_clock: 0,
+            overloaded: false,
             cfg,
             metrics,
             rng,

@@ -185,13 +185,21 @@ pub struct RtcConfig {
     pub shards: i64,
     /// How many voices of a call are forwarded once more microphones than that are open: the
     /// loudest ones, as Meet and Jitsi do. A listener follows two or three speakers, and every open
-    /// microphone is a stream to every listener. 0 (the default) forwards all of them.
+    /// microphone is a stream to every listener: thirteen open microphones in a class of 130 are
+    /// 1,700 packets every 20 ms, of which each listener can use three. The default is three; 0
+    /// forwards all of them.
     pub audio_loudest: i64,
     /// The most this node should send, in megabits per second. Near it every receiver's cameras
     /// and screen shares fall back to their small layer, so the node slows down evenly instead of
     /// losing packets for everyone. 0 (the default) sets no budget; the rate is reported on
     /// `GET /system` either way.
     pub egress_budget_mbps: i64,
+    /// The most this node should send, in packets per second: the same fall back for the other
+    /// ceiling. A virtual network card takes a limited number of packets however small they are,
+    /// and voice packets are small: the OVH video VPS sends 150 to 200 thousand a second and then
+    /// its transmit ring stays full. Set it to about 80 % of what the card was measured to take.
+    /// 0 (the default) sets no budget.
+    pub egress_budget_pps: i64,
     /// Seconds to let running sessions end on shutdown before ending them; 0 waits for them
     /// without limit, as the Go service does (a second signal ends them at once).
     pub drain_timeout_seconds: i64,
@@ -274,8 +282,9 @@ impl Default for RtcConfig {
             nack_buffer_size: 256,
             nack_disable_copy: true,
             shards: 0,
-            audio_loudest: 0,
+            audio_loudest: 3,
             egress_budget_mbps: 0,
+            egress_budget_pps: 0,
             drain_timeout_seconds: 0,
         }
     }
@@ -403,6 +412,7 @@ impl Config {
         integer!("RTC_SHARDS", self.rtc.shards);
         integer!("RTC_AUDIOLOUDEST", self.rtc.audio_loudest);
         integer!("RTC_EGRESSBUDGETMBPS", self.rtc.egress_budget_mbps);
+        integer!("RTC_EGRESSBUDGETPPS", self.rtc.egress_budget_pps);
         integer!("RTC_DRAINTIMEOUTSECONDS", self.rtc.drain_timeout_seconds);
         text!("STORE_DATASOURCE", self.store.data_source);
         boolean!("LOGGER_ENABLECONSOLE", self.logger.enable_console);
@@ -506,6 +516,12 @@ impl Config {
         }
         if !(0..=100_000).contains(&rtc.egress_budget_mbps) {
             return Err(invalid("EgressBudgetMbps", "must be between 0 and 100000"));
+        }
+        if !(0..=100_000_000).contains(&rtc.egress_budget_pps) {
+            return Err(invalid(
+                "EgressBudgetPps",
+                "must be between 0 and 100000000",
+            ));
         }
         if !(0..=64).contains(&rtc.audio_loudest) {
             return Err(invalid("AudioLoudest", "must be between 0 and 64"));
@@ -666,8 +682,8 @@ mod tests {
         assert_eq!((c.rtc.ice_port_udp, c.rtc.ice_port_tcp), (8443, 8443));
         assert_eq!(c.rtc.nack_buffer_size, 256);
         assert_eq!(
-            c.rtc.audio_loudest, 0,
-            "every voice is forwarded unless asked otherwise"
+            c.rtc.audio_loudest, 3,
+            "the three loudest voices of a call are forwarded unless asked otherwise"
         );
         assert_eq!(c.store.data_source, "/tmp/rtcd_db");
         assert_eq!(c.api.security.session_cache.expiration_minutes, 1440);
@@ -764,6 +780,7 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
             ("RTCD_RTC_ICEPORTUDP", "30000"),
             ("RTCD_RTC_AUDIOLOUDEST", "5"),
             ("RTCD_RTC_EGRESSBUDGETMBPS", "250"),
+            ("RTCD_RTC_EGRESSBUDGETPPS", "120000"),
             ("RTCD_STORE_DATASOURCE", "/data/db"),
             ("RTCD_LOGGER_ENABLEFILE", "false"),
             ("RTCD_LOGGER_CONSOLEJSON", "1"),
@@ -776,6 +793,7 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
         assert_eq!(c.rtc.ice_port_udp, 30000);
         assert_eq!(c.rtc.audio_loudest, 5);
         assert_eq!(c.rtc.egress_budget_mbps, 250);
+        assert_eq!(c.rtc.egress_budget_pps, 120_000);
         assert_eq!(c.store.data_source, "/data/db");
         assert!(!c.logger.enable_file);
         assert!(c.logger.console_json);
@@ -829,6 +847,7 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
         assert!(bad(&|c| c.rtc.audio_loudest = -1).contains("between 0 and 64"));
         assert!(bad(&|c| c.rtc.audio_loudest = 65).contains("between 0 and 64"));
         assert!(bad(&|c| c.rtc.egress_budget_mbps = -1).contains("between 0 and 100000"));
+        assert!(bad(&|c| c.rtc.egress_budget_pps = -1).contains("between 0 and 100000000"));
         assert!(
             bad(&|c| c.rtc.ice_servers = vec![IceServer {
                 urls: vec!["http://x".into()],

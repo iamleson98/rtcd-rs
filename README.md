@@ -84,7 +84,11 @@ forwards only the `N` loudest, the rule Meet (three loudest, on three fixed stre
 smoothed so that a speaker is heard from the first syllables and a pause does not give the slot
 away, and a source that holds a slot keeps it until another is clearly louder (`src/loudest.rs`).
 A call with no more open microphones than `N` is untouched, a sender that reports no level is
-always forwarded, and 0 (the default) forwards everything as before. Packets of a voice that is
+always forwarded, and 0 forwards everything. The default is 3, because without a limit the cost
+grows with the square of the class: on the OVH video VPS three lectures of 126 to 182 people with a
+tenth of the students unmuted (13 open microphones each) made the node send 226 to 268 thousand
+packets a second (`rtcd_net_packets_total`), 140 Mbit/s of it voice; the shard threads were at
+100 % and everyone lost packets from about 180 participants on. Packets of a voice that is
 not forwarded are dropped before any receiver is written to, so nothing is renegotiated and the
 people's voice indicators (`voice_on`/`voice_off`) do not change.
 
@@ -96,9 +100,33 @@ everyone past about 320 Mbit/s). With `RTCD_RTC_EGRESSBUDGETMBPS=N` (`rtc.egress
 shards add what they send to one gauge, and when its smoothed rate reaches 85 % of `N` every
 receiver's cameras and screen shares fall back to their small layer (no renegotiation, the same
 switch a receiver's own request makes); they go back up only after the rate has stayed under 65 %
-for twenty seconds, so the drop itself does not release it. Voice is never touched. 0 (the
-default) sets no budget. `GET /system` reports `egress_bps` and `egress_squeezed` either way, for
-whatever places new calls (`src/egress.rs`).
+for twenty seconds, so the drop itself does not release it. 0 (the default) sets no budget.
+`GET /system` reports `egress_bps` and `egress_squeezed` either way, for whatever places new calls
+(`src/egress.rs`).
+
+The card has a second ceiling, in packets: `RTCD_RTC_EGRESSBUDGETPPS=N` (`rtc.egress_budget_pps`)
+is the same rule for packets per second, and either budget squeezes. Voice packets are about 100
+bytes, so a call with many open microphones reaches the packet ceiling at a fraction of the bit
+rate: the OVH video VPS sent 160 thousand 140-byte packets a second without loss and 200 thousand
+with 0.1 % loss (a plain UDP test), but under the lecture load above, with 120 to 157 thousand
+packets a second leaving at 250 to 520 Mbit/s, its transmit ring stayed full and the kernel refused
+280 to 570 thousand datagrams every five seconds. Set it to about 80 % of what the card was
+measured to take.
+While the node is squeezed, a call also forwards at most two voices (see above), so the load that
+brought the node to its ceiling is cut where it is largest.
+
+The kernel does not tell the sender: a datagram the transmit queue refuses is counted
+(`UdpSndbufErrors`) and `sendmmsg` still succeeds, so the node counted those packets as sent.
+`GET /system` therefore reports `kernel_send_drops` (that counter since the start) and `egress_pps`;
+a node whose `kernel_send_drops` grows is sending more than its card takes.
+
+## Large calls: a shard with no room
+
+A call lives on one shard and cannot move, so a shard whose thread has no time left drops packets
+for every call on it while another shard may be idle. A shard that has been at least 90 % busy for
+two seconds is under pressure: its receivers are held to the small layers and its calls forward two
+voices at most, the same fall back as the send budget, but local to the shard. It is released after
+thirty seconds under 70 % (`src/runtime/scaler.rs`, `Pressure`).
 
 ## Using it from class-management
 

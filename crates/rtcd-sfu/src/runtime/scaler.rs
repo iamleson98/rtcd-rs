@@ -157,6 +157,48 @@ impl Scaler {
     }
 }
 
+/// A shard at this fraction of its time working for [`PRESSURE_FOR`] has no room left.
+const PRESSURE_AT: f32 = 0.9;
+const PRESSURE_FOR: u32 = 2;
+/// And has room again below this fraction for [`RELEASE_FOR`]: long, because what it shed is what
+/// brought it down, and giving it back at once would bring the shard straight back up.
+const PRESSURE_RELEASE: f32 = 0.7;
+const RELEASE_FOR: u32 = 30;
+
+/// Whether one shard is asked for more than its thread can do, from the busy fraction it reports
+/// once a second. A shard past its limit drops packets for every call on it at once, and a call
+/// cannot move to another shard, so the shard has to ask less of what it carries: while this says
+/// so, its receivers are held to the small video layers and its calls forward fewer voices.
+#[derive(Debug, Default)]
+pub(crate) struct Pressure {
+    hot: u32,
+    calm: u32,
+    on: bool,
+}
+
+impl Pressure {
+    /// Takes one more reading and says whether the shard is under pressure.
+    pub fn update(&mut self, busy: f32) -> bool {
+        if busy >= PRESSURE_AT {
+            self.hot += 1;
+            self.calm = 0;
+        } else if busy < PRESSURE_RELEASE {
+            self.calm += 1;
+            self.hot = 0;
+        } else {
+            // Between the marks: neither entering nor leaving.
+            self.hot = 0;
+            self.calm = 0;
+        }
+        if !self.on && self.hot >= PRESSURE_FOR {
+            self.on = true;
+        } else if self.on && self.calm >= RELEASE_FOR {
+            self.on = false;
+        }
+        self.on
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +323,29 @@ mod tests {
         let shards = [load(0, 0.9, 300), load(1, 0.0, 0)];
         s.step(t, &shards, 3);
         assert_eq!(s.step(t + EMPTY_FOR * 2, &shards, 3), Step::Hold);
+    }
+
+    #[test]
+    fn a_shard_with_no_room_for_a_few_seconds_is_under_pressure_and_stays_so_for_a_while() {
+        let mut p = Pressure::default();
+        assert!(!p.update(0.95), "one hot second is a burst");
+        assert!(p.update(0.95), "two are not");
+        for _ in 0..29 {
+            assert!(p.update(0.3), "what it shed is what brought it down");
+        }
+        assert!(!p.update(0.3), "thirty calm seconds give it back");
+    }
+
+    #[test]
+    fn a_shard_hovering_between_the_marks_neither_enters_nor_leaves() {
+        let mut p = Pressure::default();
+        for _ in 0..60 {
+            assert!(!p.update(0.8));
+        }
+        p.update(0.95);
+        assert!(p.update(0.95));
+        for _ in 0..60 {
+            assert!(p.update(0.8));
+        }
     }
 }

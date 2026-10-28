@@ -447,7 +447,18 @@ impl Sfu {
         self.core.cfg.engine.egress.rate_bps()
     }
 
-    /// Whether receivers are held to the small video layers because the send budget is reached.
+    /// What the node sends now, in packets per second.
+    pub fn egress_pps(&self) -> u64 {
+        self.core.cfg.engine.egress.rate_pps()
+    }
+
+    /// Datagrams the kernel refused to queue since the node started: what was handed to the
+    /// socket and never left, which UDP reports to nobody else.
+    pub fn kernel_send_drops(&self) -> u64 {
+        self.core.cfg.engine.egress.kernel_send_drops()
+    }
+
+    /// Whether receivers are held to the small video layers because a send budget is reached.
     pub fn egress_squeezed(&self) -> bool {
         self.core.cfg.engine.egress.squeezed()
     }

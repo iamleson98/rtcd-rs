@@ -76,6 +76,10 @@ pub struct EngineConfig {
     /// cameras and screen shares fall back to their small layer instead of the node losing packets
     /// for everyone. 0 sets no budget.
     pub egress_budget_bps: u64,
+    /// The most packets per second this node should send. The same fall back as the byte budget,
+    /// for the other ceiling: a virtual network card takes a limited number of packets however
+    /// small, and voice is small. 0 sets no budget.
+    pub egress_budget_pps: u64,
     /// What the node's shards have sent, shared by all of them.
     pub egress: Arc<crate::egress::Gauge>,
     /// How many sessions one shard serves at most; joins beyond are refused.
@@ -100,6 +104,7 @@ impl Default for EngineConfig {
             pacing: false,
             audio_loudest: 0,
             egress_budget_bps: 0,
+            egress_budget_pps: 0,
             egress: Arc::default(),
             max_sessions: 10_000,
         }

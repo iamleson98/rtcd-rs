@@ -8,8 +8,17 @@
 //! reaches a share of the configured budget every receiver's cameras and screen shares fall back
 //! to their small layer, until the rate has stayed well under the budget for a while.
 //!
+//! There are two budgets because there are two ceilings. A virtual machine's network card takes a
+//! number of bits per second and also a number of packets per second, and the second one is the
+//! one voice meets first: an Opus packet is 100 bytes, so a call with many open microphones asks
+//! for far more packets than bits (measured on the OVH video node: 150 to 200 thousand small
+//! packets a second were sent without loss, and at 270 thousand the card's transmit ring stayed
+//! full and the kernel dropped what it could not queue, at 400 Mbit/s, half what the same card
+//! sends in large packets). Either budget squeezes.
+//!
 //! The rate is also what a placement decision wants to know, so it is readable whether or not a
-//! budget is set.
+//! budget is set. The kernel's own count of datagrams it refused to queue is kept too: UDP
+//! reports those to nobody, so without it a node that drops half its packets sees none of them.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,7 +37,9 @@ const WINDOW: Duration = Duration::from_secs(1);
 struct State {
     at: Option<Instant>,
     bytes: u64,
+    packets: u64,
     rate_bps: f64,
+    rate_pps: f64,
     squeezed: bool,
     calm_since: Option<Instant>,
 }
@@ -37,16 +48,21 @@ struct State {
 #[derive(Debug, Default)]
 pub struct Gauge {
     bytes: AtomicU64,
+    packets: AtomicU64,
     state: Mutex<State>,
-    /// The smoothed rate in bits per second, for readers that do not take the lock.
+    /// The smoothed rates, for readers that do not take the lock.
     rate: AtomicU64,
+    rate_packets: AtomicU64,
     squeezed: AtomicBool,
+    /// Datagrams the kernel refused to queue since the node started (UDP `SndbufErrors`).
+    kernel_drops: AtomicU64,
 }
 
 impl Gauge {
-    /// Counts bytes put on the wire (headers included).
-    pub fn add(&self, bytes: u64) {
+    /// Counts what was put on the wire: `bytes` (headers included) in `packets` datagrams.
+    pub fn add(&self, bytes: u64, packets: u64) {
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.packets.fetch_add(packets, Ordering::Relaxed);
     }
 
     /// The smoothed send rate in bits per second.
@@ -54,50 +70,105 @@ impl Gauge {
         self.rate.load(Ordering::Relaxed)
     }
 
+    /// The smoothed send rate in packets per second.
+    pub fn rate_pps(&self) -> u64 {
+        self.rate_packets.load(Ordering::Relaxed)
+    }
+
+    /// How many datagrams the kernel has refused to queue since the node started: what was handed
+    /// to the socket and never left (0 where the system does not say).
+    pub fn kernel_send_drops(&self) -> u64 {
+        self.kernel_drops.load(Ordering::Relaxed)
+    }
+
     /// Whether receivers are being held to the small layers.
     pub fn squeezed(&self) -> bool {
         self.squeezed.load(Ordering::Relaxed)
     }
 
-    /// Recomputes the rate and the decision; cheap to call often, it works at most once a window.
-    /// A `budget_bps` of 0 only measures.
-    pub fn update(&self, now: Instant, budget_bps: u64) {
+    /// Recomputes the rates and the decision; cheap to call often, it works at most once a window.
+    /// A budget of 0 is not enforced: with both at 0 the gauge only measures.
+    pub fn update(&self, now: Instant, budget_bps: u64, budget_pps: u64) {
         let Ok(mut st) = self.state.try_lock() else {
             return;
         };
         let total = self.bytes.load(Ordering::Relaxed);
+        let packets = self.packets.load(Ordering::Relaxed);
         let Some(at) = st.at else {
             st.at = Some(now);
             st.bytes = total;
+            st.packets = packets;
             return;
         };
         let elapsed = now.saturating_duration_since(at);
         if elapsed < WINDOW {
             return;
         }
-        let instant = total.saturating_sub(st.bytes) as f64 * 8.0 / elapsed.as_secs_f64();
-        st.rate_bps = if st.rate_bps == 0.0 {
-            instant
-        } else {
-            (st.rate_bps + instant) / 2.0
+        let secs = elapsed.as_secs_f64();
+        let smooth = |old: f64, instant: f64| {
+            if old == 0.0 {
+                instant
+            } else {
+                (old + instant) / 2.0
+            }
         };
+        st.rate_bps = smooth(
+            st.rate_bps,
+            total.saturating_sub(st.bytes) as f64 * 8.0 / secs,
+        );
+        st.rate_pps = smooth(
+            st.rate_pps,
+            packets.saturating_sub(st.packets) as f64 / secs,
+        );
         st.at = Some(now);
         st.bytes = total;
+        st.packets = packets;
         self.rate.store(st.rate_bps as u64, Ordering::Relaxed);
+        self.rate_packets
+            .store(st.rate_pps as u64, Ordering::Relaxed);
+        if let Some(drops) = udp_send_errors() {
+            self.kernel_drops.store(drops, Ordering::Relaxed);
+        }
 
-        let squeezed = decide(&mut st, now, budget_bps);
+        let squeezed = decide(&mut st, now, budget_bps, budget_pps);
         self.squeezed.store(squeezed, Ordering::Relaxed);
     }
 }
 
-/// The policy on its own: squeezed from the budget share it reaches, released after a calm spell.
-fn decide(st: &mut State, now: Instant, budget_bps: u64) -> bool {
-    if budget_bps == 0 {
+/// The kernel's count of UDP datagrams it could not queue for sending (`SndbufErrors` in
+/// `/proc/net/snmp`), where the system has one.
+fn udp_send_errors() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let snmp = std::fs::read_to_string("/proc/net/snmp").ok()?;
+        let mut lines = snmp.lines().filter(|l| l.starts_with("Udp:"));
+        let names = lines.next()?;
+        let values = lines.next()?;
+        let at = names.split_whitespace().position(|n| n == "SndbufErrors")?;
+        values.split_whitespace().nth(at)?.parse().ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// The policy on its own: squeezed from the share of a budget it reaches, released after a calm
+/// spell. The share is that of whichever budget is nearer its limit.
+fn decide(st: &mut State, now: Instant, budget_bps: u64, budget_pps: u64) -> bool {
+    if budget_bps == 0 && budget_pps == 0 {
         st.squeezed = false;
         st.calm_since = None;
         return false;
     }
-    let share = st.rate_bps / budget_bps as f64;
+    let share_of = |rate: f64, budget: u64| {
+        if budget == 0 {
+            0.0
+        } else {
+            rate / budget as f64
+        }
+    };
+    let share = share_of(st.rate_bps, budget_bps).max(share_of(st.rate_pps, budget_pps));
     if share >= SQUEEZE_AT {
         st.squeezed = true;
         st.calm_since = None;
@@ -121,12 +192,33 @@ mod tests {
 
     const MBIT: u64 = 125_000;
 
-    /// Runs the gauge for `secs` seconds at `mbps`, one update per second.
+    /// Runs the gauge for `secs` seconds at `mbps`, one update per second, with 1,200-byte packets.
     fn run(g: &Gauge, now: &mut Instant, secs: u64, mbps: u64, budget_mbps: u64) {
+        run_packets(
+            g,
+            now,
+            secs,
+            mbps * MBIT,
+            (mbps * MBIT).div_ceil(1_200),
+            budget_mbps,
+            0,
+        );
+    }
+
+    /// Runs the gauge for `secs` seconds, sending `bytes` in `packets` each second.
+    fn run_packets(
+        g: &Gauge,
+        now: &mut Instant,
+        secs: u64,
+        bytes: u64,
+        packets: u64,
+        budget_mbps: u64,
+        budget_pps: u64,
+    ) {
         for _ in 0..secs {
-            g.add(mbps * MBIT);
+            g.add(bytes, packets);
             *now += Duration::from_secs(1);
-            g.update(*now, budget_mbps * 1_000_000);
+            g.update(*now, budget_mbps * 1_000_000, budget_pps);
         }
     }
 
@@ -134,7 +226,7 @@ mod tests {
     fn the_rate_is_measured_whether_or_not_there_is_a_budget() {
         let g = Gauge::default();
         let mut now = Instant::now();
-        g.update(now, 0);
+        g.update(now, 0, 0);
         run(&g, &mut now, 5, 100, 0);
         let rate = g.rate_bps() / 1_000_000;
         assert!((95..=105).contains(&rate), "rate {rate} Mbit/s");
@@ -145,7 +237,7 @@ mod tests {
     fn video_is_squeezed_near_the_budget_and_released_after_a_calm_spell() {
         let g = Gauge::default();
         let mut now = Instant::now();
-        g.update(now, 300_000_000);
+        g.update(now, 300_000_000, 0);
         run(&g, &mut now, 5, 100, 300);
         assert!(!g.squeezed(), "a third of the budget");
         run(&g, &mut now, 5, 280, 300);
@@ -160,7 +252,7 @@ mod tests {
     fn a_rate_hovering_between_the_marks_does_not_release() {
         let g = Gauge::default();
         let mut now = Instant::now();
-        g.update(now, 300_000_000);
+        g.update(now, 300_000_000, 0);
         run(&g, &mut now, 6, 290, 300);
         assert!(g.squeezed());
         // 75 % is under the squeeze mark but over the release mark.
@@ -172,8 +264,36 @@ mod tests {
     fn no_budget_never_squeezes() {
         let g = Gauge::default();
         let mut now = Instant::now();
-        g.update(now, 0);
+        g.update(now, 0, 0);
         run(&g, &mut now, 10, 900, 0);
         assert!(!g.squeezed());
+    }
+
+    #[test]
+    fn the_packet_rate_squeezes_on_its_own() {
+        // Voice: 100,000 packets of 100 bytes a second is 80 Mbit/s, far under the byte budget,
+        // and the whole of a 110,000-packet budget.
+        let g = Gauge::default();
+        let mut now = Instant::now();
+        g.update(now, 600_000_000, 110_000);
+        run_packets(&g, &mut now, 5, 100_000 * 100, 100_000, 600, 110_000);
+        assert!(
+            g.squeezed(),
+            "91 % of the packet budget, 13 % of the byte budget"
+        );
+        assert_eq!(g.rate_pps(), 100_000);
+        run_packets(&g, &mut now, 30, 30_000 * 100, 30_000, 600, 110_000);
+        assert!(!g.squeezed(), "a quarter of either budget for long enough");
+    }
+
+    #[test]
+    fn a_budget_of_zero_is_not_enforced() {
+        let g = Gauge::default();
+        let mut now = Instant::now();
+        g.update(now, 0, 0);
+        // Only the byte budget is set: a packet rate far beyond any sensible budget does not matter.
+        run_packets(&g, &mut now, 10, 10 * MBIT, 900_000, 600, 0);
+        assert!(!g.squeezed());
+        assert_eq!(g.rate_pps(), 900_000);
     }
 }

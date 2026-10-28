@@ -24,6 +24,9 @@ pub const MAX_VIDEO_SUBSCRIPTIONS: usize = 100;
 /// At most one keyframe request per stream per this long: a sender asked too often spends its
 /// bandwidth on keyframes.
 const KEYFRAME_INTERVAL: Duration = Duration::from_secs(1);
+/// How many voices of a call are forwarded while the node is shedding load, whatever the
+/// configured limit is (a smaller configured limit stays).
+const SHEDDING_VOICES: usize = 2;
 
 #[derive(Deserialize)]
 struct Subscription {
@@ -246,18 +249,50 @@ impl Engine {
     /// Once-a-second upkeep of a session's video: the sender's large layer pausing and resuming,
     /// the receiver's keyframe requests that went unanswered, and its screen share layer.
     pub(super) fn housekeeping(&mut self, key: SessionKey, now: Instant) {
-        self.cfg.egress.update(now, self.cfg.egress_budget_bps);
+        self.cfg
+            .egress
+            .update(now, self.cfg.egress_budget_bps, self.cfg.egress_budget_pps);
         self.follow_budget(key, now);
+        self.follow_voice_limit(key);
         self.watch_camera(key, now);
         self.retry_keyframes(key, now);
         self.review_screen_level(key, now);
         self.report_quality(key, now);
     }
 
-    /// Holds a receiver to the small layers while the node is near its send budget, and lets it
-    /// back up when it is not.
+    /// Whether the node is asked for more than it can send, or the shard for more than it can do:
+    /// a send budget (bits or packets) is nearly used, or the shard's thread has no room left.
+    fn shedding(&self) -> bool {
+        let budgeted = (self.cfg.egress_budget_bps > 0 || self.cfg.egress_budget_pps > 0)
+            && self.cfg.egress.squeezed();
+        budgeted || self.overloaded
+    }
+
+    /// Lets a call forward fewer voices while the node is shedding: a call with many open
+    /// microphones asks for a packet for every listener from each of them, and the listener hears
+    /// two or three.
+    fn follow_voice_limit(&mut self, key: SessionKey) {
+        let configured = self.cfg.audio_loudest;
+        let limit = if self.shedding() {
+            match configured {
+                0 => SHEDDING_VOICES,
+                n => n.min(SHEDDING_VOICES),
+            }
+        } else {
+            configured
+        };
+        let Some(s) = self.sessions.get(key) else {
+            return;
+        };
+        if let Some(call) = self.calls.get_mut(&s.call) {
+            call.voices.set_limit(limit);
+        }
+    }
+
+    /// Holds a receiver to the small layers while the node is shedding (see `shedding`), and lets
+    /// it back up when it is not.
     fn follow_budget(&mut self, key: SessionKey, now: Instant) {
-        let squeeze = self.cfg.egress_budget_bps > 0 && self.cfg.egress.squeezed();
+        let squeeze = self.shedding();
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };

@@ -336,7 +336,11 @@ async fn system(State(svc): State<Arc<Service>>, method: axum::http::Method) -> 
         shards: usize,
         /// What the instance sends now, in bits per second.
         egress_bps: u64,
-        /// Receivers are held to the small video layers: the send budget is reached.
+        /// What the instance sends now, in packets per second.
+        egress_pps: u64,
+        /// Datagrams the kernel refused to queue since the instance started.
+        kernel_send_drops: u64,
+        /// Receivers are held to the small video layers: a send budget is reached.
         egress_squeezed: bool,
     }
     json_response(&Body {
@@ -344,6 +348,8 @@ async fn system(State(svc): State<Arc<Service>>, method: axum::http::Method) -> 
         sessions: svc.sfu.session_count(),
         shards: svc.sfu.shard_count(),
         egress_bps: svc.sfu.egress_bps(),
+        egress_pps: svc.sfu.egress_pps(),
+        kernel_send_drops: svc.sfu.kernel_send_drops(),
         egress_squeezed: svc.sfu.egress_squeezed(),
     })
 }

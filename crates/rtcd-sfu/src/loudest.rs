@@ -94,6 +94,23 @@ impl<K: Copy + Eq + Hash> Selector<K> {
         self.entries.get(&key).is_some_and(|e| e.forwarded)
     }
 
+    /// Changes how many voices are forwarded at most (0 forwards all), taking effect from the next
+    /// packet: a node under pressure asks fewer of its calls.
+    pub fn set_limit(&mut self, limit: usize) {
+        if self.limit == limit {
+            return;
+        }
+        self.limit = limit;
+        // Rank again at once; with no limit nobody is left out.
+        self.ranked_at = None;
+        if limit == 0 {
+            for e in self.entries.values_mut() {
+                e.forwarded = true;
+            }
+            self.cutoff = f32::NEG_INFINITY;
+        }
+    }
+
     /// A source left the call or was muted: its slot is free.
     pub fn remove(&mut self, key: K) {
         if self.entries.remove(&key).is_some() {
@@ -265,5 +282,32 @@ mod tests {
         sel.remove(1);
         let (_, counts) = feed(&mut sel, t, 1000, &[(2, 60)]);
         assert_eq!(counts[&2].0, counts[&2].1);
+    }
+
+    #[test]
+    fn lowering_the_limit_drops_the_quietest_voices_at_once() {
+        let mut sel = Selector::new(3);
+        let t = Instant::now();
+        for step in 0..30 {
+            let now = t + Duration::from_millis(20 * step);
+            for (key, level) in [(1u32, 20u8), (2, 30), (3, 40), (4, 80)] {
+                sel.hear(key, level, now);
+            }
+        }
+        let now = t + Duration::from_millis(700);
+        assert!(
+            sel.hear(3, 40, now),
+            "the third loudest is forwarded under a limit of three"
+        );
+        sel.set_limit(1);
+        let now = now + Duration::from_millis(20);
+        assert!(sel.hear(1, 20, now));
+        assert!(!sel.hear(2, 30, now), "only the loudest voice remains");
+        assert!(!sel.hear(3, 40, now));
+        sel.set_limit(0);
+        assert!(
+            sel.hear(4, 80, now + Duration::from_millis(20)),
+            "no limit forwards everything"
+        );
     }
 }

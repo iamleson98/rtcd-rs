@@ -18,6 +18,7 @@ use super::EventSink;
 use super::config::SfuConfig;
 use super::directory::Directory;
 use super::registry::Registry;
+use super::scaler::Pressure;
 use super::table::ShardTable;
 use super::tcp::TcpConn;
 use crate::engine::{Command, Engine, Event, FastMap, Proto, RouteUpdate};
@@ -183,6 +184,7 @@ pub(crate) struct Shard {
     /// Time spent working since `window_start`.
     worked: Duration,
     window_start: Instant,
+    pressure: Pressure,
     stopping: bool,
     next_sweep: Instant,
 }
@@ -237,6 +239,7 @@ impl Shard {
             busy,
             worked: Duration::ZERO,
             window_start: Instant::now(),
+            pressure: Pressure::default(),
             stopping: false,
             next_sweep: Instant::now() + SWEEP_EVERY,
         })
@@ -306,6 +309,8 @@ impl Shard {
             let fraction = (self.worked.as_secs_f32() / window.as_secs_f32()).clamp(0.0, 1.0);
             self.busy
                 .store((fraction * BUSY_SCALE) as u32, Ordering::Relaxed);
+            let pressed = self.pressure.update(fraction);
+            self.engine.set_overloaded(pressed);
             self.worked = Duration::ZERO;
             self.window_start = done;
         }
