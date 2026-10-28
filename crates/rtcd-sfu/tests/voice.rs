@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use rtcd_proto::MessageType;
 use rtcd_proto::dc::DcMessage;
+use rtcd_sfu::config::EngineConfig;
 use rtcd_sfu::engine::CloseReason;
 use rtcd_sfu::ids::{TrackType, parse_track_id};
-use support::World;
+use support::{World, engine_config};
 
 /// Waits until browser `i` has received `n` tracks.
 fn wait_tracks(w: &mut World, i: usize, n: usize) {
@@ -408,4 +409,58 @@ fn a_participant_that_closes_its_connection_is_dropped_at_once() {
         w.closed
     );
     assert_eq!(w.engine.session_count(), 1);
+}
+
+/// A call where `levels` speak at once (browser `i` at audio level `levels[i]`, -dBov) for three
+/// seconds, plus one listener that never speaks. Returns how many packets the listener received
+/// from each speaker.
+fn crowd(audio_loudest: usize, levels: &[u8]) -> Vec<usize> {
+    let mut w = World::with_config(EngineConfig {
+        audio_loudest,
+        ..engine_config()
+    });
+    let speakers: Vec<usize> = (0..levels.len())
+        .map(|i| w.join(&format!("s{i}"), "call1"))
+        .collect();
+    let listener = w.join("listener", "call1");
+    wait_tracks(&mut w, listener, 0);
+    for _ in 0..150 {
+        for (&i, &level) in speakers.iter().zip(levels) {
+            w.send_audio(i, level);
+        }
+        w.run_for(Duration::from_millis(20));
+    }
+    w.run_for(Duration::from_millis(200));
+    (0..levels.len())
+        .map(|i| w.browsers[listener].received_on(&format!("voice_session-s{i}")))
+        .collect()
+}
+
+#[test]
+fn only_the_loudest_voices_are_forwarded_beyond_the_limit() {
+    let heard = crowd(2, &[25, 30, 90, 100]);
+    assert!(heard[0] > 100, "the loudest was heard {} times", heard[0]);
+    assert!(
+        heard[1] > 100,
+        "the second loudest was heard {} times",
+        heard[1]
+    );
+    assert!(heard[2] < 20, "a quiet voice was heard {} times", heard[2]);
+    assert!(heard[3] < 20, "a quiet voice was heard {} times", heard[3]);
+}
+
+#[test]
+fn a_call_within_the_voice_limit_forwards_everyone() {
+    let heard = crowd(3, &[25, 90, 100]);
+    for (i, n) in heard.iter().enumerate() {
+        assert!(*n > 100, "speaker {i} was heard {n} times");
+    }
+}
+
+#[test]
+fn no_voice_limit_forwards_everyone() {
+    let heard = crowd(0, &[25, 30, 90, 100]);
+    for (i, n) in heard.iter().enumerate() {
+        assert!(*n > 100, "speaker {i} was heard {n} times");
+    }
 }

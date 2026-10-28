@@ -68,6 +68,9 @@ pub struct EngineConfig {
     pub ice_lite: bool,
     /// Whether to pace video sends to each participant's estimated rate. Off matches the Go rtcd.
     pub pacing: bool,
+    /// How many voices of one call are forwarded when more microphones are open than that: the
+    /// loudest (see `loudest`). 0 forwards every voice, as the Go rtcd does.
+    pub audio_loudest: usize,
     /// How many sessions one shard serves at most; joins beyond are refused.
     pub max_sessions: usize,
 }
@@ -88,6 +91,7 @@ impl Default for EngineConfig {
             max_bitrate: 3_750_000,
             ice_lite: true,
             pacing: false,
+            audio_loudest: 0,
             max_sessions: 10_000,
         }
     }

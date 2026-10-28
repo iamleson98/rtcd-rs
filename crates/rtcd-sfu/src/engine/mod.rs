@@ -40,14 +40,27 @@ use self::route::Routes;
 use self::session::{SessionKey, Sessions, SourceKey};
 use crate::config::EngineConfig;
 use crate::ids::Rng;
+use crate::loudest::Selector;
 use crate::metrics::Metrics;
 
 /// A call: the sessions that hear each other.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Call {
     pub members: Vec<SessionKey>,
     /// The member sharing a screen, if any; one share per call.
     pub screen: Option<SessionKey>,
+    /// Which open microphones are forwarded.
+    pub voices: Selector<SessionKey>,
+}
+
+impl Call {
+    fn new(audio_loudest: usize) -> Self {
+        Self {
+            members: Vec::new(),
+            screen: None,
+            voices: Selector::new(audio_loudest),
+        }
+    }
 }
 
 /// Names a call: its group (the service client that owns it) and its id.

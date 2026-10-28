@@ -74,6 +74,20 @@ not its own passes it on. Once a shard has learned a participant's address it op
 connected to that address, bound to the same port, which the kernel serves directly: after the first
 packets almost nothing takes the detour (`rtcd_net_forwarded_packets_total` shows how much does).
 
+## Large calls: the loudest voices
+
+Every open microphone is a stream to every listener, so a call of `n` people with `m` microphones
+open costs `m × n` voice streams, while a person follows two or three speakers at most. With
+`RTCD_RTC_AUDIOLOUDEST=N` (`rtc.audio_loudest`) a call that has more than `N` open microphones
+forwards only the `N` loudest, the rule Meet (three loudest, on three fixed streams) and Jitsi
+(`route-loudest-only`) use. The loudness is the audio level the browser already sends (RFC 6464),
+smoothed so that a speaker is heard from the first syllables and a pause does not give the slot
+away, and a source that holds a slot keeps it until another is clearly louder (`src/loudest.rs`).
+A call with no more open microphones than `N` is untouched, a sender that reports no level is
+always forwarded, and 0 (the default) forwards everything as before. Packets of a voice that is
+not forwarded are dropped before any receiver is written to, so nothing is renegotiated and the
+people's voice indicators (`voice_on`/`voice_off`) do not change.
+
 ## Using it from class-management
 
 - Bring it in as a submodule: `git submodule add https://github.com/iamleson98/rtcd-rs.git rtcd-rust`

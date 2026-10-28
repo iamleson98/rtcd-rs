@@ -13,6 +13,7 @@ use rtc::rtp_transceiver::{RTCRtpReceiverId, RTCRtpSenderId};
 use rtcd_proto::SessionConfig;
 use rtcd_proto::dc::DcMessage;
 
+use super::CallId;
 use super::signaling::{Phase, SignalingLock};
 use super::types::Proto;
 use crate::bwe::Estimate;
@@ -202,6 +203,8 @@ pub(crate) enum Lifecycle {
 /// A participant's connection and everything the engine tracks about it.
 pub(crate) struct Session {
     pub cfg: SessionConfig,
+    /// The call it belongs to, for the lookups the packet path makes.
+    pub call: CallId,
     pub pc: RTCPeerConnection,
     pub estimate: Arc<Estimate>,
     pub created_at: Instant,

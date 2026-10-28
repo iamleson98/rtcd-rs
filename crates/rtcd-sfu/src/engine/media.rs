@@ -170,27 +170,38 @@ impl Engine {
         src.last_packet = Some(now);
         match src.ty {
             TrackType::Voice => {
-                let muted = s.up.muted;
-                if let (Some(id), Some(vad)) = (ext_id, s.up.vad.as_mut())
-                    && let Some(level) = packet
+                if s.up.muted {
+                    return false;
+                }
+                // The level is the low seven bits; the top bit says whether the frame is voice.
+                let level = ext_id.and_then(|id| {
+                    packet
                         .header
                         .get_extension_payload(id)
                         .and_then(|e| e.first())
+                        .map(|b| b & 0x7f)
+                });
+                if let (Some(level), Some(vad)) = (level, s.up.vad.as_mut())
+                    && let Some(on) = vad.push_packet(level, packet.header.timestamp, now)
                 {
-                    // The level is the low seven bits; the top bit says whether the frame is voice.
-                    if let Some(on) = vad.push_packet(level & 0x7f, packet.header.timestamp, now) {
-                        self.emit(
-                            key,
-                            if on {
-                                MessageType::VoiceOn
-                            } else {
-                                MessageType::VoiceOff
-                            },
-                            Vec::new(),
-                        );
-                    }
+                    self.emit(
+                        key,
+                        if on {
+                            MessageType::VoiceOn
+                        } else {
+                            MessageType::VoiceOff
+                        },
+                        Vec::new(),
+                    );
                 }
-                !muted
+                // A sender that reports no level cannot be ranked: it is always forwarded.
+                match (level, self.sessions.get(key)) {
+                    (Some(level), Some(s)) => self
+                        .calls
+                        .get_mut(&s.call)
+                        .is_none_or(|c| c.voices.hear(key, level, now)),
+                    _ => true,
+                }
             }
             TrackType::ScreenAudio => true,
             TrackType::Screen | TrackType::Video => {

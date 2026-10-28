@@ -4,6 +4,7 @@ pub mod config;
 pub mod engine;
 pub mod ids;
 pub mod layers;
+pub mod loudest;
 pub mod metrics;
 mod peer;
 pub mod rate;
