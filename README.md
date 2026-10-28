@@ -138,8 +138,10 @@ saturated: its calls forward the loudest voice only, and it refuses new sessions
 on it cannot move, so its next participant is refused; a new call goes to a shard that is not
 saturated, and is refused when none is), so the sessions it has keep their quality. It leaves that
 state after ten seconds under 90 %. The call's host (the join request's `host` field, which the LMS
-server sets for a class's teacher) is never refused: a teacher whose connection dropped comes back
-as a new session, and a node with no room still lets the teacher open the class.
+server sets for a class's teacher) and its recorder (`observer`) are never refused: a teacher whose
+connection dropped comes back as a new session, a node with no room still lets the teacher open the
+class, and a class that is being recorded keeps its recorder (a recorder costs about 3 % of a core
+and 12 Mbit/s for a class of 30 with 24 cameras, measured with `lms-sim`).
 `RTCD_RTC_REFUSEWHENSATURATED=false` turns the refusal off.
 `GET /system` reports `shards_pressured` and `shards_saturated`.
 

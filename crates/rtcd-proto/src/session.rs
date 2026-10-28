@@ -46,6 +46,20 @@ impl SessionProps {
     pub fn host(&self) -> bool {
         self.0.get("host").and_then(Value::as_bool).unwrap_or(false)
     }
+
+    /// Whether the participant only watches the call: the session recorder (absent from older
+    /// servers: false).
+    pub fn observer(&self) -> bool {
+        self.0
+            .get("observer")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    /// Whether a node with no room left still takes the participant: the host and the recorder.
+    pub fn takes_priority(&self) -> bool {
+        self.host() || self.observer()
+    }
 }
 
 /// A session, as the join request defined it and the HTTP API reports it. The field names are the
@@ -76,6 +90,7 @@ impl SessionConfig {
         props.insert("av1Support".to_owned(), Value::Bool(join.av1_support));
         props.insert("dcSignaling".to_owned(), Value::Bool(join.dc_signaling));
         props.insert("host".to_owned(), Value::Bool(join.host));
+        props.insert("observer".to_owned(), Value::Bool(join.observer));
         Self {
             group_id: group_id.to_owned(),
             call_id: join.call_id.clone(),

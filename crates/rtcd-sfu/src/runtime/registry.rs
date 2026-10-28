@@ -109,9 +109,10 @@ impl Registry {
             return Err(AdmitError::Duplicate);
         }
         let call = (cfg.group_id.clone(), cfg.call_id.clone());
-        // The call's host is never refused: without the teacher a class cannot start, or goes on
-        // without one (a teacher whose connection dropped comes back as a new session).
-        let host = cfg.props.host();
+        // The call's host and its recorder are never refused: without the teacher a class cannot
+        // start, or goes on without one (a teacher whose connection dropped comes back as a new
+        // session), and without the recorder it is not recorded.
+        let host = cfg.props.takes_priority();
         let shard = match st.calls.get(&call) {
             Some((shard, _)) if saturated(*shard) && !host => return Err(AdmitError::Saturated),
             Some((shard, _)) => *shard,
@@ -357,6 +358,21 @@ mod tests {
         assert!(
             r.admit_unless(&host("c2", "teacher2"), &|_| true).is_ok(),
             "a teacher does, on the emptiest shard"
+        );
+        let recorder = SessionConfig::from_join(
+            "g",
+            &rtcd_proto::JoinRequest {
+                call_id: "c1".into(),
+                user_id: "recorder".into(),
+                session_id: "rec".into(),
+                observer: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            r.admit_unless(&recorder, &saturated),
+            Ok(a),
+            "and so is the recorder of a class on a saturated shard"
         );
     }
 

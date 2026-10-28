@@ -25,6 +25,9 @@ pub struct JoinRequest {
     /// anyone else still takes the host: without them the class cannot start, or goes on without
     /// its teacher.
     pub host: bool,
+    /// The participant only watches the call: the session recorder. A node with no room left
+    /// still takes it, or the class would not be recorded.
+    pub observer: bool,
 }
 
 /// The `{"sessionID": ...}` payload of leave, reconnect and close.
@@ -77,7 +80,7 @@ impl ClientMessage {
                 &[("clientID", &h.client_id), ("connID", &h.conn_id)],
             ),
             Self::Join(j) => {
-                rmp::encode::write_map_len(&mut out, 7).expect("vec write");
+                rmp::encode::write_map_len(&mut out, 8).expect("vec write");
                 for (key, value) in [
                     ("callID", &j.call_id),
                     ("userID", &j.user_id),
@@ -91,6 +94,7 @@ impl ClientMessage {
                     ("av1Support", j.av1_support),
                     ("dcSignaling", j.dc_signaling),
                     ("host", j.host),
+                    ("observer", j.observer),
                 ] {
                     rmp::encode::write_str(&mut out, key).expect("vec write");
                     rmp::encode::write_bool(&mut out, value).expect("vec write");
@@ -127,6 +131,7 @@ impl ClientMessage {
                     av1_support: lookup_bool(map, "av1Support"),
                     dc_signaling: lookup_bool(map, "dcSignaling"),
                     host: lookup_bool(map, "host"),
+                    observer: lookup_bool(map, "observer"),
                 })
             }
             "leave" | "reconnect" | "close" => {
@@ -185,6 +190,7 @@ mod tests {
                 av1_support: true,
                 dc_signaling: false,
                 host: true,
+                observer: true,
             }),
             ClientMessage::Leave(SessionRef {
                 session_id: "s".into(),

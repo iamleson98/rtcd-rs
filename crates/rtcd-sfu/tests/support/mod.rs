@@ -250,6 +250,7 @@ impl World {
                     av1_support: false,
                     dc_signaling: true,
                     host: false,
+                    observer: false,
                 },
             )
             .props,

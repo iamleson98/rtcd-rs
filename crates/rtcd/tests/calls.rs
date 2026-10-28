@@ -268,6 +268,7 @@ async fn a_join_the_sfu_refuses_is_closed_back_to_the_client() {
         av1_support: false,
         dc_signaling: true,
         host: false,
+        observer: false,
     }))
     .await;
     match ws.next_message().await {
