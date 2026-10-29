@@ -9,7 +9,8 @@ use mio::net::TcpStream;
 use rtcd_net::{FrameReader, encode_frame};
 
 /// Written bytes are dropped from the front of an [`Outbox`] once there are this many, and as many
-/// as the bytes still owed: moving the owed bytes costs no more than the writes that made room.
+/// as the bytes still owed: moving the owed bytes costs no more than the writes that made room, and
+/// the buffer holds at most twice what the connection owes (plus this many bytes).
 const COMPACT_AT: usize = 32 * 1024;
 
 /// Framed bytes waiting for a socket.

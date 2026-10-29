@@ -47,6 +47,8 @@ struct State {
     active: Vec<bool>,
     /// When each participant's last session left its call.
     left: HashMap<Member, Instant>,
+    /// The size of `left` at which it is swept next (at least `SWEEP_AT`).
+    sweep_at: usize,
     closing: bool,
 }
 
@@ -126,24 +128,25 @@ impl Registry {
         // already in the call or has just left it: a student whose connection dropped comes back
         // as a new session too, and is not a newcomer the shard has to keep out.
         let host = cfg.props.takes_priority();
-        let member = (
-            cfg.group_id.clone(),
-            cfg.call_id.clone(),
-            cfg.user_id.clone(),
-        );
-        let returning = st
-            .left
-            .get(&member)
-            .is_some_and(|t| t.elapsed() < RETURN_WINDOW)
-            || st.calls.get(&call).is_some_and(|(_, ids)| {
-                ids.iter().any(|id| {
-                    st.sessions
-                        .get(id)
-                        .is_some_and(|e| e.cfg.user_id == cfg.user_id)
-                })
-            });
+        // Only asked of a participant who would otherwise be refused.
+        let returning = |ids: &HashSet<String>| {
+            !cfg.user_id.is_empty()
+                && (st
+                    .left
+                    .get(&(
+                        cfg.group_id.clone(),
+                        cfg.call_id.clone(),
+                        cfg.user_id.clone(),
+                    ))
+                    .is_some_and(|t| t.elapsed() < RETURN_WINDOW)
+                    || ids.iter().any(|id| {
+                        st.sessions
+                            .get(id)
+                            .is_some_and(|e| e.cfg.user_id == cfg.user_id)
+                    }))
+        };
         let shard = match st.calls.get(&call) {
-            Some((shard, _)) if saturated(*shard) && !host && !returning => {
+            Some((shard, ids)) if saturated(*shard) && !host && !returning(ids) => {
                 return Err(AdmitError::Saturated);
             }
             Some((shard, _)) => *shard,
@@ -196,8 +199,13 @@ impl Registry {
             return false;
         };
         st.load[entry.shard] -= 1;
-        if st.left.len() >= SWEEP_AT {
-            st.left.retain(|_, t| t.elapsed() < RETURN_WINDOW);
+        let now = Instant::now();
+        if st.left.len() >= st.sweep_at.max(SWEEP_AT) {
+            st.left
+                .retain(|_, t| now.saturating_duration_since(*t) < RETURN_WINDOW);
+            // The next sweep waits for the map to double, so a class ending does not sweep it at
+            // every release.
+            st.sweep_at = 2 * st.left.len();
         }
         st.left.insert(
             (
@@ -205,7 +213,7 @@ impl Registry {
                 entry.cfg.call_id.clone(),
                 entry.cfg.user_id.clone(),
             ),
-            Instant::now(),
+            now,
         );
         let call = (entry.cfg.group_id, entry.cfg.call_id);
         if let Some((_, members)) = st.calls.get_mut(&call) {
@@ -402,6 +410,17 @@ mod tests {
                 .map(|_| ()),
             Ok(()),
             "another call is another matter, and finds room on the other shard"
+        );
+    }
+
+    #[test]
+    fn participants_with_no_user_id_are_not_taken_for_each_other() {
+        let r = Registry::new(2);
+        let a = r.admit(&cfg_of("", "c1", "s1")).unwrap();
+        let saturated = |slot: usize| slot == a;
+        assert_eq!(
+            r.admit_unless(&cfg_of("", "c1", "s2"), &saturated),
+            Err(AdmitError::Saturated)
         );
     }
 

@@ -37,7 +37,7 @@ predicts the network bill (`increase(...[1d])` is GB per day):
 | `rtcd_rtc_rtp_bytes_received_total{type}` | the uplink, by the same types |
 | `rtcd_rtc_rtp_tracks_writes_time{groupID,type}` | time to write one packet to one receiver (a sample of the writes) |
 
-What the receivers experience, read from each receiver's connection statistics every five seconds:
+What the receivers experience, read from the connection statistics of each session that sends or receives video every five seconds (a voice-only session is not read: the snapshot allocates, and the voice thread pays for it):
 
 | metric | what it counts |
 |---|---|
