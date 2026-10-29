@@ -1,8 +1,10 @@
 //! `lms-sim run` records a synthetic class with a recorder binary and reports what it cost and what
-//! it wrote, so two recorders can be compared on the same load.
+//! it wrote, so two recorders can be compared on the same load. With `--builtin` rtcd records the
+//! class itself, and the report says how much of a core its writer threads used.
 //!
 //! ```text
 //! lms-sim run --recorder ./recorder --label rust --duration 30 --people 8 --cameras 6 --screens 1
+//! lms-sim run --builtin --label builtin --duration 30 --people 30 --cameras 10 --screens 1
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -12,13 +14,16 @@ use std::time::{Duration, Instant};
 
 use lms_sim::assets::Assets;
 use lms_sim::class::{self, Spec};
-use lms_sim::host::Rtcd;
+use lms_sim::host::{Impair, Rtcd};
 use lms_sim::lms::{CHAN_ID, Lms, REC_ID};
+use rtcd_proto::{ClientMessage, RecordStart, RecordStop};
 use serde_json::{Value, json};
 use tokio::process::Command;
 
 struct Args {
     recorder: PathBuf,
+    /// Record with rtcd itself instead of a recorder binary.
+    builtin: bool,
     label: String,
     duration: u64,
     people: u32,
@@ -34,6 +39,7 @@ struct Args {
 fn parse() -> Result<Args, String> {
     let mut a = Args {
         recorder: PathBuf::new(),
+        builtin: false,
         label: "recorder".into(),
         duration: 30,
         people: 8,
@@ -47,9 +53,13 @@ fn parse() -> Result<Args, String> {
     };
     let mut it = std::env::args().skip(1);
     if it.next().as_deref() != Some("run") {
-        return Err("usage: lms-sim run --recorder PATH [--label NAME] [--duration S] [--people N] [--cameras N] [--screens N] [--assets DIR] [--out DIR] [--data-env NAME] [--loss PERCENT] [--blackout-ms MS]".into());
+        return Err("usage: lms-sim run (--recorder PATH | --builtin) [--label NAME] [--duration S] [--people N] [--cameras N] [--screens N] [--assets DIR] [--out DIR] [--data-env NAME] [--loss PERCENT] [--blackout-ms MS]".into());
     }
     while let Some(k) = it.next() {
+        if k == "--builtin" {
+            a.builtin = true;
+            continue;
+        }
         let v = it.next().ok_or_else(|| format!("{k} needs a value"))?;
         let n = |v: &str| {
             v.parse::<u64>()
@@ -75,8 +85,8 @@ fn parse() -> Result<Args, String> {
             other => return Err(format!("unknown option {other}")),
         }
     }
-    if a.recorder.as_os_str().is_empty() {
-        return Err("--recorder is required".into());
+    if a.recorder.as_os_str().is_empty() == !a.builtin {
+        return Err("give --recorder PATH or --builtin, not both and not neither".into());
     }
     Ok(a)
 }
@@ -149,11 +159,108 @@ async fn main() {
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
 }
 
+/// The value of a counter or gauge in Prometheus text.
+fn metric(text: &str, name: &str) -> f64 {
+    text.lines()
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.trim().parse().ok())
+        .unwrap_or(0.0)
+}
+
+/// Records the class with rtcd itself, and reports what it wrote and what the writer cost: the
+/// seconds its threads spent writing (not waiting) over the length of the recording is the share
+/// of one core the recording takes.
+async fn record_in_rtcd(
+    a: Args,
+    rtcd: Arc<Rtcd>,
+    lms: Lms,
+    people: Vec<class::Participant>,
+) -> Value {
+    let control = rtcd.connect().await;
+    let busy_before = metric(&rtcd.metrics(), "rtcd_record_writer_busy_seconds_total");
+    let started = Instant::now();
+    control.send(ClientMessage::RecordStart(RecordStart {
+        recording_id: REC_ID.into(),
+        call_id: CHAN_ID.into(),
+        t0: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64,
+        file_base: 0,
+        site_url: lms.url.clone(),
+        token: "bot-token".into(),
+    }));
+    tokio::time::sleep(Duration::from_secs(a.duration)).await;
+    control.send(ClientMessage::RecordStop(RecordStop {
+        recording_id: REC_ID.into(),
+    }));
+    let capture = started.elapsed();
+    let busy = metric(&rtcd.metrics(), "rtcd_record_writer_busy_seconds_total") - busy_before;
+    let wait = Instant::now();
+    let ended = loop {
+        let found = rtcd.reports().into_iter().find_map(|m| match m {
+            ClientMessage::RecordEnded(e) => Some(e),
+            _ => None,
+        });
+        if found.is_some() || wait.elapsed() > Duration::from_secs(120) {
+            break found;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let mut files = Vec::new();
+    for m in rtcd.reports() {
+        if let ClientMessage::RecordFile(f) = m {
+            let mut entry = json!({
+                "index": f.index, "kind": f.kind, "session_id": f.session_id,
+                "start_ms": f.start_ms, "end_ms": f.end_ms,
+                "width": f.width, "height": f.height, "size": f.size,
+            });
+            if let Some(p) = lms.read(|s| s.files.get(&f.index.to_string()).cloned()) {
+                entry["probe"] = ffprobe(&p);
+            }
+            files.push(entry);
+        }
+    }
+    let text = rtcd.metrics();
+    let report = json!({
+        "label": a.label, "builtin": true,
+        "loss_percent": a.loss * 100.0, "blackout_ms": a.blackout,
+        "people": a.people, "cameras": a.cameras, "screens": a.screens, "duration_s": a.duration,
+        "capture_s": capture.as_secs_f64(),
+        "writer_busy_s": busy,
+        "writer_core_percent": 100.0 * busy / capture.as_secs_f64().max(0.001),
+        "uploaded_bytes": metric(&text, "rtcd_record_uploaded_bytes_total"),
+        "upload_failures": metric(&text, "rtcd_record_upload_failures_total"),
+        "writer_dropped_packets": metric(&text, "rtcd_record_writer_dropped_packets_total"),
+        "ended": ended.map(|e| json!({
+            "reason": e.reason, "file_base": e.file_base, "files": e.files,
+            "duration_ms": e.duration_ms, "dropped": e.dropped,
+        })),
+        "files": files,
+    });
+    for p in people {
+        p.leave().await;
+    }
+    report
+}
+
 async fn run(a: Args) -> Value {
     let _ = std::fs::remove_dir_all(&a.out);
     std::fs::create_dir_all(&a.out).unwrap();
     let assets = Arc::new(Assets::load(&a.assets).expect("the media is made (ffmpeg)"));
-    let rtcd = Arc::new(Rtcd::start_with(a.loss, a.blackout).await);
+    let impair = Impair {
+        down_loss: a.loss,
+        blackout_ms: a.blackout,
+        ..Default::default()
+    };
+    let recording_data = a.out.join("rtcd-data").display().to_string();
+    let builtin = a.builtin;
+    let rtcd = Arc::new(
+        Rtcd::start_configured(impair, move |cfg| {
+            cfg.record.enabled = builtin;
+            cfg.record.data_dir = recording_data;
+        })
+        .await,
+    );
     let lms = Lms::start(Some(rtcd.clone()), a.out.join("lms")).await;
 
     // The class: everyone speaks, some have cameras, some share a screen.
@@ -174,6 +281,10 @@ async fn run(a: Args) -> Value {
     }
     for p in &people {
         lms.person_joined(&p.session_id, &p.user_id);
+    }
+
+    if a.builtin {
+        return record_in_rtcd(a, rtcd, lms, people).await;
     }
 
     // The recorder, under `time` for its CPU and memory.

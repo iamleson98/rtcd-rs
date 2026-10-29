@@ -10,11 +10,12 @@ use std::time::{Duration, Instant};
 
 use lms_sim::assets::Assets;
 use lms_sim::class::{self, Ctl, Participant, Spec};
-use lms_sim::host::{Impair, Rtcd};
+use lms_sim::host::{Impair, Rtcd, RtcdConn};
 use lms_sim::lms::{CHAN_ID, Lms, REC_ID};
 use recorder::api::Api;
 use recorder::config::Config;
 use recorder::session::{RunError, run};
+use rtcd_proto::{ClientMessage, RecordEnded, RecordStart, RecordStop};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -56,9 +57,25 @@ impl Class {
     }
 
     async fn start_impaired(tag: &str, assets: Arc<Assets>, impair: Impair) -> Self {
+        Self::start_on(tag, assets, impair, false).await
+    }
+
+    /// A class on an rtcd that can record calls itself.
+    async fn start_builtin(tag: &str, assets: Arc<Assets>) -> Self {
+        Self::start_on(tag, assets, Impair::default(), true).await
+    }
+
+    async fn start_on(tag: &str, assets: Arc<Assets>, impair: Impair, builtin: bool) -> Self {
         let dir = std::env::temp_dir().join(format!("recorder-e2e-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let rtcd = Arc::new(Rtcd::start_impaired(impair).await);
+        let data = dir.join("rtcd-data").display().to_string();
+        let rtcd = Arc::new(
+            Rtcd::start_configured(impair, move |cfg| {
+                cfg.record.enabled = builtin;
+                cfg.record.data_dir = data;
+            })
+            .await,
+        );
         let lms = Lms::start(Some(rtcd.clone()), dir.join("lms")).await;
         Self {
             rtcd,
@@ -122,6 +139,70 @@ impl Class {
             "",
             json!({ "recording_id": REC_ID }),
         );
+    }
+
+    /// Asks rtcd to record the class's call, numbering files from `file_base`.
+    fn builtin_start(&self, control: &RtcdConn, file_base: u32) {
+        control.send(ClientMessage::RecordStart(RecordStart {
+            recording_id: REC_ID.into(),
+            call_id: CHAN_ID.into(),
+            t0: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
+            file_base,
+            site_url: self.lms.url.clone(),
+            token: "bot-token".into(),
+        }));
+    }
+
+    fn builtin_stop(control: &RtcdConn) {
+        control.send(ClientMessage::RecordStop(RecordStop {
+            recording_id: REC_ID.into(),
+        }));
+    }
+
+    /// Waits for rtcd to say its recording ended, and returns what it reported, in order: the
+    /// files, then the end. The files are those stored in the fake LMS.
+    async fn builtin_report(&self) -> (Vec<Entry>, RecordEnded) {
+        let end = Instant::now() + Duration::from_secs(60);
+        loop {
+            let all = self.rtcd.reports();
+            if let Some(at) = all
+                .iter()
+                .position(|m| matches!(m, ClientMessage::RecordEnded(_)))
+            {
+                let ClientMessage::RecordEnded(ended) = all[at].clone() else {
+                    unreachable!()
+                };
+                assert_eq!(at, all.len() - 1, "nothing is reported after the end");
+                let files = all[..at]
+                    .iter()
+                    .map(|m| {
+                        let ClientMessage::RecordFile(f) = m else {
+                            panic!("only files come before the end: {m:?}")
+                        };
+                        Entry {
+                            kind: f.kind.clone(),
+                            session: f.session_id.clone(),
+                            user: f.user_id.clone(),
+                            start_ms: f.start_ms,
+                            end_ms: f.end_ms,
+                            width: u64::from(f.width),
+                            height: u64::from(f.height),
+                            size: f.size,
+                            path: self
+                                .lms
+                                .read(|s| s.files.get(&f.index.to_string()).cloned())
+                                .unwrap_or_else(|| panic!("file {} was not stored", f.index)),
+                        }
+                    })
+                    .collect();
+                return (files, ended);
+            }
+            assert!(Instant::now() < end, "rtcd never said the recording ended");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// The manifest the recorder completed with, and where each uploaded file is.
@@ -629,5 +710,187 @@ async fn a_dropped_realtime_connection_costs_nothing() {
         "the recorder stayed in the call: {:?}",
         c.lms.actions()
     );
+    c.finish().await;
+}
+
+fn full(name: &str) -> Spec {
+    Spec {
+        name: name.into(),
+        voice: true,
+        camera: true,
+        screen: true,
+    }
+}
+
+/// Joins the class `people` and holds everything they send back until `release` is called.
+async fn quiet_class(c: &mut Class) {
+    for spec in [
+        full("p0"),
+        Spec {
+            screen: false,
+            ..full("p1")
+        },
+        Spec {
+            camera: false,
+            screen: false,
+            ..full("p2")
+        },
+    ] {
+        c.join(spec).await;
+    }
+    for p in &c.people {
+        p.control(Ctl::Voice(false));
+        p.control(Ctl::Camera(false));
+        p.control(Ctl::Screen(false));
+    }
+}
+
+fn media(c: &Class, on: bool) {
+    for p in &c.people {
+        p.control(Ctl::Voice(on));
+        p.control(Ctl::Camera(on));
+        p.control(Ctl::Screen(on));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rtcd_records_a_class_by_itself_and_reports_every_file_then_the_end() {
+    let Some(assets) = assets() else { return };
+    let mut c = Class::start_builtin("builtin", assets).await;
+    quiet_class(&mut c).await;
+    let control = c.rtcd.connect().await;
+    c.builtin_start(&control, 300);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    media(&c, true);
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    Class::builtin_stop(&control);
+    let (m, ended) = c.builtin_report().await;
+
+    assert_eq!(of_kind(&m, "voice").len(), 3, "a voice per person: {m:#?}");
+    assert_eq!(of_kind(&m, "camera").len(), 2);
+    assert_eq!(of_kind(&m, "screen").len(), 1);
+    assert_eq!(
+        (ended.reason.as_str(), ended.file_base, ended.files as usize),
+        ("stopped", 300, m.len()),
+        "the end counts the files reported before it"
+    );
+    assert!(
+        (8_000..16_000).contains(&ended.duration_ms),
+        "{}",
+        ended.duration_ms
+    );
+    for e in &m {
+        assert!(
+            e.start_ms >= 0 && e.end_ms > e.start_ms && e.end_ms <= ended.duration_ms + 500,
+            "{e:?} within the recording ({} ms)",
+            ended.duration_ms
+        );
+        assert!(
+            e.session.starts_with("session-p") && e.user == e.session.replace("session-", "user-"),
+            "{e:?}: whose it is"
+        );
+        let p = probe(e);
+        let seconds = (e.end_ms - e.start_ms) as f64 / 1000.0;
+        assert!(
+            (p.duration - seconds).abs() < 0.5,
+            "{e:?}: the file lasts {} s, the manifest says {seconds}",
+            p.duration
+        );
+        match e.kind.as_str() {
+            "voice" => assert_eq!(p.codec, "opus"),
+            "camera" => assert_eq!(
+                (p.codec.as_str(), p.width, p.height, e.width, e.height),
+                ("vp8", 640, 360, 640, 360)
+            ),
+            "screen" => assert_eq!((p.codec.as_str(), p.width, p.height), ("vp8", 1280, 720)),
+            other => panic!("{other}"),
+        }
+    }
+    c.finish().await;
+}
+
+/// The bot and rtcd record the same class at the same time; they must write the same files.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bot_and_rtcd_write_the_same_files_for_the_same_class() {
+    let Some(assets) = assets() else { return };
+    let mut c = Class::start_builtin("parity", assets).await;
+    quiet_class(&mut c).await;
+    let rec = c.record();
+    c.recorder_in().await;
+    let control = c.rtcd.connect().await;
+    c.builtin_start(&control, 1000);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Both are in place: from here they see the same packets.
+    media(&c, true);
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    media(&c, false);
+    // Long enough for voice and cameras to be taken for ended (a screen is held until the stop).
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    c.stop();
+    Class::builtin_stop(&control);
+    rec.await.unwrap().expect("the bot's recording completes");
+    let bot = c.manifest();
+    let (built_in, _) = c.builtin_report().await;
+
+    // What each file is, and how long it lasts.
+    let shape = |m: &[Entry]| -> Vec<(String, String, String, i64)> {
+        let mut v: Vec<_> = m
+            .iter()
+            .map(|e| {
+                (
+                    e.kind.clone(),
+                    e.session.clone(),
+                    e.user.clone(),
+                    e.end_ms - e.start_ms,
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let (a, b) = (shape(&bot), shape(&built_in));
+    let names = |v: &[(String, String, String, i64)]| -> Vec<String> {
+        v.iter()
+            .map(|(k, s, u, _)| format!("{k} {s} {u}"))
+            .collect()
+    };
+    assert_eq!(
+        names(&a),
+        names(&b),
+        "the same files, kinds and owners\nbot: {a:#?}\nrtcd: {b:#?}"
+    );
+    for ((kind, session, _, bot_ms), (_, _, _, rtcd_ms)) in a.iter().zip(&b) {
+        // A frame at 30 fps is 33 ms; a screen is held to the stop, which each path sees a little
+        // apart.
+        let allowed = if kind == "screen" { 400 } else { 66 };
+        assert!(
+            (bot_ms - rtcd_ms).abs() <= allowed,
+            "{kind} {session}: the bot's file lasts {bot_ms} ms, rtcd's {rtcd_ms} ms"
+        );
+    }
+    // And each decodes, with the same number of frames.
+    let by_key = |m: &'_ [Entry], e: &Entry| -> Option<usize> {
+        m.iter()
+            .position(|x| x.kind == e.kind && x.session == e.session)
+    };
+    for e in &built_in {
+        let theirs = &bot[by_key(&bot, e).expect("the bot has this file")];
+        let (mine, other) = (probe(e), probe(theirs));
+        assert_eq!(
+            (mine.codec.as_str(), mine.width, mine.height),
+            (other.codec.as_str(), other.width, other.height),
+            "{e:?}"
+        );
+        let apart = mine.frames.abs_diff(other.frames);
+        assert!(
+            apart <= 3,
+            "{} {}: {} frames from rtcd, {} from the bot",
+            e.kind,
+            e.session,
+            mine.frames,
+            other.frames
+        );
+        assert!((mine.duration - other.duration).abs() < 0.4);
+    }
     c.finish().await;
 }

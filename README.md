@@ -253,6 +253,22 @@ builds a static image on `scratch`. It uses about a quarter of the Go recorder's
 memory; see [crates/recorder/README.md](crates/recorder/README.md) for the numbers, the method
 (`scripts/bench-recorder.py`) and what differs.
 
+### Recording inside rtcd
+
+With `[record] enabled = true` (`RTCD_RECORD_ENABLED`) a node records calls itself, without a recorder
+participant: the server sends `record_start` over the websocket, each published stream is copied once
+to a writer thread (`rtcd_sfu::record`), the files are the recorder crate's, rotated every ten minutes
+and numbered from the start's `fileBase` in the order they close, and each is uploaded as it closes
+through the endpoints the bot uses, then reported (`record_file`) and deleted. `record_ended` follows
+once every file is stored. Settings: `RTCD_RECORD_DATADIR`, `_MAXBYTES` (one recording's total),
+`_MAXPENDINGBYTES` (closed files waiting for upload, all recordings; above it packets are left out and
+counted, not the recording ended) and `_UPLOADMBPS` (the node's upload rate, so uploads never compete
+with media). Files a dead process left in the data directory are removed at start. Metrics:
+`rtcd_record_{recordings,files_written_total,pending_bytes,uploaded_bytes_total,upload_failures_total,
+writer_dropped_packets_total,writer_busy_seconds_total}`. `lms-sim run --builtin` records a synthetic
+class this way; the writer threads used 0.14 % of a core for 8 people and 7 video streams, and 0.41 %
+for 100 people and 32 (release build, loopback).
+
 ## Fuzzing
 
 `fuzz/` holds libFuzzer targets for what comes from outside: data channel frames, websocket frames, the
