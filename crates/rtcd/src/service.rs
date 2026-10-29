@@ -156,7 +156,8 @@ impl Service {
                 return;
             }
         };
-        self.metrics.ws_message(client_id, msg.type_name(), "in");
+        let kind = msg.type_name();
+        self.metrics.ws_message(client_id, kind, "in");
         match msg {
             ClientMessage::Join(join) => self.join(conn_id, client_id, &join),
             ClientMessage::Leave(r) => {
@@ -182,7 +183,16 @@ impl Service {
                 }
             }
             ClientMessage::Rtc(m) => self.signal(client_id, m),
-            ClientMessage::Hello(_) | ClientMessage::Close(_) | ClientMessage::Vad(_) => {
+            // Recording is not implemented in the service yet. The message carries a token, so
+            // only its type is logged.
+            ClientMessage::RecordStart(_) | ClientMessage::RecordStop(_) => {
+                debug!(conn = conn_id, kind, "recording message ignored");
+            }
+            ClientMessage::Hello(_)
+            | ClientMessage::Close(_)
+            | ClientMessage::Vad(_)
+            | ClientMessage::RecordFile(_)
+            | ClientMessage::RecordEnded(_) => {
                 warn!(conn = conn_id, "unexpected message from a client");
             }
         }
