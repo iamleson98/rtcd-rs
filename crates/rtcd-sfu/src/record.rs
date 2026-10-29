@@ -190,6 +190,21 @@ pub fn record_channel(capacity: usize) -> (RecordSink, RecordReceiver) {
     )
 }
 
+/// Ends a recording that never recorded anything: its writer gets a `Begin` and the end.
+pub(crate) fn end_unbegun(
+    sink: &RecordSink,
+    recording_id: &str,
+    t0: Instant,
+    reason: RecordEnd,
+    now: Instant,
+) {
+    let _ = sink.try_send(RecordItem::Begin(Box::new(RecordBegin {
+        recording_id: recording_id.to_owned(),
+        t0,
+    })));
+    let _ = sink.try_send(RecordItem::End { reason, at: now });
+}
+
 /// Why a recording could not be started or stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RecordError {

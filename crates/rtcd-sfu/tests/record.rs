@@ -444,25 +444,82 @@ fn the_last_one_out_ends_the_recording() {
 }
 
 #[test]
-fn a_call_that_is_not_there_or_is_recorded_already_is_refused() {
+fn a_call_that_is_recorded_under_another_id_refuses_and_the_same_id_changes_nothing() {
     let mut w = World::new();
-    let _a = w.join("alice", "call1");
-    let mut none = start(&mut w, "nothing", "rec0", 8);
-    assert_eq!(names(&drain(&mut none)), ["begin rec0", "end Refused"]);
-
+    let a = w.join("alice", "call1");
     let mut first = start(&mut w, "call1", "rec1", 8);
     let mut second = start(&mut w, "call1", "rec2", 8);
     assert_eq!(names(&drain(&mut second)), ["begin rec2", "end Refused"]);
     assert_eq!(names(&drain(&mut first)), ["begin rec1"]);
 
+    // The same recording asked for again is the same recording: its new queue is let go.
+    let mut again = start(&mut w, "call1", "rec1", 8);
+    assert!(drain(&mut again).is_empty());
+    assert!(matches!(
+        again.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Disconnected)
+    ));
+    w.speak(a, 3, |_| 40);
+    assert_eq!(
+        packets(&drain(&mut first)).len(),
+        3,
+        "and the first goes on"
+    );
+
     // Stopping what is not recorded under that id changes nothing.
     w.engine.record_stop(w.now, "group", "call1", "rec2");
     assert!(drain(&mut first).is_empty());
     w.engine.record_stop(w.now, "group", "call1", "rec1");
-    assert_eq!(names(&drain(&mut first)), ["end Stopped"]);
+    assert_eq!(names(&drain(&mut first)), ["close 0", "end Stopped"]);
     // And the call can be recorded again.
-    let mut again = start(&mut w, "call1", "rec3", 8);
-    assert_eq!(names(&drain(&mut again)), ["begin rec3"]);
+    let mut later = start(&mut w, "call1", "rec3", 8);
+    assert_eq!(names(&drain(&mut later))[0], "begin rec3");
+}
+
+#[test]
+fn a_recording_asked_for_before_its_call_begins_with_the_first_session() {
+    let mut w = World::new();
+    let mut rx = start(&mut w, "call1", "rec1", 1024);
+    assert_eq!(names(&drain(&mut rx)), ["begin rec1"], "it waits");
+
+    // The same request again is a no-op; another id for the same call is refused.
+    let mut again = start(&mut w, "call1", "rec1", 8);
+    assert!(drain(&mut again).is_empty());
+    let mut other = start(&mut w, "call1", "rec2", 8);
+    assert_eq!(names(&drain(&mut other)), ["begin rec2", "end Refused"]);
+
+    let a = w.join("alice", "call1");
+    w.speak(a, 10, |_| 40);
+    let n = names(&drain(&mut rx));
+    assert_eq!(n[0], "open 0 voice session-alice", "{n:?}");
+    assert_eq!(
+        n.len(),
+        11,
+        "and every packet of the speaker is recorded: {n:?}"
+    );
+    w.engine.record_stop(w.now, "group", "call1", "rec1");
+    assert_eq!(names(&drain(&mut rx)), ["close 0", "end Stopped"]);
+}
+
+#[test]
+fn stopping_a_recording_that_waits_clears_it() {
+    let mut w = World::new();
+    let mut rx = start(&mut w, "call1", "rec1", 1024);
+    w.engine.record_stop(w.now, "group", "call1", "rec2");
+    assert_eq!(
+        names(&drain(&mut rx)),
+        ["begin rec1"],
+        "another id: nothing"
+    );
+    w.engine.record_stop(w.now, "group", "call1", "rec1");
+    assert_eq!(names(&drain(&mut rx)), ["end Stopped"]);
+
+    // And the call, when it comes, is not recorded.
+    let a = w.join("alice", "call1");
+    w.speak(a, 5, |_| 40);
+    assert!(drain(&mut rx).is_empty());
+    let mut next = start(&mut w, "call1", "rec3", 64);
+    assert_eq!(names(&drain(&mut next))[0], "begin rec3");
 }
 
 #[test]

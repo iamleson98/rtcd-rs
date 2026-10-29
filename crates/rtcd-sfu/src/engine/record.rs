@@ -19,7 +19,9 @@ use super::{CallId, Engine};
 use crate::ids::TrackType;
 use crate::layers::Layer;
 use crate::metrics::Metrics;
-use crate::record::{RecordBegin, RecordEnd, RecordItem, RecordPacket, RecordSink, StreamOpen};
+use crate::record::{
+    RecordBegin, RecordEnd, RecordItem, RecordPacket, RecordSink, StreamOpen, end_unbegun,
+};
 
 /// How soon an event that did not fit the queue is tried again when nothing else wakes the engine.
 const RETRY: Duration = Duration::from_millis(100);
@@ -169,11 +171,19 @@ impl Active {
 pub(crate) struct Recordings {
     slots: Vec<Option<Active>>,
     live: usize,
+    /// Recordings asked for before their call has a session here: they begin with the call.
+    waiting: Vec<Active>,
 }
 
 impl Recordings {
     pub fn is_empty(&self) -> bool {
         self.live == 0
+    }
+
+    /// Takes the recording that waits for a call, if any.
+    fn take_waiting(&mut self, call: &CallId) -> Option<Active> {
+        let i = self.waiting.iter().position(|a| a.call == *call)?;
+        Some(self.waiting.swap_remove(i))
     }
 
     fn insert(&mut self, a: Active) -> u32 {
@@ -244,8 +254,10 @@ fn recordable(src: &Source) -> bool {
 
 impl Engine {
     /// Starts recording a call: every stream it has now, and every one that comes. The recording
-    /// reports on `sink`, starting with [`RecordItem::Begin`]; a call that does not exist, or has a
-    /// recording already, gets an [`RecordEnd::Refused`] straight after it.
+    /// reports on `sink`, starting with [`RecordItem::Begin`]. A call that has no session yet is
+    /// recorded from its first one (the request may overtake the participant's join). Asking
+    /// again for a recording that exists or waits changes nothing (the new sink is dropped); a call
+    /// that has another recording gets a [`RecordEnd::Refused`] straight after the `Begin`.
     pub fn record_start(
         &mut self,
         now: Instant,
@@ -263,27 +275,51 @@ impl Engine {
             recording_id: recording_id.to_owned(),
             t0,
         }));
-        if !self.calls.get(&id).is_some_and(|c| c.record.is_none()) {
-            let _ = sink.try_send(begin);
-            let _ = sink.try_send(RecordItem::End {
-                reason: RecordEnd::Refused,
-                at: now,
-            });
+        let holder = match self.calls.get(&id) {
+            Some(c) => c.record.and_then(|rec| self.recordings.get(rec)),
+            None => self.recordings.waiting.iter().find(|a| a.call == id),
+        };
+        if let Some(existing) = holder {
+            if existing.id != recording_id {
+                end_unbegun(&sink, recording_id, t0, RecordEnd::Refused, now);
+            }
             return;
         }
         let mut active = Active::new(recording_id, id.clone(), sink, now);
         active.send_control(begin, now);
+        if self.calls.contains_key(&id) {
+            self.begin_recording(active, now);
+        } else {
+            info!(recording = recording_id, call = %id.call, "recording waits for its call");
+            self.recordings.waiting.push(active);
+        }
+    }
+
+    /// Attaches a recording to its call, which exists, and taps what the call has.
+    fn begin_recording(&mut self, active: Active, now: Instant) {
+        let id = active.call.clone();
+        let name = active.id.clone();
         let rec = self.recordings.insert(active);
         let Some(call) = self.calls.get_mut(&id) else {
             return;
         };
         call.record = Some(rec);
         let members = call.members.clone();
-        info!(recording = recording_id, call = %id.call, "recording started");
+        info!(recording = %name, call = %id.call, "recording started");
         for member in members {
             for ty in TrackType::ALL {
                 self.record_sync(member, ty, now);
             }
+        }
+    }
+
+    /// A call got its first session: a recording that waited for it begins.
+    pub(super) fn call_began(&mut self, id: &CallId, now: Instant) {
+        if self.recordings.waiting.is_empty() {
+            return;
+        }
+        if let Some(active) = self.recordings.take_waiting(id) {
+            self.begin_recording(active, now);
         }
     }
 
@@ -293,15 +329,26 @@ impl Engine {
             group: group.to_owned(),
             call: call.to_owned(),
         };
-        let Some(rec) = self.calls.get(&id).and_then(|c| c.record) else {
-            return;
-        };
-        if self
+        if let Some(rec) = self.calls.get(&id).and_then(|c| c.record) {
+            if self
+                .recordings
+                .get(rec)
+                .is_some_and(|a| a.id == recording_id)
+            {
+                self.finish_recording(rec, RecordEnd::Stopped, now);
+            }
+        } else if let Some(i) = self
             .recordings
-            .get(rec)
-            .is_some_and(|a| a.id == recording_id)
+            .waiting
+            .iter()
+            .position(|a| a.call == id && a.id == recording_id)
         {
-            self.finish_recording(rec, RecordEnd::Stopped, now);
+            // It never began: its writer is told it is over, with nothing recorded.
+            let active = self.recordings.waiting.swap_remove(i);
+            let _ = active.sink.try_send(RecordItem::End {
+                reason: RecordEnd::Stopped,
+                at: now,
+            });
         }
     }
 
@@ -538,5 +585,57 @@ impl Engine {
         if self.recordings.retry_at().is_some_and(|t| t <= now) {
             self.recordings.retry(now);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::record::record_channel;
+
+    /// What the tap costs one packet by itself. Run by hand:
+    /// `cargo test --release -p rtcd-sfu --lib tap_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn tap_cost_per_packet() {
+        let now = Instant::now();
+        let (sink, mut rx) = record_channel(8192);
+        let call = CallId {
+            group: "g".into(),
+            call: "c".into(),
+        };
+        let mut recordings = Recordings::default();
+        let rec = recordings.insert(Active::new("r", call, sink, now));
+        let tap = Tap { rec, stream: 0 };
+        let mut packet = rtc::rtp::Packet {
+            payload: Bytes::from(vec![7u8; 160]),
+            ..Default::default()
+        };
+        // A header with an extension, as a browser's packet has.
+        packet
+            .header
+            .set_extension(1, Bytes::from_static(&[40]))
+            .unwrap();
+        const N: u32 = 2_000_000;
+        let mut best = Duration::MAX;
+        for _ in 0..7 {
+            let mut spent = Duration::ZERO;
+            for batch in 0..(N / 4096) {
+                let started = Instant::now();
+                for i in 0..4096u32 {
+                    packet.header.sequence_number = (batch * 4096 + i) as u16;
+                    recordings.packet(tap, &packet, now);
+                }
+                spent += started.elapsed();
+                while rx.try_recv().is_ok() {}
+            }
+            best = best.min(spent);
+        }
+        println!(
+            "tap: {:.1} ns per packet",
+            best.as_nanos() as f64 / f64::from(N / 4096 * 4096)
+        );
     }
 }

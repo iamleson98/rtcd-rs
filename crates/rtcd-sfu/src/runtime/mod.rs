@@ -9,6 +9,7 @@ mod shard;
 mod table;
 mod tcp;
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -87,6 +88,9 @@ struct Core {
     threads: Mutex<Vec<(usize, JoinHandle<()>)>>,
     /// Held while shards are added or stopped, so two changes cannot interleave.
     resize: Mutex<()>,
+    /// Recordings asked for before their call has a session, by group and call: they go to the
+    /// shard the call is placed on, with its first session.
+    pending_records: Mutex<HashMap<(String, String), Box<RecordStart>>>,
 }
 
 impl Core {
@@ -325,6 +329,7 @@ impl Sfu {
             table: Arc::new(ShardTable::new(slots)),
             threads: Mutex::new(Vec::with_capacity(slots)),
             resize: Mutex::new(()),
+            pending_records: Mutex::new(HashMap::new()),
         });
         for (slot, udp) in sockets.into_iter().enumerate() {
             let thread = core.spawn(slot, udp)?;
@@ -392,12 +397,21 @@ impl Sfu {
             self.core.registry.admit(&cfg)?
         };
         let session_id = cfg.session_id.clone();
+        let call = (cfg.group_id.clone(), cfg.call_id.clone());
         let sent = match self.core.table.get(shard) {
             Some(handle) => handle.send(ShardCommand::Engine(Command::Join(cfg))),
             None => Err(Undelivered::Stopped),
         };
         match sent {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // A recording that waited for this call goes to the shard that now has it, after
+                // the join, so the call exists when the shard looks.
+                let waiting = self.pending_records().remove(&call);
+                if let (Some(r), Some(handle)) = (waiting, self.core.table.get(shard)) {
+                    let _ = handle.send(ShardCommand::RecordStart(r));
+                }
+                Ok(())
+            }
             Err(_) => {
                 self.core.registry.release(&session_id);
                 Err(JoinError::Overloaded)
@@ -437,11 +451,20 @@ impl Sfu {
             })
     }
 
-    /// Starts recording a call that has sessions: its streams are copied to `sink`, which first
-    /// gets [`RecordItem::Begin`](crate::record::RecordItem::Begin) with `recording_id` and `t0`
-    /// and ends with an [`End`](crate::record::RecordItem::End). The rest is reported through the
-    /// sink: a recording the call's shard cannot start (the call ended meanwhile, or it is
-    /// recorded already) ends at once as `Refused`.
+    fn pending_records(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(String, String), Box<RecordStart>>> {
+        self.core
+            .pending_records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Starts recording a call: its streams are copied to `sink`, which first gets
+    /// [`RecordItem::Begin`](crate::record::RecordItem::Begin) with `recording_id` and `t0` and
+    /// ends with an [`End`](crate::record::RecordItem::End). A call that has no session yet is
+    /// recorded from its first one; asking again for the same recording changes nothing; a call
+    /// that has another recording is refused through the sink (`Refused`).
     pub fn record_start(
         &self,
         group: &str,
@@ -450,36 +473,67 @@ impl Sfu {
         t0: Instant,
         sink: RecordSink,
     ) -> Result<(), RecordError> {
-        let shard = self
-            .core
-            .registry
-            .shard_of_call(group, call)
-            .ok_or(RecordError::UnknownCall)?;
-        self.shard_send(
-            shard,
-            ShardCommand::RecordStart(Box::new(RecordStart {
-                group: group.to_owned(),
-                call: call.to_owned(),
-                recording_id: recording_id.to_owned(),
-                t0,
-                sink,
-            })),
-        )
+        let request = Box::new(RecordStart {
+            group: group.to_owned(),
+            call: call.to_owned(),
+            recording_id: recording_id.to_owned(),
+            t0,
+            sink,
+        });
+        // Checked under the lock `join` takes to hand over a waiting recording: a call placed
+        // meanwhile is found here, or finds this request there.
+        let mut waiting = self.pending_records();
+        let Some(shard) = self.core.registry.shard_of_call(group, call) else {
+            match waiting.get(&(group.to_owned(), call.to_owned())) {
+                Some(w) if w.recording_id == recording_id => {}
+                Some(_) => crate::record::end_unbegun(
+                    &request.sink,
+                    recording_id,
+                    t0,
+                    crate::record::RecordEnd::Refused,
+                    Instant::now(),
+                ),
+                None => {
+                    waiting.insert((group.to_owned(), call.to_owned()), request);
+                }
+            }
+            return Ok(());
+        };
+        drop(waiting);
+        self.shard_send(shard, ShardCommand::RecordStart(request))
     }
 
-    /// Stops the recording of a call; its sink gets what is left and an `End`. A call that is not
-    /// recorded under that id is left alone.
+    /// Stops the recording of a call; its sink gets what is left and an `End`. A recording that
+    /// waits for its call ends without having recorded; one that is not recorded under that id is
+    /// left alone.
     pub fn record_stop(
         &self,
         group: &str,
         call: &str,
         recording_id: &str,
     ) -> Result<(), RecordError> {
+        let mut waiting = self.pending_records();
+        let key = (group.to_owned(), call.to_owned());
+        if waiting
+            .get(&key)
+            .is_some_and(|w| w.recording_id == recording_id)
+            && let Some(w) = waiting.remove(&key)
+        {
+            crate::record::end_unbegun(
+                &w.sink,
+                recording_id,
+                w.t0,
+                crate::record::RecordEnd::Stopped,
+                Instant::now(),
+            );
+            return Ok(());
+        }
         let shard = self
             .core
             .registry
             .shard_of_call(group, call)
             .ok_or(RecordError::UnknownCall)?;
+        drop(waiting);
         self.shard_send(
             shard,
             ShardCommand::RecordStop(RecordStop {

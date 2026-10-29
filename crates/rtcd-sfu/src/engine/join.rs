@@ -95,10 +95,11 @@ impl Engine {
         self.routes.add_ufrag(ufrag, key);
         let loudest = self.cfg.audio_loudest;
         self.calls
-            .entry(call_id)
+            .entry(call_id.clone())
             .or_insert_with(|| Call::new(loudest))
             .members
             .push(key);
+        self.call_began(&call_id, now);
         self.mark_dirty(key);
     }
 

@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 use live::Live;
 use rtcd_proto::MessageType;
 use rtcd_sfu::engine::{CloseReason, Event};
-use rtcd_sfu::record::RecordError;
 use rtcd_sfu::runtime::ScalingPolicy;
 
 #[test]
@@ -484,12 +483,6 @@ fn a_call_is_recorded_on_whichever_shard_it_lives_on() {
             .expect("the call exists");
         recordings.push(rx);
     }
-    let (sink, _rx) = record_channel(8);
-    assert_eq!(
-        live.sfu
-            .record_start("group", "nobody", "rec", Instant::now(), sink),
-        Err(RecordError::UnknownCall)
-    );
 
     for &a in &speakers {
         live.speak(a, 40);
@@ -536,4 +529,91 @@ fn a_call_is_recorded_on_whichever_shard_it_lives_on() {
             "call{c}"
         );
     }
+}
+
+/// The server's call-start hook can ask for a recording before the first participant has joined:
+/// it waits, whichever shard the call lands on, and begins with the first session.
+#[test]
+fn a_recording_asked_for_before_the_first_join_begins_with_it() {
+    use rtcd_sfu::record::{RecordEnd, RecordItem, record_channel};
+    let mut live = Live::start(4);
+    // Other calls already fill some shards.
+    live.join("x0", "other0");
+    live.join("x1", "other1");
+    let t0 = Instant::now();
+    let (sink, mut rx) = record_channel(1024);
+    live.sfu
+        .record_start("group", "late", "rec1", t0, sink)
+        .expect("accepted though the call has no session");
+    let (again, mut dropped) = record_channel(8);
+    live.sfu
+        .record_start("group", "late", "rec1", t0, again)
+        .expect("asking again is a no-op");
+    let (other, mut refused) = record_channel(8);
+    live.sfu
+        .record_start("group", "late", "rec2", t0, other)
+        .unwrap();
+    assert!(matches!(refused.try_recv(), Ok(RecordItem::Begin(_))));
+    assert!(matches!(
+        refused.try_recv(),
+        Ok(RecordItem::End {
+            reason: RecordEnd::Refused,
+            ..
+        })
+    ));
+    assert!(dropped.try_recv().is_err());
+
+    let a = live.join("alice", "late");
+    live.join("bob", "late");
+    live.speak(a, 40);
+    live.run(Duration::from_millis(400));
+    live.sfu.record_stop("group", "late", "rec1").unwrap();
+    live.run(Duration::from_millis(300));
+    let items: Vec<RecordItem> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(matches!(&items[0], RecordItem::Begin(b) if b.recording_id == "rec1" && b.t0 == t0));
+    let packets = items
+        .iter()
+        .filter(|i| matches!(i, RecordItem::Packet(_)))
+        .count();
+    assert!(packets >= 30, "{packets} packets");
+    assert!(matches!(
+        items.last(),
+        Some(RecordItem::End {
+            reason: RecordEnd::Stopped,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_recording_that_waits_for_its_call_can_be_stopped() {
+    use rtcd_sfu::record::{RecordEnd, RecordItem, record_channel};
+    let mut live = Live::start(2);
+    let (sink, mut rx) = record_channel(8);
+    live.sfu
+        .record_start("group", "late", "rec1", Instant::now(), sink)
+        .unwrap();
+    live.sfu.record_stop("group", "late", "rec1").unwrap();
+    assert!(matches!(rx.try_recv(), Ok(RecordItem::Begin(_))));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(RecordItem::End {
+            reason: RecordEnd::Stopped,
+            ..
+        })
+    ));
+    // The call that comes is not recorded.
+    let a = live.join("alice", "late");
+    live.speak(a, 10);
+    live.run(Duration::from_millis(200));
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        live.sfu.record_stop("group", "late", "rec1"),
+        Ok(()),
+        "a call that has a session, no recording of that id"
+    );
+    assert_eq!(
+        live.sfu.record_stop("group", "never", "rec1"),
+        Err(rtcd_sfu::record::RecordError::UnknownCall)
+    );
 }
