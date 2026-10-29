@@ -66,14 +66,22 @@ enum Traffic {
     VoiceUnheard,
     /// A camera and a screen share, on both layers, with a viewer.
     Video,
+    /// Two speakers and a listener.
+    TwoSpeakers,
 }
 
 /// The allocations and bytes of the engine's packet path for `traffic`, and the packets the
 /// recording was handed (none when it is not recording).
-fn measure(traffic: Traffic, recorded: bool) -> (u64, u64, usize) {
+fn measure(traffic: Traffic, queue: Option<usize>) -> (u64, u64, usize) {
     let mut w = World::new();
     w.around_engine = around;
+    let mut b = None;
     let (a, listeners) = match traffic {
+        Traffic::TwoSpeakers => {
+            let a = w.join("alice", "call1");
+            b = Some(w.join("bob", "call1"));
+            (a, vec![w.join("carol", "call1")])
+        }
         Traffic::Voice => {
             let a = w.join("alice", "call1");
             (a, vec![w.join("bob", "call1"), w.join("carol", "call1")])
@@ -86,13 +94,21 @@ fn measure(traffic: Traffic, recorded: bool) -> (u64, u64, usize) {
             (a, vec![b])
         }
     };
-    let mut recording = recorded.then(|| {
-        let (sink, rx) = record_channel(1 << 16);
+    let mut recording = queue.map(|capacity| {
+        let (sink, rx) = record_channel(capacity);
         w.engine
             .record_start(w.now, "group", "call1", "rec1", w.now, sink);
         rx
     });
     let send = |w: &mut World, frames: usize| match traffic {
+        Traffic::TwoSpeakers => {
+            for f in 0..frames {
+                let level = if f % 2 == 0 { 20 } else { 70 };
+                w.send_audio(a, level);
+                w.send_audio(b.expect("two speakers"), level);
+                w.run_for(std::time::Duration::from_millis(20));
+            }
+        }
         Traffic::Voice | Traffic::VoiceUnheard => {
             w.speak(a, frames, |f| if f % 2 == 0 { 20 } else { 70 })
         }
@@ -132,9 +148,16 @@ fn measure(traffic: Traffic, recorded: bool) -> (u64, u64, usize) {
     (measured.0, measured.1, recorded_packets)
 }
 
+const ROOMY: usize = 1 << 16;
+
 fn same_as_unrecorded(traffic: Traffic, least: usize) {
-    let plain = measure(traffic, false);
-    let recorded = measure(traffic, true);
+    same_with_queue(traffic, ROOMY, least);
+}
+
+/// The packet path with a queue of `capacity` items, against the same traffic not recorded.
+fn same_with_queue(traffic: Traffic, capacity: usize, least: usize) {
+    let plain = measure(traffic, None);
+    let recorded = measure(traffic, Some(capacity));
     assert!(
         recorded.2 >= least,
         "the recording was handed {} packets, expected at least {least}",
@@ -166,4 +189,26 @@ fn a_recorded_voice_nobody_hears_costs_the_packet_path_no_allocation() {
 fn a_recorded_camera_and_screen_cost_the_packet_path_no_allocation() {
     // 150 frames of two packets on the large layer of each of the two streams.
     same_as_unrecorded(Traffic::Video, 150 * 2 * 2 - 40);
+}
+
+/// A queue that is full for good: every packet is left out, and the events that cannot be queued
+/// wait. None of that allocates on the packet path.
+#[test]
+fn a_queue_of_one_item_that_is_always_full_costs_no_allocation() {
+    // The beginning fills it; the stream's open waits for room that never comes.
+    same_with_queue(Traffic::Voice, 1, 0);
+    same_with_queue(Traffic::VoiceUnheard, 1, 0);
+}
+
+#[test]
+fn a_full_queue_with_no_event_waiting_costs_no_allocation() {
+    // The beginning and the open fill it; each packet finds it full.
+    same_with_queue(Traffic::Voice, 2, 0);
+}
+
+#[test]
+fn events_waiting_for_room_while_packets_arrive_cost_no_allocation() {
+    // The second speaker's open waits behind the first's, and packets of both are left out.
+    same_with_queue(Traffic::TwoSpeakers, 2, 0);
+    same_with_queue(Traffic::Video, 3, 0);
 }

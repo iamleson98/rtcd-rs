@@ -36,10 +36,11 @@ use self::shard::{
 };
 use self::table::ShardTable;
 use crate::config::LocalAddress;
+use crate::engine::WAIT_FOR_CALL;
 use crate::engine::{CloseReason, Command, Engine, Event};
 use crate::ids::Rng;
 use crate::metrics::Metrics;
-use crate::record::{RecordError, RecordSink};
+use crate::record::{RecordEnd, RecordError, RecordSink, end_unbegun};
 
 /// Receives what the SFU reports about sessions. Called from the SFU's threads: it must not block.
 pub trait EventSink: Send + Sync + 'static {
@@ -90,7 +91,41 @@ struct Core {
     resize: Mutex<()>,
     /// Recordings asked for before their call has a session, by group and call: they go to the
     /// shard the call is placed on, with its first session.
-    pending_records: Mutex<HashMap<(String, String), Box<RecordStart>>>,
+    pending_records: Mutex<HashMap<(String, String), PendingRecord>>,
+}
+
+/// The most recordings that may wait for their calls at once.
+const MAX_PENDING_RECORDS: usize = 1024;
+
+/// A recording that waits for its call to get a session, and since when.
+struct PendingRecord {
+    request: Box<RecordStart>,
+    since: Instant,
+}
+
+impl Core {
+    /// Ends the recordings that have waited longer than [`WAIT_FOR_CALL`] as `Refused`: the call
+    /// never came, or was placed by a join that is not the one the recording was meant for.
+    /// Called whenever the map is locked, so a node with calls coming and going cleans it.
+    fn expire_pending_records(
+        waiting: &mut HashMap<(String, String), PendingRecord>,
+        now: Instant,
+    ) {
+        waiting.retain(|(_, call), p| {
+            let expired = now.saturating_duration_since(p.since) >= WAIT_FOR_CALL;
+            if expired {
+                info!(call, recording = %p.request.recording_id, "no session came for the recording; ending it");
+                end_unbegun(
+                    &p.request.sink,
+                    &p.request.recording_id,
+                    p.request.t0,
+                    RecordEnd::Refused,
+                    now,
+                );
+            }
+            !expired
+        });
+    }
 }
 
 impl Core {
@@ -406,9 +441,13 @@ impl Sfu {
             Ok(()) => {
                 // A recording that waited for this call goes to the shard that now has it, after
                 // the join, so the call exists when the shard looks.
-                let waiting = self.pending_records().remove(&call);
-                if let (Some(r), Some(handle)) = (waiting, self.core.table.get(shard)) {
-                    let _ = handle.send(ShardCommand::RecordStart(r));
+                let waiting = {
+                    let mut waiting = self.pending_records();
+                    Core::expire_pending_records(&mut waiting, Instant::now());
+                    waiting.remove(&call)
+                };
+                if let Some(p) = waiting {
+                    self.hand_over(shard, p.request);
                 }
                 Ok(())
             }
@@ -451,9 +490,36 @@ impl Sfu {
             })
     }
 
+    /// Passes a recording that waited to the shard that now has its call. A shard that cannot take
+    /// it ends the recording as `Refused`, and the failure is counted and logged.
+    fn hand_over(&self, shard: usize, request: Box<RecordStart>) {
+        let sink = request.sink.clone();
+        let (group, call, id, t0) = (
+            request.group.clone(),
+            request.call.clone(),
+            request.recording_id.clone(),
+            request.t0,
+        );
+        let sent = match self.core.table.get(shard) {
+            Some(handle) => handle.send(ShardCommand::RecordStart(request)),
+            None => Err(Undelivered::Stopped),
+        };
+        if let Err(why) = sent {
+            warn!(
+                call,
+                recording = id,
+                shard,
+                ?why,
+                "cannot hand a recording to its call's shard"
+            );
+            self.core.metrics.error(&group, "record_handover");
+            end_unbegun(&sink, &id, t0, RecordEnd::Refused, Instant::now());
+        }
+    }
+
     fn pending_records(
         &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<(String, String), Box<RecordStart>>> {
+    ) -> std::sync::MutexGuard<'_, HashMap<(String, String), PendingRecord>> {
         self.core
             .pending_records
             .lock()
@@ -463,8 +529,10 @@ impl Sfu {
     /// Starts recording a call: its streams are copied to `sink`, which first gets
     /// [`RecordItem::Begin`](crate::record::RecordItem::Begin) with `recording_id` and `t0` and
     /// ends with an [`End`](crate::record::RecordItem::End). A call that has no session yet is
-    /// recorded from its first one; asking again for the same recording changes nothing; a call
-    /// that has another recording is refused through the sink (`Refused`).
+    /// recorded from its first one, if one comes within ten seconds (and up to a thousand
+    /// recordings wait at once); otherwise it ends as `Refused`. Asking again for the same
+    /// recording leaves it as it is and ends the new sink as `AlreadyRecording`; a call that has
+    /// another recording is refused through the sink (`Refused`). Both come after a `Begin`.
     pub fn record_start(
         &self,
         group: &str,
@@ -483,18 +551,35 @@ impl Sfu {
         // Checked under the lock `join` takes to hand over a waiting recording: a call placed
         // meanwhile is found here, or finds this request there.
         let mut waiting = self.pending_records();
+        let now = Instant::now();
         let Some(shard) = self.core.registry.shard_of_call(group, call) else {
-            match waiting.get(&(group.to_owned(), call.to_owned())) {
-                Some(w) if w.recording_id == recording_id => {}
-                Some(_) => crate::record::end_unbegun(
-                    &request.sink,
-                    recording_id,
-                    t0,
-                    crate::record::RecordEnd::Refused,
-                    Instant::now(),
-                ),
+            Core::expire_pending_records(&mut waiting, now);
+            let key = (group.to_owned(), call.to_owned());
+            let reason = match waiting.get(&key) {
+                Some(w) if w.request.recording_id == recording_id => {
+                    Some(RecordEnd::AlreadyRecording)
+                }
+                Some(_) => Some(RecordEnd::Refused),
+                None if waiting.len() >= MAX_PENDING_RECORDS => {
+                    warn!(
+                        call,
+                        recording = recording_id,
+                        "too many recordings wait for their calls"
+                    );
+                    Some(RecordEnd::Refused)
+                }
+                None => None,
+            };
+            match reason {
+                Some(reason) => end_unbegun(&request.sink, recording_id, t0, reason, now),
                 None => {
-                    waiting.insert((group.to_owned(), call.to_owned()), request);
+                    waiting.insert(
+                        key,
+                        PendingRecord {
+                            request,
+                            since: now,
+                        },
+                    );
                 }
             }
             return Ok(());
@@ -513,17 +598,18 @@ impl Sfu {
         recording_id: &str,
     ) -> Result<(), RecordError> {
         let mut waiting = self.pending_records();
+        Core::expire_pending_records(&mut waiting, Instant::now());
         let key = (group.to_owned(), call.to_owned());
         if waiting
             .get(&key)
-            .is_some_and(|w| w.recording_id == recording_id)
+            .is_some_and(|w| w.request.recording_id == recording_id)
             && let Some(w) = waiting.remove(&key)
         {
-            crate::record::end_unbegun(
-                &w.sink,
+            end_unbegun(
+                &w.request.sink,
                 recording_id,
-                w.t0,
-                crate::record::RecordEnd::Stopped,
+                w.request.t0,
+                RecordEnd::Stopped,
                 Instant::now(),
             );
             return Ok(());

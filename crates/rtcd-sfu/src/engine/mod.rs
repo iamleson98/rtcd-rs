@@ -15,6 +15,7 @@ mod media;
 mod negotiate;
 mod quality;
 mod record;
+pub(crate) use record::WAIT_FOR_CALL;
 mod route;
 mod session;
 mod signaling;

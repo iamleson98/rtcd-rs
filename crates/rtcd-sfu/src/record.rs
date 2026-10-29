@@ -66,8 +66,12 @@ pub enum RecordEnd {
     Stopped,
     /// The last participant left the call.
     CallEnded,
-    /// It could not start: the call does not exist (any more) or is being recorded already.
+    /// It could not start: the call has no session (after a wait), or has another recording.
     Refused,
+    /// A recording with this id exists (or waits for its call) already. This sink is a second
+    /// request for it, was not attached to anything, and gets this straight after its `Begin`; the
+    /// first recording goes on undisturbed.
+    AlreadyRecording,
 }
 
 /// Something a recording's writer is told, in the order it happened.
@@ -131,25 +135,42 @@ impl RecordShared {
     }
 }
 
-/// The shard's end of a recording's channel.
-#[derive(Debug)]
+/// The shard's end of a recording's channel. It is handed to [`Sfu::record_start`], which passes it
+/// to the shard that owns the call; clones share the queue.
+///
+/// [`Sfu::record_start`]: crate::runtime::Sfu::record_start
+#[derive(Debug, Clone)]
 pub struct RecordSink {
     tx: SyncSender<RecordItem>,
     shared: Arc<RecordShared>,
 }
 
 impl RecordSink {
-    /// Queues an item without waiting.
-    pub(crate) fn try_send(&self, item: RecordItem) -> Result<(), TrySendError<RecordItem>> {
+    /// Queues an item without waiting, or gives it back if the queue is full or the writer is
+    /// gone. This is what a shard does for every packet; other producers (tests) may use it too.
+    pub fn try_send(&self, item: RecordItem) -> Result<(), TrySendError<RecordItem>> {
         self.tx.try_send(item)
     }
 
-    pub(crate) fn shared(&self) -> &RecordShared {
+    /// The counters shared with the writer.
+    pub fn shared(&self) -> &RecordShared {
         &self.shared
     }
 }
 
 /// The writer's end of a recording's channel.
+///
+/// **Contract: drain it with [`try_recv`](Self::try_recv) and sleep on your own when it is empty
+/// (a couple of milliseconds); never call `recv` or `recv_timeout` on the queue, and do not wrap
+/// it in anything that does.** A receiver parked on the queue is registered as a waiter, and
+/// then every `try_send` of the shard thread takes a lock and wakes it with a futex call: a
+/// system call per packet on the thread that forwards the media. A polling writer is never
+/// parked, so a send costs a few atomic operations.
+///
+/// The writer reads the items in the order they were queued, `Begin` first and `End` last. Use
+/// the `arrived` instant of the last item it took as the time of the media while it is behind,
+/// and the clock only once `try_recv` says `Empty`: a late packet may still be queued behind the
+/// moment that gives up on a gap.
 #[derive(Debug)]
 pub struct RecordReceiver {
     rx: Receiver<RecordItem>,
@@ -170,6 +191,28 @@ impl RecordReceiver {
     pub fn shared(&self) -> &Arc<RecordShared> {
         &self.shared
     }
+}
+
+/// What one queued item can hold in memory: the payload keeps the datagram it arrived in (up to a
+/// 1,500 byte buffer, of which the RTP payload is about 1.3 KB in the biggest packets), and the
+/// slot in the queue is the size of an item (a little over 70 bytes).
+pub const ITEM_BYTES: usize = 1500 + std::mem::size_of::<RecordItem>();
+
+/// The memory a recording's queue may hold by default: 12 MiB, which is 8,000 items, about two
+/// seconds of a call of two hundred people with thirty open streams (a few thousand packets a
+/// second).
+pub const DEFAULT_QUEUE_BYTES: usize = 12 << 20;
+
+/// How many items fit in a memory `budget`, at [`ITEM_BYTES`] each: the most the queue can pin if
+/// the writer stalls, since every item keeps its datagram alive.
+pub const fn capacity_for(budget: usize) -> usize {
+    let n = budget / ITEM_BYTES;
+    if n == 0 { 1 } else { n }
+}
+
+/// A recording's channel sized for a memory budget (see [`capacity_for`]).
+pub fn record_channel_for(budget: usize) -> (RecordSink, RecordReceiver) {
+    record_channel(capacity_for(budget))
 }
 
 /// A recording's channel, with room for `capacity` items. The room is allocated here and never

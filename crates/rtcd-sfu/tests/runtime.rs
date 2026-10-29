@@ -561,7 +561,14 @@ fn a_recording_asked_for_before_the_first_join_begins_with_it() {
             ..
         })
     ));
-    assert!(dropped.try_recv().is_err());
+    assert!(matches!(dropped.try_recv(), Ok(RecordItem::Begin(_))));
+    assert!(matches!(
+        dropped.try_recv(),
+        Ok(RecordItem::End {
+            reason: RecordEnd::AlreadyRecording,
+            ..
+        })
+    ));
 
     let a = live.join("alice", "late");
     live.join("bob", "late");
@@ -615,5 +622,53 @@ fn a_recording_that_waits_for_its_call_can_be_stopped() {
     assert_eq!(
         live.sfu.record_stop("group", "never", "rec1"),
         Err(rtcd_sfu::record::RecordError::UnknownCall)
+    );
+}
+
+/// A recording that waits for a call that never gets a session does not wait for ever, and the
+/// number that wait is bounded.
+#[test]
+fn recordings_that_wait_for_a_call_are_bounded_in_number_and_time() {
+    use rtcd_sfu::record::{RecordEnd, RecordItem, record_channel};
+    let live = Live::start(1);
+    let mut first = None;
+    for n in 0..1024 {
+        let (sink, rx) = record_channel(4);
+        live.sfu
+            .record_start("group", &format!("never{n}"), "rec", Instant::now(), sink)
+            .unwrap();
+        first.get_or_insert(rx);
+    }
+    let (sink, mut over) = record_channel(4);
+    live.sfu
+        .record_start("group", "one-too-many", "rec", Instant::now(), sink)
+        .unwrap();
+    assert!(matches!(over.try_recv(), Ok(RecordItem::Begin(_))));
+    assert!(matches!(
+        over.try_recv(),
+        Ok(RecordItem::End {
+            reason: RecordEnd::Refused,
+            ..
+        })
+    ));
+
+    // After ten seconds the next request sweeps them out.
+    std::thread::sleep(Duration::from_millis(10_500));
+    let (sink, mut sweeper) = record_channel(4);
+    live.sfu
+        .record_start("group", "fresh", "rec", Instant::now(), sink)
+        .unwrap();
+    let mut first = first.unwrap();
+    assert!(matches!(first.try_recv(), Ok(RecordItem::Begin(_))));
+    assert!(matches!(
+        first.try_recv(),
+        Ok(RecordItem::End {
+            reason: RecordEnd::Refused,
+            ..
+        })
+    ));
+    assert!(
+        sweeper.try_recv().is_err(),
+        "the new one waits, as the first did"
     );
 }

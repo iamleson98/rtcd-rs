@@ -224,6 +224,22 @@ fn layers_recorded(items: &[RecordItem]) -> Vec<(u32, u8)> {
         .collect()
 }
 
+/// Streams video for `secs` seconds, taking what the recording is handed every second as a
+/// writer does (one that took nothing for ten seconds would be let go of).
+fn stream_taking(
+    w: &mut World,
+    rx: &mut RecordReceiver,
+    taken: &mut Vec<RecordItem>,
+    a: usize,
+    secs: usize,
+    layers: &[Layer],
+) {
+    for _ in 0..secs {
+        w.stream_video(a, false, 1.0, 30, layers);
+        taken.extend(drain(rx));
+    }
+}
+
 #[test]
 fn a_camera_with_only_the_small_layer_is_recorded_after_a_moment() {
     let mut w = World::new();
@@ -250,11 +266,12 @@ fn a_camera_with_only_the_small_layer_is_recorded_after_a_moment() {
 fn a_camera_whose_large_layer_is_paused_is_recorded_at_the_small_one() {
     let mut w = World::new();
     let a = w.join_with_camera("alice", "call1");
-    let mut rx = start(&mut w, "call1", "rec1", 8192);
-    w.stream_video(a, false, 2.0, 30, &BOTH);
-    w.stream_video(a, false, 5.0, 30, &[Layer::Low]);
-    w.stream_video(a, false, 3.0, 30, &BOTH);
-    let items = drain(&mut rx);
+    let mut rx = start(&mut w, "call1", "rec1", 16384);
+    let mut items = Vec::new();
+    stream_taking(&mut w, &mut rx, &mut items, a, 2, &BOTH);
+    stream_taking(&mut w, &mut rx, &mut items, a, 5, &[Layer::Low]);
+    // The large layer is the choice again for ten seconds before the recording goes back to it.
+    stream_taking(&mut w, &mut rx, &mut items, a, 14, &BOTH);
     let layers = layers_recorded(&items);
     let (small, large) = (Layer::Low as u8 + 1, Layer::High as u8 + 1);
     // The large layer, then the small one while the large is paused, then the large again, each
@@ -452,13 +469,12 @@ fn a_call_that_is_recorded_under_another_id_refuses_and_the_same_id_changes_noth
     assert_eq!(names(&drain(&mut second)), ["begin rec2", "end Refused"]);
     assert_eq!(names(&drain(&mut first)), ["begin rec1"]);
 
-    // The same recording asked for again is the same recording: its new queue is let go.
+    // The same recording asked for again is the same recording: the new queue is told so.
     let mut again = start(&mut w, "call1", "rec1", 8);
-    assert!(drain(&mut again).is_empty());
-    assert!(matches!(
-        again.try_recv(),
-        Err(std::sync::mpsc::TryRecvError::Disconnected)
-    ));
+    assert_eq!(
+        names(&drain(&mut again)),
+        ["begin rec1", "end AlreadyRecording"]
+    );
     w.speak(a, 3, |_| 40);
     assert_eq!(
         packets(&drain(&mut first)).len(),
@@ -484,7 +500,10 @@ fn a_recording_asked_for_before_its_call_begins_with_the_first_session() {
 
     // The same request again is a no-op; another id for the same call is refused.
     let mut again = start(&mut w, "call1", "rec1", 8);
-    assert!(drain(&mut again).is_empty());
+    assert_eq!(
+        names(&drain(&mut again)),
+        ["begin rec1", "end AlreadyRecording"]
+    );
     let mut other = start(&mut w, "call1", "rec2", 8);
     assert_eq!(names(&drain(&mut other)), ["begin rec2", "end Refused"]);
 
@@ -546,4 +565,90 @@ fn a_writer_that_quits_is_let_go_of() {
             "{how}: and the new recording gets the speaker: {n:?}"
         );
     }
+}
+
+#[test]
+fn a_fluctuating_large_layer_does_not_cut_a_file_at_every_swing() {
+    let mut w = World::new();
+    let a = w.join_with_camera("alice", "call1");
+    let mut rx = start(&mut w, "call1", "rec1", 32768);
+    let mut items = Vec::new();
+    stream_taking(&mut w, &mut rx, &mut items, a, 3, &BOTH);
+    // The sender's large layer comes and goes every few seconds.
+    for _ in 0..4 {
+        stream_taking(&mut w, &mut rx, &mut items, a, 3, &[Layer::Low]);
+        stream_taking(&mut w, &mut rx, &mut items, a, 4, &BOTH);
+    }
+    let streams = opens(&items)
+        .iter()
+        .filter(|s| s.1 == TrackType::Video)
+        .count();
+    assert!(
+        streams <= 3,
+        "{streams} streams for a layer that never held for ten seconds: {:?}",
+        names(&items)
+            .iter()
+            .filter(|n| n.starts_with("open"))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_recording_that_waits_for_a_call_that_never_comes_gives_up() {
+    let mut w = World::new();
+    let mut rx = start(&mut w, "nowhere", "rec1", 64);
+    assert_eq!(names(&drain(&mut rx)), ["begin rec1"]);
+    let due = w
+        .engine
+        .poll_timeout()
+        .expect("the engine wakes to give up");
+    assert!(due <= w.now + Duration::from_secs(11));
+    // No session ever joins; time passes.
+    w.run_for(Duration::from_secs(12));
+    assert_eq!(names(&drain(&mut rx)), ["end Refused"]);
+    // And the call, when it does come, is not recorded.
+    let a = w.join("alice", "nowhere");
+    w.speak(a, 5, |_| 40);
+    assert!(drain(&mut rx).is_empty());
+}
+
+#[test]
+fn a_writer_that_takes_nothing_for_a_long_time_is_let_go_of() {
+    let mut w = World::new();
+    let a = w.join("alice", "call1");
+    let mut rx = start(&mut w, "call1", "rec1", 4);
+    w.speak(a, 30, |_| 40);
+    // The writer takes nothing: the queue stays full. After ten seconds the engine lets go.
+    w.speak(a, 600, |_| 40);
+    let mut next = start(&mut w, "call1", "rec2", 64);
+    assert_eq!(
+        names(&drain(&mut next))[0],
+        "begin rec2",
+        "the stalled recording is gone, so the call can be recorded again"
+    );
+    assert!(
+        drain(&mut rx).len() <= 4,
+        "and nothing more was queued for it"
+    );
+}
+
+#[test]
+fn an_ended_recording_whose_writer_never_takes_its_last_events_is_forgotten() {
+    let mut w = World::new();
+    let a = w.join("alice", "call1");
+    let rx = start(&mut w, "call1", "rec1", 2);
+    w.speak(a, 10, |_| 40);
+    w.engine.record_stop(w.now, "group", "call1", "rec1");
+    // The end waits for room, and the engine wakes to try again until its time is up.
+    assert!(w.engine.poll_timeout().is_some());
+    w.run_for(Duration::from_secs(12));
+    let mut next = start(&mut w, "call1", "rec2", 64);
+    assert_eq!(names(&drain(&mut next))[0], "begin rec2");
+    drop(rx);
+    assert!(
+        w.engine
+            .poll_timeout()
+            .is_none_or(|t| t < w.now + Duration::from_secs(2)),
+        "nothing keeps retrying for the dead recording"
+    );
 }
