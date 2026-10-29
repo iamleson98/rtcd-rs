@@ -1194,4 +1194,70 @@ mod tests {
         s.finish(start + Duration::from_secs(6), "test");
         assert_eq!(rec.files().len(), 2);
     }
+
+    const GOLDEN: [&str; 2] = [
+        "voice 1000-2040 0x0 757 66a7051f49b46422",
+        "camera 0-3000 640x360 658 2ecb611bfd328cce",
+    ];
+
+    /// FNV-1a: a stable fingerprint of a file's bytes, with no dependency.
+    fn fingerprint(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+            (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    /// The files a fixed feed leaves, as `kind start-end WxH length fingerprint`. The expected
+    /// lines were recorded before the muxing was made to take any packet source, so a change in
+    /// the bytes written (not only in their meaning) fails this test.
+    #[test]
+    fn a_fixed_feed_writes_the_same_files_byte_for_byte() {
+        let (rec, start) = setup("golden", u64::MAX);
+        let mut voice = voice(&rec);
+        // 25 packets of 20 ms, a 40 ms packet, a lost packet with a 300 ms hole, then 10 more.
+        speak(&mut voice, start + Duration::from_secs(1), 100, 0, 25);
+        voice.packet(
+            start + Duration::from_millis(1500),
+            opus(125, 25 * 960, &[0x10, 7, 7, 7]),
+        );
+        speak(
+            &mut voice,
+            start + Duration::from_millis(1840),
+            127,
+            27 * 960 + 15 * 960,
+            10,
+        );
+        voice.finish(start + Duration::from_millis(2200), "golden");
+        let mut camera = camera(&rec);
+        for i in 0..40u32 {
+            // Frame 15 never arrives: the picture is broken until the keyframe at 20.
+            if i == 15 {
+                continue;
+            }
+            camera.packet(
+                start + Duration::from_millis(66 * u64::from(i)),
+                vp8_frame(i as u16, i * 6000, i % 20 == 0),
+            );
+            camera.tick(start + Duration::from_millis(66 * u64::from(i)));
+        }
+        camera.finish(start + Duration::from_secs(3), "golden");
+        let got: Vec<String> = rec
+            .files()
+            .iter()
+            .map(|e| {
+                let bytes = std::fs::read(&e.path).unwrap();
+                format!(
+                    "{} {}-{} {}x{} {} {:016x}",
+                    e.kind,
+                    e.start_ms,
+                    e.end_ms,
+                    e.width,
+                    e.height,
+                    bytes.len(),
+                    fingerprint(&bytes)
+                )
+            })
+            .collect();
+        assert_eq!(got, GOLDEN, "{got:#?}");
+    }
 }
