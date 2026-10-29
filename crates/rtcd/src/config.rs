@@ -238,6 +238,14 @@ pub struct RecordConfig {
     /// reaches it ends cleanly (`disk_full`) with what it has. Leave room under the volume's size
     /// for the files being written and the recordings that run side by side.
     pub max_bytes: i64,
+    /// The most bytes of closed files this node holds waiting to be uploaded, all recordings
+    /// together. Above it recordings drop packets (each drop is a gap in the recording and is
+    /// counted) until uploads catch up, rather than ending. Files still being written are on top
+    /// of this.
+    pub max_pending_bytes: i64,
+    /// The rate, in megabits per second, at which this node uploads recordings, all of them
+    /// together: uploads must not compete with the media the node sends.
+    pub upload_mbps: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -335,6 +343,8 @@ impl Default for RecordConfig {
             enabled: false,
             data_dir: "/data/recordings".into(),
             max_bytes: 2 << 30,
+            max_pending_bytes: 1 << 30,
+            upload_mbps: 50,
         }
     }
 }
@@ -461,6 +471,8 @@ impl Config {
         boolean!("RECORD_ENABLED", self.record.enabled);
         text!("RECORD_DATADIR", self.record.data_dir);
         integer!("RECORD_MAXBYTES", self.record.max_bytes);
+        integer!("RECORD_MAXPENDINGBYTES", self.record.max_pending_bytes);
+        integer!("RECORD_UPLOADMBPS", self.record.upload_mbps);
         boolean!("LOGGER_ENABLECONSOLE", self.logger.enable_console);
         boolean!("LOGGER_CONSOLEJSON", self.logger.console_json);
         text!("LOGGER_CONSOLELEVEL", self.logger.console_level);
@@ -590,6 +602,15 @@ impl Config {
             }
             if self.record.max_bytes <= 0 {
                 return Err(invalid("RecordMaxBytes", "should be a positive number"));
+            }
+            if self.record.max_pending_bytes <= 0 {
+                return Err(invalid(
+                    "RecordMaxPendingBytes",
+                    "should be a positive number",
+                ));
+            }
+            if self.record.upload_mbps <= 0 {
+                return Err(invalid("RecordUploadMbps", "should be a positive number"));
             }
         }
         let lg = &self.logger;
@@ -752,6 +773,10 @@ mod tests {
         assert_eq!(c.store.data_source, "/tmp/rtcd_db");
         assert_eq!(c.api.security.session_cache.expiration_minutes, 1440);
         assert!(!c.record.enabled, "recording is off unless asked for");
+        assert_eq!(
+            (c.record.max_pending_bytes, c.record.upload_mbps),
+            (1 << 30, 50)
+        );
         c.validate().unwrap();
     }
 
@@ -873,31 +898,28 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
     #[test]
     fn recording_is_set_in_the_file_or_the_environment() {
         let mut c = Config::from_toml(
-            "[record]\nenabled = true\ndata_dir = \"/v/rec\"\nmax_bytes = 1000\n",
+            "[record]\nenabled = true\ndata_dir = \"/v/rec\"\nmax_bytes = 1000\nmax_pending_bytes = 2000\nupload_mbps = 8\n",
         )
         .unwrap();
-        assert_eq!(
+        let seen = |c: &Config| {
             (
                 c.record.enabled,
-                c.record.data_dir.as_str(),
-                c.record.max_bytes
-            ),
-            (true, "/v/rec", 1000)
-        );
+                c.record.data_dir.clone(),
+                c.record.max_bytes,
+                c.record.max_pending_bytes,
+                c.record.upload_mbps,
+            )
+        };
+        assert_eq!(seen(&c), (true, "/v/rec".into(), 1000, 2000, 8));
         c.apply_env(&env(&[
             ("RTCD_RECORD_ENABLED", "false"),
             ("RTCD_RECORD_DATADIR", "/other"),
             ("RTCD_RECORD_MAXBYTES", "5000"),
+            ("RTCD_RECORD_MAXPENDINGBYTES", "6000"),
+            ("RTCD_RECORD_UPLOADMBPS", "20"),
         ]))
         .unwrap();
-        assert_eq!(
-            (
-                c.record.enabled,
-                c.record.data_dir.as_str(),
-                c.record.max_bytes
-            ),
-            (false, "/other", 5000)
-        );
+        assert_eq!(seen(&c), (false, "/other".into(), 5000, 6000, 20));
     }
 
     #[test]
@@ -989,6 +1011,20 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
                 c.record.max_bytes = 0;
             })
             .contains("RecordMaxBytes")
+        );
+        assert!(
+            bad(&|c| {
+                c.record.enabled = true;
+                c.record.max_pending_bytes = 0;
+            })
+            .contains("RecordMaxPendingBytes")
+        );
+        assert!(
+            bad(&|c| {
+                c.record.enabled = true;
+                c.record.upload_mbps = 0;
+            })
+            .contains("RecordUploadMbps")
         );
         let mut off = Config::default();
         off.record.max_bytes = 0;
