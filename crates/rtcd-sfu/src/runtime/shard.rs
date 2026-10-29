@@ -18,9 +18,10 @@ use super::EventSink;
 use super::config::SfuConfig;
 use super::directory::Directory;
 use super::registry::Registry;
+use super::scaler::{Level, Pressure};
 use super::table::ShardTable;
 use super::tcp::TcpConn;
-use crate::engine::{Command, Engine, Event, FastMap, Proto, RouteUpdate};
+use crate::engine::{Command, Engine, Event, FastMap, Load, Proto, RouteUpdate};
 use crate::metrics::{Metrics, NetTraffic};
 
 const WAKER: Token = Token(0);
@@ -38,6 +39,11 @@ const SWEEP_EVERY: Duration = Duration::from_secs(1);
 const BUSY_WINDOW: Duration = Duration::from_secs(1);
 /// The busy fraction is published in parts per thousand.
 const BUSY_SCALE: f32 = 1000.0;
+/// Set in the published value while the shard is shedding load, and while it is saturated (see
+/// `Pressure`).
+const PRESSURE_FLAG: u32 = 1 << 31;
+const SATURATED_FLAG: u32 = 1 << 30;
+const FLAGS: u32 = PRESSURE_FLAG | SATURATED_FLAG;
 
 /// A datagram another shard read and found to be this one's.
 #[derive(Debug)]
@@ -95,7 +101,18 @@ impl ShardHandle {
 
     /// How busy the shard has been lately, 0 to 1.
     pub fn busy(&self) -> f32 {
-        self.busy.load(Ordering::Relaxed) as f32 / BUSY_SCALE
+        (self.busy.load(Ordering::Relaxed) & !FLAGS) as f32 / BUSY_SCALE
+    }
+
+    /// Whether the shard has no room left and is shedding load: its receivers are held to the
+    /// small video layers and its calls forward fewer voices.
+    pub fn pressured(&self) -> bool {
+        self.busy.load(Ordering::Relaxed) & PRESSURE_FLAG != 0
+    }
+
+    /// Whether the shard is at its limit and refuses new sessions.
+    pub fn saturated(&self) -> bool {
+        self.busy.load(Ordering::Relaxed) & SATURATED_FLAG != 0
     }
 
     /// Queues a command and wakes the shard; fails if its queue is full or it has stopped.
@@ -183,6 +200,7 @@ pub(crate) struct Shard {
     /// Time spent working since `window_start`.
     worked: Duration,
     window_start: Instant,
+    pressure: Pressure,
     stopping: bool,
     next_sweep: Instant,
 }
@@ -237,6 +255,7 @@ impl Shard {
             busy,
             worked: Duration::ZERO,
             window_start: Instant::now(),
+            pressure: Pressure::default(),
             stopping: false,
             next_sweep: Instant::now() + SWEEP_EVERY,
         })
@@ -304,8 +323,19 @@ impl Shard {
         let window = done.saturating_duration_since(self.window_start);
         if window >= BUSY_WINDOW {
             let fraction = (self.worked.as_secs_f32() / window.as_secs_f32()).clamp(0.0, 1.0);
+            let level = self.pressure.update(fraction);
+            self.engine.set_load(match level {
+                Level::Ok => Load::Ok,
+                Level::Shedding => Load::Shedding,
+                Level::Saturated => Load::Saturated,
+            });
+            let flags = match level {
+                Level::Ok => 0,
+                Level::Shedding => PRESSURE_FLAG,
+                Level::Saturated => PRESSURE_FLAG | SATURATED_FLAG,
+            };
             self.busy
-                .store((fraction * BUSY_SCALE) as u32, Ordering::Relaxed);
+                .store((fraction * BUSY_SCALE) as u32 | flags, Ordering::Relaxed);
             self.worked = Duration::ZERO;
             self.window_start = done;
         }

@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use rtcd_proto::SessionConfig;
 
@@ -15,7 +16,17 @@ pub enum AdmitError {
     ShuttingDown,
     #[error("no shard is running to serve the session")]
     NoShard,
+    #[error("every shard that could serve the session is at its limit")]
+    Saturated,
 }
+
+/// How long after its last session left a call a participant counts as coming back to it.
+const RETURN_WINDOW: Duration = Duration::from_secs(60);
+/// Departures are remembered in a map that is swept once it has this many.
+const SWEEP_AT: usize = 1024;
+
+/// A participant of a call: its group, call and user.
+type Member = (String, String, String);
 
 #[derive(Debug)]
 struct Entry {
@@ -34,6 +45,10 @@ struct State {
     load: Vec<usize>,
     /// Which slots have a shard that takes new sessions.
     active: Vec<bool>,
+    /// When each participant's last session left its call.
+    left: HashMap<Member, Instant>,
+    /// The size of `left` at which it is swept next (at least `SWEEP_AT`).
+    sweep_at: usize,
     closing: bool,
 }
 
@@ -87,6 +102,18 @@ impl Registry {
     /// Records a new session and returns the shard to serve it: the one its call lives on, else
     /// the running one with the fewest sessions.
     pub fn admit(&self, cfg: &SessionConfig) -> Result<usize, AdmitError> {
+        self.admit_unless(cfg, &|_| false)
+    }
+
+    /// Like [`admit`](Self::admit), but refuses a session whose shard is `saturated` (the one its
+    /// call lives on, or for a new call every shard that takes new sessions): a shard at its
+    /// limit loses packets for every call on it, and the sessions it has are all it can serve. A
+    /// new call goes to the emptiest shard that is not saturated.
+    pub fn admit_unless(
+        &self,
+        cfg: &SessionConfig,
+        saturated: &dyn Fn(usize) -> bool,
+    ) -> Result<usize, AdmitError> {
         let mut st = self.lock();
         if st.closing {
             return Err(AdmitError::ShuttingDown);
@@ -95,15 +122,59 @@ impl Registry {
             return Err(AdmitError::Duplicate);
         }
         let call = (cfg.group_id.clone(), cfg.call_id.clone());
+        // The call's host and its recorder are never refused: without the teacher a class cannot
+        // start, or goes on without one (a teacher whose connection dropped comes back as a new
+        // session), and without the recorder it is not recorded. Nor is a participant who is
+        // already in the call or has just left it: a student whose connection dropped comes back
+        // as a new session too, and is not a newcomer the shard has to keep out.
+        let host = cfg.props.takes_priority();
+        // Only asked of a participant who would otherwise be refused.
+        let returning = |ids: &HashSet<String>| {
+            !cfg.user_id.is_empty()
+                && (st
+                    .left
+                    .get(&(
+                        cfg.group_id.clone(),
+                        cfg.call_id.clone(),
+                        cfg.user_id.clone(),
+                    ))
+                    .is_some_and(|t| t.elapsed() < RETURN_WINDOW)
+                    || ids.iter().any(|id| {
+                        st.sessions
+                            .get(id)
+                            .is_some_and(|e| e.cfg.user_id == cfg.user_id)
+                    }))
+        };
         let shard = match st.calls.get(&call) {
+            Some((shard, ids)) if saturated(*shard) && !host && !returning(ids) => {
+                return Err(AdmitError::Saturated);
+            }
             Some((shard, _)) => *shard,
-            None => Self::weights(&st)
-                .into_iter()
-                .enumerate()
-                .filter(|&(i, _)| st.active[i])
-                .min_by_key(|&(_, n)| n)
-                .map(|(i, _)| i)
-                .ok_or(AdmitError::NoShard)?,
+            None => {
+                let open: Vec<(usize, usize)> = Self::weights(&st)
+                    .into_iter()
+                    .enumerate()
+                    .filter(|&(i, _)| st.active[i])
+                    .collect();
+                if open.is_empty() {
+                    return Err(AdmitError::NoShard);
+                }
+                let with_room = open
+                    .iter()
+                    .copied()
+                    .filter(|&(i, _)| !saturated(i))
+                    .min_by_key(|&(_, n)| n);
+                match with_room {
+                    Some((i, _)) => i,
+                    // Every shard is saturated: only the host starts a call, on the emptiest.
+                    None if host => open
+                        .into_iter()
+                        .min_by_key(|&(_, n)| n)
+                        .map(|(i, _)| i)
+                        .ok_or(AdmitError::NoShard)?,
+                    None => return Err(AdmitError::Saturated),
+                }
+            }
         };
         st.load[shard] += 1;
         st.calls
@@ -128,6 +199,22 @@ impl Registry {
             return false;
         };
         st.load[entry.shard] -= 1;
+        let now = Instant::now();
+        if st.left.len() >= st.sweep_at.max(SWEEP_AT) {
+            st.left
+                .retain(|_, t| now.saturating_duration_since(*t) < RETURN_WINDOW);
+            // The next sweep waits for the map to double, so a class ending does not sweep it at
+            // every release.
+            st.sweep_at = 2 * st.left.len();
+        }
+        st.left.insert(
+            (
+                entry.cfg.group_id.clone(),
+                entry.cfg.call_id.clone(),
+                entry.cfg.user_id.clone(),
+            ),
+            now,
+        );
         let call = (entry.cfg.group_id, entry.cfg.call_id);
         if let Some((_, members)) = st.calls.get_mut(&call) {
             members.remove(session_id);
@@ -256,10 +343,138 @@ mod tests {
         SessionConfig {
             group_id: "g".into(),
             call_id: call.into(),
-            user_id: "u".into(),
+            user_id: format!("user-{session}"),
             session_id: session.into(),
             ..Default::default()
         }
+    }
+
+    /// A session of the participant `user`.
+    fn cfg_of(user: &str, call: &str, session: &str) -> SessionConfig {
+        SessionConfig {
+            user_id: user.into(),
+            ..cfg(call, session)
+        }
+    }
+
+    #[test]
+    fn a_saturated_shard_refuses_new_sessions_and_new_calls_go_to_a_shard_with_room() {
+        let r = Registry::new(2);
+        let a = r.admit(&cfg("c1", "s1")).unwrap();
+        let saturated = |slot: usize| slot == a;
+        assert_eq!(
+            r.admit_unless(&cfg("c1", "s2"), &saturated),
+            Err(AdmitError::Saturated),
+            "a call cannot move: its next participant is refused"
+        );
+        let b = r.admit_unless(&cfg("c2", "s3"), &saturated).unwrap();
+        assert_ne!(a, b, "a new call goes where there is room");
+        assert_eq!(r.len(), 2, "nothing is recorded for the refused one");
+        assert_eq!(
+            r.admit_unless(&cfg("c3", "s4"), &|_| true),
+            Err(AdmitError::Saturated),
+            "every shard is at its limit"
+        );
+        assert!(
+            r.admit_unless(&cfg("c1", "s5"), &|_| false).is_ok(),
+            "and room again"
+        );
+    }
+
+    #[test]
+    fn a_participant_coming_back_is_not_refused_by_a_saturated_shard() {
+        let r = Registry::new(2);
+        let a = r.admit(&cfg_of("ann", "c1", "s1")).unwrap();
+        let saturated = |slot: usize| slot == a;
+        // Ann's connection dropped and she is back before her old session was noticed to be gone.
+        assert_eq!(
+            r.admit_unless(&cfg_of("ann", "c1", "s2"), &saturated),
+            Ok(a)
+        );
+        // Her old sessions end; she comes back again after both are gone.
+        r.release("s1");
+        r.release("s2");
+        r.admit(&cfg_of("bob", "c1", "s3")).unwrap();
+        assert_eq!(
+            r.admit_unless(&cfg_of("ann", "c1", "s4"), &saturated),
+            Ok(a),
+            "she left a moment ago"
+        );
+        assert_eq!(
+            r.admit_unless(&cfg_of("cat", "c1", "s5"), &saturated),
+            Err(AdmitError::Saturated),
+            "someone new is still refused"
+        );
+        assert_eq!(
+            r.admit_unless(&cfg_of("ann", "c2", "s6"), &saturated)
+                .map(|_| ()),
+            Ok(()),
+            "another call is another matter, and finds room on the other shard"
+        );
+    }
+
+    #[test]
+    fn participants_with_no_user_id_are_not_taken_for_each_other() {
+        let r = Registry::new(2);
+        let a = r.admit(&cfg_of("", "c1", "s1")).unwrap();
+        let saturated = |slot: usize| slot == a;
+        assert_eq!(
+            r.admit_unless(&cfg_of("", "c1", "s2"), &saturated),
+            Err(AdmitError::Saturated)
+        );
+    }
+
+    #[test]
+    fn the_host_is_never_refused_by_a_saturated_shard() {
+        let host = |call: &str, session: &str| {
+            SessionConfig::from_join(
+                "g",
+                &rtcd_proto::JoinRequest {
+                    call_id: call.into(),
+                    user_id: "teacher".into(),
+                    session_id: session.into(),
+                    host: true,
+                    ..Default::default()
+                },
+            )
+        };
+        let r = Registry::new(2);
+        let a = r.admit(&cfg("c1", "s1")).unwrap();
+        let saturated = |slot: usize| slot == a;
+        assert_eq!(
+            r.admit_unless(&cfg("c1", "s2"), &saturated),
+            Err(AdmitError::Saturated),
+            "a student is refused"
+        );
+        assert_eq!(
+            r.admit_unless(&host("c1", "teacher"), &saturated),
+            Ok(a),
+            "the teacher of that class is not"
+        );
+        assert_eq!(
+            r.admit_unless(&cfg("c2", "s3"), &|_| true),
+            Err(AdmitError::Saturated),
+            "nobody else starts a call on a node whose shards are all saturated"
+        );
+        assert!(
+            r.admit_unless(&host("c2", "teacher2"), &|_| true).is_ok(),
+            "a teacher does, on the emptiest shard"
+        );
+        let recorder = SessionConfig::from_join(
+            "g",
+            &rtcd_proto::JoinRequest {
+                call_id: "c1".into(),
+                user_id: "recorder".into(),
+                session_id: "rec".into(),
+                observer: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            r.admit_unless(&recorder, &saturated),
+            Ok(a),
+            "and so is the recorder of a class on a saturated shard"
+        );
     }
 
     #[test]

@@ -278,7 +278,8 @@ impl Engine {
         let Some(desc) = s.pc.local_description() else {
             return;
         };
-        let json = serde_json::json!({ "type": desc.sdp_type.to_string(), "sdp": with_opus_dtx(&desc.sdp) });
+        let sdp = with_audio_ptime(&with_opus_dtx(&desc.sdp), self.cfg.audio_ptime_ms);
+        let json = serde_json::json!({ "type": desc.sdp_type.to_string(), "sdp": sdp });
         let data = json.to_string().into_bytes();
         match via {
             Channel::Ws => self.emit(key, MessageType::Sdp, data),
@@ -472,9 +473,43 @@ pub(crate) fn with_opus_dtx(sdp: &str) -> String {
         .join("\r\n")
 }
 
+/// Asks the participant to send its voice in packets of `ms` milliseconds, by writing `a=ptime`
+/// and `a=maxptime` into every audio section the SFU receives on (0 changes nothing).
+///
+/// Browsers apply the packet time of the description they are given to what they send, so this is
+/// how a node with many open microphones halves the packets they cost (40 ms), at 20 ms more delay.
+/// Sections the SFU only sends on are left alone: what it forwards keeps the packet time it came
+/// with. Like [`with_opus_dtx`], only the copy sent to the participant carries it.
+pub(crate) fn with_audio_ptime(sdp: &str, ms: u32) -> String {
+    if ms == 0 {
+        return sdp.to_owned();
+    }
+    // Split at "\r\nm=": every section but the last has lost its closing line break.
+    let sections: Vec<&str> = sdp.split("\r\nm=").collect();
+    let last = sections.len() - 1;
+    sections
+        .iter()
+        .enumerate()
+        .map(|(i, section)| {
+            let receives = section.contains("\r\na=recvonly") || section.contains("\r\na=sendrecv");
+            if i == 0
+                || !section.starts_with("audio ")
+                || !receives
+                || section.contains("\r\na=ptime:")
+            {
+                return (*section).to_owned();
+            }
+            let body = section.strip_suffix("\r\n").unwrap_or(section);
+            let end = if i == last { "\r\n" } else { "" };
+            format!("{body}\r\na=ptime:{ms}\r\na=maxptime:{ms}{end}")
+        })
+        .collect::<Vec<_>>()
+        .join("\r\nm=")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::with_opus_dtx;
+    use super::{with_audio_ptime, with_opus_dtx};
 
     #[test]
     fn dtx_is_added_to_opus_only() {
@@ -497,5 +532,43 @@ mod tests {
     fn a_description_without_opus_is_unchanged() {
         let sdp = "a=rtpmap:96 VP8/90000\r\na=fmtp:96 a=b\r\n";
         assert_eq!(with_opus_dtx(sdp), sdp);
+    }
+
+    const BROWSER_ANSWER: &str = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=recvonly\r\na=rtpmap:111 opus/48000/2\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\na=recvonly\r\na=rtpmap:96 VP8/90000\r\n";
+
+    #[test]
+    fn the_packet_time_is_written_into_audio_the_sfu_receives() {
+        let out = with_audio_ptime(BROWSER_ANSWER, 40);
+        assert!(
+            out.contains("a=rtpmap:111 opus/48000/2\r\na=ptime:40\r\na=maxptime:40\r\nm=video"),
+            "{out}"
+        );
+        assert_eq!(
+            out.matches("a=ptime").count(),
+            1,
+            "the video section has none"
+        );
+        assert!(out.ends_with("a=rtpmap:96 VP8/90000\r\n"), "{out}");
+    }
+
+    #[test]
+    fn the_packet_time_is_written_into_the_last_section_too() {
+        let sdp = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=sendonly\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendrecv\r\n";
+        assert!(
+            with_audio_ptime(sdp, 60).ends_with("a=sendrecv\r\na=ptime:60\r\na=maxptime:60\r\n")
+        );
+    }
+
+    #[test]
+    fn audio_the_sfu_only_sends_keeps_its_packet_time() {
+        let sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendonly\r\n";
+        assert_eq!(with_audio_ptime(sdp, 40), sdp);
+    }
+
+    #[test]
+    fn a_packet_time_already_there_is_kept_and_zero_changes_nothing() {
+        let sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=recvonly\r\na=ptime:20\r\n";
+        assert_eq!(with_audio_ptime(sdp, 40), sdp);
+        assert_eq!(with_audio_ptime(BROWSER_ANSWER, 0), BROWSER_ANSWER);
     }
 }

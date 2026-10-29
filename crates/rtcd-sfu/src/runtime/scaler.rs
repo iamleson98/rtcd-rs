@@ -46,6 +46,10 @@ pub struct ScalingPolicy {
     /// call is placed. Counting what a call will bring spreads them. A call with more sessions
     /// counts for what it has.
     pub expected_call_size: usize,
+    /// How many shards are always kept, however long they have been empty. With one, a class that
+    /// starts at the bell lands entirely on the only shard (calls are placed before the first
+    /// participant arrives, and a call cannot move), where two share it.
+    pub min_shards: usize,
 }
 
 impl Default for ScalingPolicy {
@@ -57,6 +61,7 @@ impl Default for ScalingPolicy {
             empty_for: EMPTY_FOR,
             sessions_per_shard: SESSIONS_PER_SHARD,
             expected_call_size: EXPECTED_CALL_SIZE,
+            min_shards: 1,
         }
     }
 }
@@ -125,7 +130,7 @@ impl Scaler {
 
         // Give one back when it has been empty long enough and the rest are not hot: stopping
         // one just before the load needs it again would only be a restart.
-        if shards.len() > 1 {
+        if shards.len() > self.policy.min_shards.max(1) {
             let hot = self.policy.hot;
             let rest_cool = |slot: usize| {
                 shards
@@ -154,6 +159,75 @@ impl Scaler {
             }
         }
         Step::Hold
+    }
+}
+
+/// A shard at this fraction of its time working for [`PRESSURE_FOR`] has no room left.
+const PRESSURE_AT: f32 = 0.9;
+const PRESSURE_FOR: u32 = 2;
+/// And has room again below this fraction for [`RELEASE_FOR`]: long, because what it shed is what
+/// brought it down, and giving it back at once would bring the shard straight back up.
+const PRESSURE_RELEASE: f32 = 0.7;
+const RELEASE_FOR: u32 = 30;
+/// A shard this close to all of its time working for [`SATURATED_FOR`] is at the edge of a cliff:
+/// measured, a thread at 97 % lost 0.2 % of its packets and at 100 % a third, because losses are
+/// asked for again and the thread has no time left for them. The sessions it has are all it
+/// should serve, and it must ease off before it reaches 100 %.
+const SATURATED_AT: f32 = 0.95;
+const SATURATED_FOR: u32 = 3;
+/// It leaves that state after this many seconds under [`PRESSURE_AT`].
+const SATURATED_RELEASE_FOR: u32 = 10;
+
+/// How much a shard is asked for compared with what its thread can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Level {
+    /// Room to spare.
+    #[default]
+    Ok,
+    /// No room left: its receivers are held to the small video layers and its calls forward two
+    /// voices at most.
+    Shedding,
+    /// Shedding is not enough: the thread is at its limit and the shard refuses new sessions, so
+    /// the ones it has keep their quality instead of everyone losing packets.
+    Saturated,
+}
+
+/// The [`Level`] of one shard, from the busy fraction it reports once a second. A call lives on
+/// one shard and cannot move, so a shard past its limit drops packets for every call on it at
+/// once while another shard may be idle: it has to ask less of what it carries, and past that
+/// take no more.
+#[derive(Debug, Default)]
+pub(crate) struct Pressure {
+    /// Readings in a row at or over [`PRESSURE_AT`], [`SATURATED_AT`], under [`PRESSURE_AT`] and
+    /// under [`PRESSURE_RELEASE`].
+    hot: u32,
+    full: u32,
+    below: u32,
+    calm: u32,
+    level: Level,
+}
+
+impl Pressure {
+    /// Takes one more reading and returns the shard's level.
+    pub fn update(&mut self, busy: f32) -> Level {
+        let run = |count: u32, holds: bool| if holds { count + 1 } else { 0 };
+        self.hot = run(self.hot, busy >= PRESSURE_AT);
+        self.full = run(self.full, busy >= SATURATED_AT);
+        self.below = run(self.below, busy < PRESSURE_AT);
+        self.calm = run(self.calm, busy < PRESSURE_RELEASE);
+        self.level = if self.full >= SATURATED_FOR {
+            Level::Saturated
+        } else {
+            match self.level {
+                Level::Ok if self.hot >= PRESSURE_FOR => Level::Shedding,
+                // Out of the harder level once clearly under the shedding mark for a while; it
+                // keeps shedding, since what it sheds is what holds it down.
+                Level::Saturated if self.below >= SATURATED_RELEASE_FOR => Level::Shedding,
+                Level::Shedding if self.calm >= RELEASE_FOR => Level::Ok,
+                level => level,
+            }
+        };
+        self.level
     }
 }
 
@@ -281,5 +355,82 @@ mod tests {
         let shards = [load(0, 0.9, 300), load(1, 0.0, 0)];
         s.step(t, &shards, 3);
         assert_eq!(s.step(t + EMPTY_FOR * 2, &shards, 3), Step::Hold);
+    }
+
+    #[test]
+    fn a_shard_with_no_room_for_a_few_seconds_is_shedding_and_stays_so_for_a_while() {
+        let mut p = Pressure::default();
+        assert_eq!(p.update(0.95), Level::Ok, "one hot second is a burst");
+        assert_eq!(p.update(0.95), Level::Shedding, "two are not");
+        for _ in 0..29 {
+            assert_eq!(
+                p.update(0.3),
+                Level::Shedding,
+                "what it shed is what brought it down"
+            );
+        }
+        assert_eq!(p.update(0.3), Level::Ok, "thirty calm seconds give it back");
+    }
+
+    #[test]
+    fn a_shard_hovering_between_the_marks_neither_enters_nor_leaves() {
+        let mut p = Pressure::default();
+        for _ in 0..60 {
+            assert_eq!(p.update(0.8), Level::Ok);
+        }
+        p.update(0.95);
+        assert_eq!(p.update(0.95), Level::Shedding);
+        for _ in 0..60 {
+            assert_eq!(p.update(0.8), Level::Shedding);
+        }
+    }
+
+    #[test]
+    fn a_thread_at_its_limit_refuses_new_sessions_until_it_has_eased_for_a_while() {
+        let mut p = Pressure::default();
+        for _ in 0..2 {
+            p.update(1.0);
+        }
+        assert_eq!(
+            p.update(1.0),
+            Level::Saturated,
+            "three seconds at the limit"
+        );
+        // Eases a little, still hot: not released.
+        for _ in 0..30 {
+            assert_eq!(p.update(0.93), Level::Saturated);
+        }
+        for _ in 0..9 {
+            assert_eq!(p.update(0.8), Level::Saturated);
+        }
+        assert_eq!(
+            p.update(0.8),
+            Level::Shedding,
+            "ten seconds under the shedding mark"
+        );
+        assert_eq!(
+            p.update(0.99),
+            Level::Shedding,
+            "a single reading at the limit is a burst"
+        );
+    }
+
+    #[test]
+    fn the_shards_that_are_always_kept_are_not_retired() {
+        let t = Instant::now();
+        let policy = ScalingPolicy {
+            min_shards: 2,
+            ..ScalingPolicy::default()
+        };
+        let mut s = Scaler::new(4, policy);
+        let idle = [load(0, 0.0, 0), load(1, 0.0, 0)];
+        let steps = ticks(&mut s, t, 0, 200, &idle, 3);
+        assert!(steps.iter().all(|s| *s == Step::Hold), "two shards stay");
+        let three = [load(0, 0.0, 0), load(1, 0.0, 0), load(2, 0.0, 0)];
+        let steps = ticks(&mut s, t, 200, 200, &three, 3);
+        assert!(
+            steps.contains(&Step::Retire(2)),
+            "the one above the floor goes"
+        );
     }
 }

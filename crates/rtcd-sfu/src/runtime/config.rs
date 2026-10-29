@@ -34,6 +34,9 @@ pub struct SfuConfig {
     pub tcp_idle_timeout: Duration,
     /// Bytes queued for a TCP connection that does not read before it is closed.
     pub tcp_write_limit: usize,
+    /// Whether a session is refused while its shard is saturated (see `scaler::Level`), so the
+    /// sessions the shard has keep their quality instead of every call on it losing packets.
+    pub refuse_when_saturated: bool,
 }
 
 impl Default for SfuConfig {
@@ -49,6 +52,7 @@ impl Default for SfuConfig {
             tcp_handshake_timeout: Duration::from_secs(5),
             tcp_idle_timeout: Duration::from_secs(60),
             tcp_write_limit: 4 * 1024 * 1024,
+            refuse_when_saturated: true,
         }
     }
 }

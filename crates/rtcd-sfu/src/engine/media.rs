@@ -37,6 +37,9 @@ pub(crate) struct Fan {
     pub vp8: bool,
     /// What the stream carries, for the uplink counter.
     pub ty: TrackType,
+    /// The next packet follows a stretch that was left out: receivers carry on their sequence
+    /// numbers from where they were.
+    pub resume: bool,
 }
 
 #[derive(Deserialize)]
@@ -170,32 +173,70 @@ impl Engine {
         src.last_packet = Some(now);
         match src.ty {
             TrackType::Voice => {
-                let muted = s.up.muted;
-                if let (Some(id), Some(vad)) = (ext_id, s.up.vad.as_mut())
-                    && let Some(level) = packet
+                if s.up.muted {
+                    src.gap = true;
+                    return false;
+                }
+                // The level is the low seven bits; the top bit says whether the frame is voice.
+                let level = ext_id.and_then(|id| {
+                    packet
                         .header
                         .get_extension_payload(id)
                         .and_then(|e| e.first())
+                        .map(|b| b & 0x7f)
+                });
+                if let (Some(level), Some(vad)) = (level, s.up.vad.as_mut())
+                    && let Some(on) = vad.push_packet(level, packet.header.timestamp, now)
                 {
-                    // The level is the low seven bits; the top bit says whether the frame is voice.
-                    if let Some(on) = vad.push_packet(level & 0x7f, packet.header.timestamp, now) {
-                        self.emit(
-                            key,
-                            if on {
-                                MessageType::VoiceOn
-                            } else {
-                                MessageType::VoiceOff
-                            },
-                            Vec::new(),
-                        );
-                    }
+                    self.emit(
+                        key,
+                        if on {
+                            MessageType::VoiceOn
+                        } else {
+                            MessageType::VoiceOff
+                        },
+                        Vec::new(),
+                    );
                 }
-                !muted
+                // A sender that reports no level cannot be ranked: it is always forwarded.
+                let forward = match (level, self.sessions.get(key)) {
+                    (Some(level), Some(s)) => self
+                        .calls
+                        .get_mut(&s.call)
+                        .is_none_or(|c| c.voices.hear(key, level, now)),
+                    _ => true,
+                };
+                self.note_voice_gap(key, source, forward);
+                forward
             }
             TrackType::ScreenAudio => true,
             TrackType::Screen | TrackType::Video => {
                 src.rate.push(now, packet.marshal_size());
                 true
+            }
+        }
+    }
+
+    /// Remembers that a voice was left out, and when it comes back tells its receivers to carry on
+    /// their sequence numbers (see `Rewriter::resume_after_gap`): otherwise a listener sees the
+    /// packets left out as lost, at the first syllable of every turn.
+    fn note_voice_gap(&mut self, key: SessionKey, source: u32, forwarded: bool) {
+        let Some(src) = self
+            .sessions
+            .get_mut(key)
+            .and_then(|s| s.up.sources.iter_mut().find(|x| x.id == source))
+        else {
+            return;
+        };
+        if !forwarded {
+            src.gap = true;
+        } else if src.gap {
+            src.gap = false;
+            if let Some(fan) = self.fanout.get_mut(&SourceKey {
+                session: key,
+                source,
+            }) {
+                fan.resume = true;
             }
         }
     }
@@ -288,6 +329,7 @@ impl Engine {
             rate: RateMonitor::new(window),
             last_packet: Some(now),
             last_pli: None,
+            gap: false,
         });
         info!(session = %s.cfg.session_id, %ty, ?layer, ssrc = init.ssrc, "track received");
         self.metrics
@@ -302,6 +344,7 @@ impl Engine {
                 waiting: Vec::new(),
                 vp8: is_vp8,
                 ty,
+                resume: false,
             },
         );
 
@@ -539,9 +582,11 @@ impl Engine {
                 session: key,
                 source,
             };
-            let Some(fan) = self.fanout.get(&sk) else {
+            let Some(fan) = self.fanout.get_mut(&sk) else {
                 continue;
             };
+            let resume = std::mem::take(&mut fan.resume);
+            let fan = &*fan;
             // The uplink counts whether or not anyone receives the stream.
             let size = packet.marshal_size() as u64;
             self.metrics.rtp_bytes_received(fan.ty, size);
@@ -553,6 +598,7 @@ impl Engine {
             packet.header.extensions.clear();
             let size = packet.marshal_size() as u64;
             let mut sent = [0u64; 4];
+            let mut writes = 0u64;
             let mut switched = Vec::new();
 
             // Receivers waiting for this stream join it at a keyframe (any packet, for codecs whose
@@ -573,6 +619,7 @@ impl Engine {
                         sent[type_slot(
                             r.down.get(sub.stream).map_or(TrackType::Video, |d| d.ty),
                         )] += size;
+                        writes += 1;
                     }
                     switched.push(sub);
                 }
@@ -585,10 +632,14 @@ impl Engine {
                     continue;
                 };
                 let started = (timed && n == 0).then(Instant::now);
+                if resume && let Some(ds) = r.down.get_mut(sub.stream) {
+                    ds.rewrite.resume_after_gap(&packet);
+                }
                 let wrote = write_down(r, sub, &packet, now, &mut self.dirty);
                 let ty = r.down.get(sub.stream).map_or(TrackType::Voice, |d| d.ty);
                 if wrote {
                     sent[type_slot(ty)] += size;
+                    writes += 1;
                 }
                 if let Some(started) = started {
                     self.metrics
@@ -600,6 +651,10 @@ impl Engine {
                     self.metrics.rtp_bytes_sent(ty, sent[type_slot(ty)]);
                 }
             }
+            // What the node's budget counts is on the wire: the IP and UDP headers add 28 bytes.
+            self.cfg
+                .egress
+                .add(sent.iter().sum::<u64>() + writes * 28, writes);
             for sub in switched {
                 self.complete_switch(sk, sub);
             }
@@ -637,10 +692,16 @@ impl Engine {
             return;
         };
         s.up.muted = muted;
+        let voice_ended = muted && s.up.vad.as_mut().is_some_and(Monitor::reset);
         if muted
-            && let Some(vad) = s.up.vad.as_mut()
-            && vad.reset()
+            && let Some(id) = self.call_id_of(key)
+            && let Some(call) = self.calls.get_mut(&id)
         {
+            // Its slot among the loudest voices is free for whoever answers, not held until the
+            // last loudness it had has aged out.
+            call.voices.remove(key);
+        }
+        if voice_ended {
             self.emit(key, MessageType::VoiceOff, Vec::new());
         }
         debug!(session = %self.session_id(key), muted, "microphone state");

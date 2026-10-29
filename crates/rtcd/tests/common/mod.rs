@@ -155,6 +155,8 @@ impl WsClient {
             channel_id: "channel".into(),
             av1_support: false,
             dc_signaling: true,
+            host: false,
+            observer: false,
         }))
         .await;
     }

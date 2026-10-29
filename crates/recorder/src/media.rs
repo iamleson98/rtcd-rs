@@ -204,6 +204,32 @@ impl std::fmt::Debug for StreamRecorder {
 const OPUS_SILENCE: [u8; 3] = [0xf8, 0xff, 0xfe];
 const OPUS_FRAME_MS: i64 = 20;
 
+/// How much audio an Opus packet holds, in milliseconds, from its table of contents (RFC 6716
+/// section 3.1): the frame size its config names times the number of frames. A packet that cannot be
+/// read counts as one 20 ms frame.
+fn opus_packet_ms(data: &[u8]) -> i64 {
+    let Some(&toc) = data.first() else {
+        return OPUS_FRAME_MS;
+    };
+    let config = usize::from(toc >> 3);
+    // Samples of a frame at 48 kHz: SILK 10, 20, 40 or 60 ms; hybrid 10 or 20 ms; CELT 2.5, 5, 10
+    // or 20 ms.
+    let frame_samples: i64 = match config {
+        0..=11 => [480, 960, 1920, 2880][config % 4],
+        12..=15 => [480, 960][config % 2],
+        _ => [120, 240, 480, 960][config % 4],
+    };
+    let frames = match toc & 3 {
+        0 => 1,
+        1 | 2 => 2,
+        _ => match data.get(1).map(|b| i64::from(b & 0x3f)) {
+            Some(n) if n > 0 => n,
+            _ => return OPUS_FRAME_MS,
+        },
+    };
+    (frame_samples * frames / 48).clamp(1, 120)
+}
+
 impl StreamRecorder {
     pub fn new(info: StreamInfo, rec: Arc<Recording>, users: Users) -> Self {
         let (wait, held) = if info.video {
@@ -475,7 +501,11 @@ impl StreamRecorder {
         seg.prev_ts = ts;
         seg.writer.write_block(key, ms, data);
         seg.last_ms = ms;
-        let span = if video { seg.frame_ms } else { OPUS_FRAME_MS };
+        let span = if video {
+            seg.frame_ms
+        } else {
+            opus_packet_ms(data)
+        };
         seg.end_ms = seg.end_ms.max(ms + span);
     }
 
@@ -724,6 +754,58 @@ mod tests {
             [0, 20, 40, 60],
             "the hole is bridged with silence"
         );
+    }
+
+    #[test]
+    fn packets_of_forty_milliseconds_are_recorded_without_a_hole_after_each() {
+        let (rec, start) = setup("ptime40", u64::MAX);
+        let mut s = voice(&rec);
+        // 0xfd: two 20 ms frames in a packet, as a browser asked for 40 ms packets sends them.
+        for i in 0..100u32 {
+            s.packet(
+                start + Duration::from_millis(40 * u64::from(i)),
+                opus(i as u16, 1920 * i, &[0xfd, 1, 2]),
+            );
+        }
+        s.finish(start + Duration::from_secs(4), "test");
+        let files = rec.files();
+        assert_eq!(files.len(), 1, "{files:?}");
+        let times = block_times(&files[0].path);
+        assert_eq!(
+            times.len(),
+            100,
+            "no silent block was added between packets"
+        );
+        assert!(times.windows(2).all(|w| w[1] - w[0] == 40), "{times:?}");
+    }
+
+    #[test]
+    fn the_length_of_an_opus_packet_comes_from_its_table_of_contents() {
+        assert_eq!(opus_packet_ms(&[0xfc, 1]), 20, "one 20 ms frame");
+        assert_eq!(
+            opus_packet_ms(&[0xfd, 1]),
+            40,
+            "two frames of the same size"
+        );
+        assert_eq!(
+            opus_packet_ms(&[0xfe, 1]),
+            40,
+            "two frames of different sizes"
+        );
+        assert_eq!(opus_packet_ms(&[0x10, 1]), 40, "one 40 ms SILK frame");
+        assert_eq!(opus_packet_ms(&[0x18, 1]), 60, "one 60 ms SILK frame");
+        assert_eq!(
+            opus_packet_ms(&[0xfb, 3, 0]),
+            60,
+            "three 20 ms frames, arbitrary count"
+        );
+        assert_eq!(opus_packet_ms(&[0xf8]), 20, "the silence frame");
+        assert_eq!(
+            opus_packet_ms(&[0xfb]),
+            20,
+            "a count code with no count byte is read as 20"
+        );
+        assert_eq!(opus_packet_ms(&[]), 20, "nothing to read");
     }
 
     #[test]

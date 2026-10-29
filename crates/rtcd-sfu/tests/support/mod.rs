@@ -38,7 +38,7 @@ use rtcd_proto::{Message, MessageType, SessionConfig};
 use rtcd_sfu::config::{EngineConfig, LocalAddress};
 use rtcd_sfu::engine::{CloseReason, Command, Engine, Event, Proto};
 use rtcd_sfu::ids::Rng;
-use rtcd_sfu::metrics::NoMetrics;
+use rtcd_sfu::metrics::{Metrics, NoMetrics};
 
 pub const AUDIO_LEVEL_URI: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
 pub const SERVER: &str = "10.0.0.1:8443";
@@ -88,6 +88,8 @@ pub struct Browser {
     pub dc_frames: Vec<DcMessage>,
     pub offers_received: usize,
     pub answers_sent: usize,
+    /// The text of every description the SFU sent this browser, in order.
+    pub descriptions: Vec<String>,
     pub mic: RTCRtpSenderId,
     pub mic_ssrc: u32,
     pub mic_seq: u16,
@@ -184,6 +186,10 @@ impl World {
     }
 
     pub fn with_config(cfg: EngineConfig) -> World {
+        World::with_metrics(cfg, Arc::new(NoMetrics))
+    }
+
+    pub fn with_metrics(cfg: EngineConfig, metrics: Arc<dyn Metrics>) -> World {
         // `RUST_LOG=rtcd_sfu=debug cargo test -- --nocapture` shows what the engine decides.
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -193,7 +199,7 @@ impl World {
         let cfg_server = cfg.addresses[0].advertised_udp();
         World {
             now: Instant::now(),
-            engine: Engine::new(Arc::new(cfg), Arc::new(NoMetrics), Rng::seeded(7)),
+            engine: Engine::new(Arc::new(cfg), metrics, Rng::seeded(7)),
             server: cfg_server,
             browsers: Vec::new(),
             closed: Vec::new(),
@@ -249,6 +255,8 @@ impl World {
                     channel_id: "ch".into(),
                     av1_support: false,
                     dc_signaling: true,
+                    host: false,
+                    observer: false,
                 },
             )
             .props,
@@ -337,6 +345,7 @@ impl World {
             dc_frames: vec![],
             offers_received: 0,
             answers_sent: 0,
+            descriptions: Vec::new(),
             mic,
             mic_ssrc,
             mic_seq: 0,
@@ -564,6 +573,7 @@ impl World {
         let desc: RTCSessionDescription = serde_json::from_slice(json).unwrap();
         let now = self.now;
         let b = &mut self.browsers[i];
+        b.descriptions.push(desc.sdp.clone());
         match desc.sdp_type {
             RTCSdpType::Answer => {
                 b.pc.set_remote_description(now, desc)

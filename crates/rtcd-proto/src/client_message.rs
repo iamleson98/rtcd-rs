@@ -21,6 +21,13 @@ pub struct JoinRequest {
     pub av1_support: bool,
     /// SDP after the first offer travels over the data channel instead of the websocket.
     pub dc_signaling: bool,
+    /// The participant is the call's host (a class's teacher). A node that has no room left for
+    /// anyone else still takes the host: without them the class cannot start, or goes on without
+    /// its teacher.
+    pub host: bool,
+    /// The participant only watches the call: the session recorder. A node with no room left
+    /// still takes it, or the class would not be recorded.
+    pub observer: bool,
 }
 
 /// The `{"sessionID": ...}` payload of leave, reconnect and close.
@@ -73,7 +80,7 @@ impl ClientMessage {
                 &[("clientID", &h.client_id), ("connID", &h.conn_id)],
             ),
             Self::Join(j) => {
-                rmp::encode::write_map_len(&mut out, 6).expect("vec write");
+                rmp::encode::write_map_len(&mut out, 8).expect("vec write");
                 for (key, value) in [
                     ("callID", &j.call_id),
                     ("userID", &j.user_id),
@@ -86,6 +93,8 @@ impl ClientMessage {
                 for (key, value) in [
                     ("av1Support", j.av1_support),
                     ("dcSignaling", j.dc_signaling),
+                    ("host", j.host),
+                    ("observer", j.observer),
                 ] {
                     rmp::encode::write_str(&mut out, key).expect("vec write");
                     rmp::encode::write_bool(&mut out, value).expect("vec write");
@@ -121,6 +130,8 @@ impl ClientMessage {
                     channel_id: lookup_string(map, "channelID"),
                     av1_support: lookup_bool(map, "av1Support"),
                     dc_signaling: lookup_bool(map, "dcSignaling"),
+                    host: lookup_bool(map, "host"),
+                    observer: lookup_bool(map, "observer"),
                 })
             }
             "leave" | "reconnect" | "close" => {
@@ -178,6 +189,8 @@ mod tests {
                 channel_id: "ch".into(),
                 av1_support: true,
                 dc_signaling: false,
+                host: true,
+                observer: true,
             }),
             ClientMessage::Leave(SessionRef {
                 session_id: "s".into(),

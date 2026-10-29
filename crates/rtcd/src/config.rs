@@ -179,10 +179,40 @@ pub struct RtcConfig {
     pub nack_buffer_size: i64,
     /// Kept for compatibility: packets are always stored by value here, there is no unsafe mode.
     pub nack_disable_copy: bool,
-    /// Threads serving calls. 0 lets the SFU choose: it starts with one, adds another when every
-    /// shard has been busy for a few seconds (up to one fewer than the cores) and stops one that has
-    /// been empty for two minutes. A positive number pins it.
+    /// Threads serving calls. 0 lets the SFU choose: it starts with two where there are cores for
+    /// two (a class that begins at the bell is placed call by call before its participants arrive),
+    /// adds another when every shard has been busy for a few seconds (up to one fewer than the
+    /// cores) and stops one that has been empty for two minutes. A positive number pins it.
     pub shards: i64,
+    /// How many voices of a call are forwarded once more microphones than that are open: the
+    /// loudest ones, as Meet and Jitsi do. A listener follows two or three speakers, and every open
+    /// microphone is a stream to every listener: thirteen open microphones in a class of 130 are
+    /// 1,700 packets every 20 ms, of which each listener can use three. The default is three; 0
+    /// forwards all of them.
+    pub audio_loudest: i64,
+    /// The packet time, in milliseconds, browsers are asked to send their voice with. A longer one
+    /// makes fewer, larger packets: 40 halves the packets a call's open microphones cost every
+    /// listener, for 20 ms more delay (a browser sends 20 on its own). 0, the default, leaves it
+    /// to the browser; otherwise a multiple of 20 (Opus's frame) up to 120.
+    pub audio_ptime_ms: i64,
+    /// The most this node should send, in megabits per second. Near it every receiver's cameras
+    /// and screen shares fall back to their small layer, so the node slows down evenly instead of
+    /// losing packets for everyone. 0 (the default) sets no budget; the rate is reported on
+    /// `GET /system` either way.
+    pub egress_budget_mbps: i64,
+    /// The most this node should send, in packets per second: the same fall back for the other
+    /// ceiling. A virtual network card takes a limited number of packets however small they are,
+    /// and voice packets are small: the OVH video VPS sends 150 to 200 thousand a second and then
+    /// its transmit ring stays full. Set it to about 80 % of what the card was measured to take.
+    /// 0 (the default) sets no budget.
+    pub egress_budget_pps: i64,
+    /// Whether a join is refused while the shard that would serve it is at its limit (a thread
+    /// busy for three seconds at 95 % or more, after shedding what it can): the participants it
+    /// has keep their quality, where letting more in makes every call on the shard lose packets.
+    /// The default is on. A refused session is closed, and the participant joins again; a new call
+    /// goes to a shard that is not at its limit when there is one. The call's host and recorder,
+    /// and a participant who is in the call or left it in the last minute, are never refused.
+    pub refuse_when_saturated: bool,
     /// Seconds to let running sessions end on shutdown before ending them; 0 waits for them
     /// without limit, as the Go service does (a second signal ends them at once).
     pub drain_timeout_seconds: i64,
@@ -265,6 +295,11 @@ impl Default for RtcConfig {
             nack_buffer_size: 256,
             nack_disable_copy: true,
             shards: 0,
+            audio_loudest: 3,
+            audio_ptime_ms: 0,
+            egress_budget_mbps: 0,
+            egress_budget_pps: 0,
+            refuse_when_saturated: true,
             drain_timeout_seconds: 0,
         }
     }
@@ -390,6 +425,11 @@ impl Config {
         integer!("RTC_NACKBUFFERSIZE", self.rtc.nack_buffer_size);
         boolean!("RTC_NACKDISABLECOPY", self.rtc.nack_disable_copy);
         integer!("RTC_SHARDS", self.rtc.shards);
+        integer!("RTC_AUDIOLOUDEST", self.rtc.audio_loudest);
+        integer!("RTC_AUDIOPTIMEMS", self.rtc.audio_ptime_ms);
+        integer!("RTC_EGRESSBUDGETMBPS", self.rtc.egress_budget_mbps);
+        integer!("RTC_EGRESSBUDGETPPS", self.rtc.egress_budget_pps);
+        boolean!("RTC_REFUSEWHENSATURATED", self.rtc.refuse_when_saturated);
         integer!("RTC_DRAINTIMEOUTSECONDS", self.rtc.drain_timeout_seconds);
         text!("STORE_DATASOURCE", self.store.data_source);
         boolean!("LOGGER_ENABLECONSOLE", self.logger.enable_console);
@@ -490,6 +530,24 @@ impl Config {
         }
         if rtc.shards < 0 || rtc.shards > 256 {
             return Err(invalid("Shards", "must be between 0 and 256"));
+        }
+        if !(0..=100_000).contains(&rtc.egress_budget_mbps) {
+            return Err(invalid("EgressBudgetMbps", "must be between 0 and 100000"));
+        }
+        if !(0..=100_000_000).contains(&rtc.egress_budget_pps) {
+            return Err(invalid(
+                "EgressBudgetPps",
+                "must be between 0 and 100000000",
+            ));
+        }
+        if !(0..=64).contains(&rtc.audio_loudest) {
+            return Err(invalid("AudioLoudest", "must be between 0 and 64"));
+        }
+        if !(0..=120).contains(&rtc.audio_ptime_ms) || rtc.audio_ptime_ms % 20 != 0 {
+            return Err(invalid(
+                "AudioPtimeMs",
+                "must be 0 or a multiple of 20 up to 120",
+            ));
         }
         if rtc.drain_timeout_seconds < 0 {
             return Err(invalid("DrainTimeoutSeconds", "should not be negative"));
@@ -646,6 +704,14 @@ mod tests {
         assert_eq!(c.api.http.listen_address, ":8045");
         assert_eq!((c.rtc.ice_port_udp, c.rtc.ice_port_tcp), (8443, 8443));
         assert_eq!(c.rtc.nack_buffer_size, 256);
+        assert_eq!(
+            c.rtc.audio_loudest, 3,
+            "the three loudest voices of a call are forwarded unless asked otherwise"
+        );
+        assert!(
+            c.rtc.refuse_when_saturated,
+            "a saturated shard refuses joins unless told not to"
+        );
         assert_eq!(c.store.data_source, "/tmp/rtcd_db");
         assert_eq!(c.api.security.session_cache.expiration_minutes, 1440);
         c.validate().unwrap();
@@ -739,6 +805,11 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
         c.apply_env(&env(&[
             ("RTCD_API_SECURITY_ALLOWSELFREGISTRATION", "true"),
             ("RTCD_RTC_ICEPORTUDP", "30000"),
+            ("RTCD_RTC_AUDIOLOUDEST", "5"),
+            ("RTCD_RTC_AUDIOPTIMEMS", "40"),
+            ("RTCD_RTC_EGRESSBUDGETMBPS", "250"),
+            ("RTCD_RTC_EGRESSBUDGETPPS", "120000"),
+            ("RTCD_RTC_REFUSEWHENSATURATED", "false"),
             ("RTCD_STORE_DATASOURCE", "/data/db"),
             ("RTCD_LOGGER_ENABLEFILE", "false"),
             ("RTCD_LOGGER_CONSOLEJSON", "1"),
@@ -749,6 +820,11 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
         .unwrap();
         assert!(c.api.security.allow_self_registration);
         assert_eq!(c.rtc.ice_port_udp, 30000);
+        assert_eq!(c.rtc.audio_loudest, 5);
+        assert_eq!(c.rtc.audio_ptime_ms, 40);
+        assert_eq!(c.rtc.egress_budget_mbps, 250);
+        assert_eq!(c.rtc.egress_budget_pps, 120_000);
+        assert!(!c.rtc.refuse_when_saturated);
         assert_eq!(c.store.data_source, "/data/db");
         assert!(!c.logger.enable_file);
         assert!(c.logger.console_json);
@@ -799,6 +875,15 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
         assert!(bad(&|c| c.rtc.nack_buffer_size = 100).contains("power of 2"));
         assert!(bad(&|c| c.rtc.nack_buffer_size = 16).contains("at least 32"));
         assert!(bad(&|c| c.rtc.nack_buffer_size = 16384).contains("exceed 8192"));
+        assert!(bad(&|c| c.rtc.audio_loudest = -1).contains("between 0 and 64"));
+        assert!(bad(&|c| c.rtc.audio_loudest = 65).contains("between 0 and 64"));
+        assert!(bad(&|c| c.rtc.audio_ptime_ms = 25).contains("multiple of 20"));
+        assert!(bad(&|c| c.rtc.audio_ptime_ms = 10).contains("multiple of 20"));
+        assert!(bad(&|c| c.rtc.audio_ptime_ms = 30).contains("multiple of 20"));
+        assert!(bad(&|c| c.rtc.audio_ptime_ms = 140).contains("multiple of 20"));
+        assert!(bad(&|c| c.rtc.audio_ptime_ms = -20).contains("multiple of 20"));
+        assert!(bad(&|c| c.rtc.egress_budget_mbps = -1).contains("between 0 and 100000"));
+        assert!(bad(&|c| c.rtc.egress_budget_pps = -1).contains("between 0 and 100000000"));
         assert!(
             bad(&|c| c.rtc.ice_servers = vec![IceServer {
                 urls: vec!["http://x".into()],

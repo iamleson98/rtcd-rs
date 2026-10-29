@@ -414,6 +414,8 @@ async fn bridge(
         channel_id: CHAN_ID.into(),
         av1_support: false,
         dc_signaling: true,
+        host: false,
+        observer: false,
     }));
     to_bot(
         json!({"event": "custom_calls_join", "data": {"connID": id, "iceServers": []}, "broadcast": {"channel_id": CHAN_ID}}),

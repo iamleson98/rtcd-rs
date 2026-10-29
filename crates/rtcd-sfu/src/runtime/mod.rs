@@ -381,7 +381,13 @@ impl Sfu {
     pub fn join(&self, cfg: SessionConfig) -> Result<(), JoinError> {
         cfg.validate().map_err(JoinError::Invalid)?;
         self.core.make_room(&cfg);
-        let shard = self.core.registry.admit(&cfg)?;
+        let shard = if self.core.cfg.refuse_when_saturated {
+            self.core
+                .registry
+                .admit_unless(&cfg, &|slot| self.core.table.saturated(slot))?
+        } else {
+            self.core.registry.admit(&cfg)?
+        };
         let session_id = cfg.session_id.clone();
         let sent = match self.core.table.get(shard) {
             Some(handle) => handle.send(ShardCommand::Engine(Command::Join(cfg))),
@@ -442,9 +448,40 @@ impl Sfu {
         self.core.registry.len()
     }
 
+    /// What the node sends now, in bits per second (the shards' smoothed total).
+    pub fn egress_bps(&self) -> u64 {
+        self.core.cfg.engine.egress.rate_bps()
+    }
+
+    /// What the node sends now, in packets per second.
+    pub fn egress_pps(&self) -> u64 {
+        self.core.cfg.engine.egress.rate_pps()
+    }
+
+    /// Datagrams the kernel refused to queue since the node started: what was handed to the
+    /// socket and never left, which UDP reports to nobody else.
+    pub fn kernel_send_drops(&self) -> u64 {
+        self.core.cfg.engine.egress.kernel_send_drops()
+    }
+
+    /// Whether receivers are held to the small video layers because a send budget is reached.
+    pub fn egress_squeezed(&self) -> bool {
+        self.core.cfg.engine.egress.squeezed()
+    }
+
     /// How many threads serve sessions right now.
     pub fn shard_count(&self) -> usize {
         self.core.table.len()
+    }
+
+    /// How many of them have no room left and are shedding load.
+    pub fn shards_pressured(&self) -> usize {
+        self.core.table.pressured()
+    }
+
+    /// How many of those are at their limit and refuse new sessions.
+    pub fn shards_saturated(&self) -> usize {
+        self.core.table.saturated_count()
     }
 
     /// Starts one more shard, if the configuration leaves room for it. The SFU does this itself

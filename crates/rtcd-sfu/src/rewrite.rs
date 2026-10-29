@@ -89,6 +89,19 @@ impl Rewriter {
         }
     }
 
+    /// Prepares to continue the stream with `first` after the SFU left the source's packets out for a
+    /// while (a voice that was not among the loudest): the receiver's sequence numbers carry on from
+    /// the last one it saw, so it counts nothing as lost, while the timestamps keep the real time
+    /// that passed, which a receiver treats as a pause in the speech. Call before rewriting `first`.
+    pub fn resume_after_gap(&mut self, first: &Packet) {
+        if self.started {
+            self.seq_offset = self
+                .last_seq
+                .wrapping_add(1)
+                .wrapping_sub(first.header.sequence_number);
+        }
+    }
+
     /// Rewrites `packet` for the receiver.
     pub fn rewrite(&mut self, packet: &mut Packet) {
         let h = &mut packet.header;
@@ -232,5 +245,27 @@ mod tests {
         r.rewrite(&mut p);
         assert_eq!(&p.payload[..], &[1, 2, 3]);
         assert_eq!(p.header.ssrc, 9);
+    }
+
+    #[test]
+    fn a_stream_resumed_after_a_gap_continues_the_sequence_and_keeps_the_time() {
+        let mut r = Rewriter::new(7, 111, false);
+        for seq in 100..105u16 {
+            let mut p = packet(seq, u32::from(seq) * 960, 0, 0);
+            r.rewrite(&mut p);
+        }
+        // 1,000 packets (20 seconds) were left out.
+        let mut first = packet(1105, 1105 * 960, 0, 0);
+        r.resume_after_gap(&first);
+        r.rewrite(&mut first);
+        assert_eq!(first.header.sequence_number, 105, "no sequence gap");
+        assert_eq!(
+            first.header.timestamp,
+            1105 * 960,
+            "the pause is still there in time"
+        );
+        let mut next = packet(1106, 1106 * 960, 0, 0);
+        r.rewrite(&mut next);
+        assert_eq!(next.header.sequence_number, 106);
     }
 }

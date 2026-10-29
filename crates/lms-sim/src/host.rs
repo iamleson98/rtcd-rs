@@ -106,6 +106,10 @@ impl Rtcd {
         cfg.store.data_source = dir.display().to_string();
         cfg.logger.enable_file = false;
         cfg.logger.enable_console = false;
+        // The settings under test come from the environment, as for the real service
+        // (RTCD_RTC_EGRESSBUDGETPPS=1 makes the node shed from the first second).
+        cfg.apply_env(&std::env::vars().collect())
+            .expect("the RTCD_* settings in the environment are valid");
         // Behind a lossy relay, the candidates rtcd offers name the relay's port.
         let front = if !impair.is_none() {
             Some(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap())

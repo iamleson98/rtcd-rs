@@ -35,6 +35,32 @@ impl ShardTable {
         self.read().get(slot).cloned().flatten()
     }
 
+    /// How many running shards have no room left and are shedding load.
+    pub fn pressured(&self) -> usize {
+        self.read()
+            .iter()
+            .flatten()
+            .filter(|h| h.pressured())
+            .count()
+    }
+
+    /// Whether the shard of `slot` is running and at its limit.
+    pub fn saturated(&self, slot: usize) -> bool {
+        self.read()
+            .get(slot)
+            .and_then(Option::as_ref)
+            .is_some_and(ShardHandle::saturated)
+    }
+
+    /// How many running shards are at their limit and refuse new sessions.
+    pub fn saturated_count(&self) -> usize {
+        self.read()
+            .iter()
+            .flatten()
+            .filter(|h| h.saturated())
+            .count()
+    }
+
     /// How many shards are running.
     pub fn len(&self) -> usize {
         self.read().iter().flatten().count()

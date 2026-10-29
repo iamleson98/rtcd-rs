@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rtcd_sfu::config::{EngineConfig, LocalAddress};
 use rtcd_sfu::engine::Event;
-use rtcd_sfu::runtime::{Sfu, SfuConfig};
+use rtcd_sfu::runtime::{ScalingPolicy, Sfu, SfuConfig};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -82,6 +82,10 @@ pub fn sfu_config(cfg: &Config, addresses: Vec<LocalAddress>) -> SfuConfig {
     if rtc.nack_buffer_size != 0 {
         engine.nack_buffer_size = rtc.nack_buffer_size as u16;
     }
+    engine.audio_loudest = rtc.audio_loudest.clamp(0, 64) as usize;
+    engine.audio_ptime_ms = rtc.audio_ptime_ms.clamp(0, 120) as u32;
+    engine.egress_budget_bps = rtc.egress_budget_mbps.clamp(0, 100_000) as u64 * 1_000_000;
+    engine.egress_budget_pps = rtc.egress_budget_pps.clamp(0, 100_000_000) as u64;
     // A shard is a thread, a call lives on one, and one carries a few hundred participants before it
     // saturates (measured: a single shard dropped 3 % of the voice packets at 600 participants on
     // four cores, and lost two thirds at 900, where two shards lost 7 %). Another is not free
@@ -93,12 +97,22 @@ pub fn sfu_config(cfg: &Config, addresses: Vec<LocalAddress>) -> SfuConfig {
         (rtc.shards as usize, 0)
     } else {
         let cores = std::thread::available_parallelism().map_or(1, usize::from);
-        (1, cores.saturating_sub(1).clamp(1, 32))
+        let max = cores.saturating_sub(1).clamp(1, 32);
+        // Two from the start where there are cores for two: a class that begins at the bell is
+        // placed call by call before its participants arrive, so with one shard they all land on it
+        // (three lectures of 130 to 180 people filled one thread to 96 to 100 % while a second sat
+        // idle, then refused people; on two shards the threads ran at 51 and 70 %).
+        (max.min(2), max)
     };
     SfuConfig {
         engine,
         shards,
         max_shards,
+        scaling: ScalingPolicy {
+            min_shards: shards,
+            ..Default::default()
+        },
+        refuse_when_saturated: rtc.refuse_when_saturated,
         ..Default::default()
     }
 }

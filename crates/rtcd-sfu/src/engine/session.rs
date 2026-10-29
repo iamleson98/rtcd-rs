@@ -13,6 +13,7 @@ use rtc::rtp_transceiver::{RTCRtpReceiverId, RTCRtpSenderId};
 use rtcd_proto::SessionConfig;
 use rtcd_proto::dc::DcMessage;
 
+use super::CallId;
 use super::signaling::{Phase, SignalingLock};
 use super::types::Proto;
 use crate::bwe::Estimate;
@@ -61,6 +62,10 @@ pub(crate) struct Source {
     pub last_packet: Option<Instant>,
     /// When a keyframe was last asked of the sender for this stream.
     pub last_pli: Option<Instant>,
+    /// Whether packets of this voice were left out (muted, or not among the loudest) since one
+    /// was last forwarded: the receivers' sequence numbers must then carry on from where they
+    /// were (see `Rewriter::resume_after_gap`).
+    pub gap: bool,
 }
 
 /// What a participant sends.
@@ -122,6 +127,9 @@ pub(crate) struct DownStream {
 #[derive(Debug, Default)]
 pub(crate) struct Downlink {
     pub streams: Vec<Option<DownStream>>,
+    /// Its cameras and screen share are held to the small layers because the node is near its
+    /// send budget (see `egress`).
+    pub squeezed: bool,
     /// The data channel is open, so tracks may be pushed.
     pub ready: bool,
     /// Whose cameras the participant wants (all, until it says otherwise).
@@ -202,6 +210,8 @@ pub(crate) enum Lifecycle {
 /// A participant's connection and everything the engine tracks about it.
 pub(crate) struct Session {
     pub cfg: SessionConfig,
+    /// The call it belongs to, for the lookups the packet path makes.
+    pub call: CallId,
     pub pc: RTCPeerConnection,
     pub estimate: Arc<Estimate>,
     pub created_at: Instant,

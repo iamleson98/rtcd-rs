@@ -1,6 +1,7 @@
 //! Settings of the media plane.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// An address the SFU listens on and the candidates it offers for it.
@@ -68,6 +69,24 @@ pub struct EngineConfig {
     pub ice_lite: bool,
     /// Whether to pace video sends to each participant's estimated rate. Off matches the Go rtcd.
     pub pacing: bool,
+    /// How many voices of one call are forwarded when more microphones are open than that: the
+    /// loudest (see `loudest`). 0 forwards every voice, as the Go rtcd does.
+    pub audio_loudest: usize,
+    /// The packet time, in milliseconds, browsers are asked to send their voice with (`a=ptime` in
+    /// the descriptions they are given). A longer one makes fewer, larger packets: 40 ms halves the
+    /// packets a call's microphones cost every listener, for 20 ms more delay. 0 leaves it to the
+    /// browser (20 ms).
+    pub audio_ptime_ms: u32,
+    /// The most this node should send, in bits per second. Near it (see `egress`) every receiver's
+    /// cameras and screen shares fall back to their small layer instead of the node losing packets
+    /// for everyone. 0 sets no budget.
+    pub egress_budget_bps: u64,
+    /// The most packets per second this node should send. The same fall back as the byte budget,
+    /// for the other ceiling: a virtual network card takes a limited number of packets however
+    /// small, and voice is small. 0 sets no budget.
+    pub egress_budget_pps: u64,
+    /// What the node's shards have sent, shared by all of them.
+    pub egress: Arc<crate::egress::Gauge>,
     /// How many sessions one shard serves at most; joins beyond are refused.
     pub max_sessions: usize,
 }
@@ -88,6 +107,11 @@ impl Default for EngineConfig {
             max_bitrate: 3_750_000,
             ice_lite: true,
             pacing: false,
+            audio_loudest: 0,
+            audio_ptime_ms: 0,
+            egress_budget_bps: 0,
+            egress_budget_pps: 0,
+            egress: Arc::default(),
             max_sessions: 10_000,
         }
     }

@@ -37,7 +37,7 @@ predicts the network bill (`increase(...[1d])` is GB per day):
 | `rtcd_rtc_rtp_bytes_received_total{type}` | the uplink, by the same types |
 | `rtcd_rtc_rtp_tracks_writes_time{groupID,type}` | time to write one packet to one receiver (a sample of the writes) |
 
-What the receivers experience, read from each receiver's connection statistics every five seconds:
+What the receivers experience, read from the connection statistics of each session that sends or receives video every five seconds (a voice-only session is not read: the snapshot allocates, and the voice thread pays for it):
 
 | metric | what it counts |
 |---|---|
@@ -58,11 +58,14 @@ whatever places new calls (the LMS server does, from its DNS-discovered pool) ca
 lighter instance. Calls stay on the instance they start on.
 
 Within an instance, threads called shards serve the calls, and a call lives on one of them. With
-`RTCD_RTC_SHARDS=0` (the default) the number follows the load, from one shard up to one fewer than
-the cores. A new call that finds every shard holding 300 sessions' worth (each call counts for at
+`RTCD_RTC_SHARDS=0` (the default) the number follows the load, from two shards (one where there
+are fewer than three cores) up to one fewer than the cores. Two from the start because a class
+that begins at the bell is placed call by call before its participants arrive: with one shard,
+three lectures of 130 to 180 people landed on it together and ran it at 96 to 100 % while a
+second sat idle, then refused people; on two shards the threads ran at 51 and 70 %. A new call that finds every shard holding 300 sessions' worth (each call counts for at
 least 20, since a class fills over the seconds after it starts, and a bell starts many at once) gets
 a shard of its own, which a burst of classes needs because they are all placed before their
-participants have arrived; and a shard is added as well when every shard has been over half busy for three seconds. A shard that has had no
+participants have arrived; and a shard is added as well when every shard has been over half busy for three seconds. A shard above the two that are kept and that has had no
 sessions for two minutes is stopped. A call stays on the shard it started on, and new calls go to
 the shard carrying the least. Measured on four cores at 900 participants, one shard dropped a third
 of the voice packets and the automatic two dropped about 5 % (the load generator shares the machine,
@@ -73,6 +76,112 @@ share the media port; the kernel hands a datagram to one of them, and a shard th
 not its own passes it on. Once a shard has learned a participant's address it opens a socket
 connected to that address, bound to the same port, which the kernel serves directly: after the first
 packets almost nothing takes the detour (`rtcd_net_forwarded_packets_total` shows how much does).
+
+## Large calls: the loudest voices
+
+Every open microphone is a stream to every listener, so a call of `n` people with `m` microphones
+open costs `m × n` voice streams, while a person follows two or three speakers at most. With
+`RTCD_RTC_AUDIOLOUDEST=N` (`rtc.audio_loudest`) a call that has more than `N` open microphones
+forwards only the `N` loudest, the rule Meet (three loudest, on three fixed streams) and Jitsi
+(`route-loudest-only`) use. The loudness is the audio level the browser already sends (RFC 6464),
+smoothed so that a speaker is heard from the first syllables and a pause does not give the slot
+away, and a source that holds a slot keeps it until another is clearly louder (`src/loudest.rs`).
+A call with no more open microphones than `N` is untouched, a sender that reports no level is
+always forwarded, and 0 forwards everything. The default is 3, because without a limit the cost
+grows with the square of the class: on the OVH video VPS three lectures of 126 to 182 people with a
+tenth of the students unmuted (13 open microphones each) made the node send 226 to 268 thousand
+packets a second (`rtcd_net_packets_total`), 140 Mbit/s of it voice; the shard threads were at
+100 % and everyone lost packets from about 180 participants on. Packets of a voice that is
+not forwarded are dropped before any receiver is written to, so nothing is renegotiated and the
+people's voice indicators (`voice_on`/`voice_off`) do not change.
+
+
+### Voice packet time
+
+Opus fits 20 ms in a packet by default, so a microphone is 50 packets a second, and an open
+microphone is that to every listener. `RTCD_RTC_AUDIOPTIMEMS=40` (`rtc.audio_ptime_ms`) asks the
+browsers to send 40 ms in a packet instead, by writing `a=ptime` and `a=maxptime` into every audio
+section the node receives on, in each description it sends (a browser given a description without
+one goes back to 20). That halves the voice packets of a call and the header bytes with them, at 20
+ms more delay and 40 ms lost to a lost packet instead of 20 (Opus's in-band repair covers it).
+Chrome 156, Firefox 158 and Safari 26.6 apply it to what they send (checked: 50.8 packets a second
+without, 25.6 with 40 and 17.6 with 60 in Chromium; in a call through this node with 40, 25 a second
+from each of the three, and each heard the others at 25 a second without loss); a browser that
+ignores it stays at 20. Forwarded voice keeps the packet time it was sent with, and the voice
+activity detector follows it. The value is 0 (the browser decides, the default) or a multiple of 20
+up to 120.
+
+## Large calls: a send budget
+
+A node asked for more than its network carries does not slow down evenly: its send queues overflow
+and every receiver loses packets at once (the production load test saw 50 to 75 % loss for
+everyone past about 320 Mbit/s). With `RTCD_RTC_EGRESSBUDGETMBPS=N` (`rtc.egress_budget_mbps`) the
+shards add what they send to one gauge, and when its smoothed rate reaches 85 % of `N` every
+receiver's cameras and screen shares fall back to their small layer (no renegotiation, the same
+switch a receiver's own request makes); they go back up only after the rate has stayed under 65 %
+for twenty seconds, so the drop itself does not release it. 0 (the default) sets no budget.
+`GET /system` reports `egress_bps` and `egress_squeezed` either way, for whatever places new calls
+(`src/egress.rs`).
+
+The card has a second ceiling, in packets: `RTCD_RTC_EGRESSBUDGETPPS=N` (`rtc.egress_budget_pps`)
+is the same rule for packets per second, and either budget squeezes. Voice packets are about 100
+bytes, so a call with many open microphones reaches the packet ceiling at a fraction of the bit
+rate: the OVH video VPS sent 160 thousand 140-byte packets a second without loss and 200 thousand
+with 0.1 % loss (a plain UDP test), but under the lecture load above, with 120 to 157 thousand
+packets a second leaving at 250 to 520 Mbit/s, its transmit ring stayed full and the kernel refused
+280 to 570 thousand datagrams every five seconds. Set it to about 80 % of what the card was
+measured to take.
+While the node is squeezed, a call also forwards at most two voices (see above), so the load that
+brought the node to its ceiling is cut where it is largest.
+
+The kernel does not tell the sender: a datagram the transmit queue refuses is counted
+(`UdpSndbufErrors`) and `sendmmsg` still succeeds, so the node counted those packets as sent.
+`GET /system` therefore reports `kernel_send_drops` (that counter since the start) and `egress_pps`;
+a node whose `kernel_send_drops` grows is sending more than its card takes.
+
+## Large calls: a shard with no room
+
+A call lives on one shard and cannot move, so a shard whose thread has no time left drops packets
+for every call on it while another shard may be idle. A shard that has been at least 90 % busy for
+two seconds is under pressure: its receivers are held to the small layers and its calls forward two
+voices at most, the same fall back as the send budget, but local to the shard. It is released after
+thirty seconds under 70 % (`src/runtime/scaler.rs`, `Pressure`).
+
+Past that there is a cliff. Measured on the OVH video VPS, a shard thread at 97 % lost 0.2 % of its
+packets and at 100 % about a third, because lost packets are asked for again and the thread has no
+time left for them, so it does not recover by itself. A shard at 95 % busy for three seconds is
+saturated: its calls forward the loudest voice only (a second speaker is heard from about half a
+second after starting, the selector's hysteresis and release; this is the emergency setting, and
+the price of keeping the other calls clean), and it refuses new sessions (a call that lives
+on it cannot move, so its next participant is refused; a new call goes to a shard that is not
+saturated, and is refused when none is), so the sessions it has keep their quality. It leaves that
+state after ten seconds under 90 %. The call's host (the join request's `host` field, which the LMS
+server sets for a class's teacher) and its recorder (`observer`) are never refused: a teacher whose
+connection dropped comes back as a new session, a node with no room still lets the teacher open the
+class, and a class that is being recorded keeps its recorder. Nor is a participant refused who has a
+session in the call or whose last one ended in the last minute: a student's connection dropped, and
+they come back as a new session, not as someone the shard was not already serving (a recorder costs about 3 % of a core
+and 12 Mbit/s for a class of 30 with 24 cameras, measured with `lms-sim`).
+`RTCD_RTC_REFUSEWHENSATURATED=false` turns the refusal off.
+`GET /system` reports `shards_pressured` and `shards_saturated`.
+
+## Upgrading from the previous release
+
+With no setting changed, a node that takes this release behaves differently in four ways:
+
+- It forwards the three loudest voices of a call, not all of them (`RTCD_RTC_AUDIOLOUDEST=0` forwards
+  all, as before).
+- It starts two shards where there are cores for two, not one (`RTCD_RTC_SHARDS` pins the number).
+- It refuses a join to a shard that has been at 95 % busy for three seconds, except the call's host
+  and recorder and a participant already in the call or just gone from it
+  (`RTCD_RTC_REFUSEWHENSATURATED=false` turns that off).
+- Under load (90 % busy for two seconds, or a send budget reached) it holds receivers to the small
+  video layers and forwards two voices.
+
+Off unless set: the send budgets (`RTCD_RTC_EGRESSBUDGETMBPS`, `RTCD_RTC_EGRESSBUDGETPPS`) and the
+packet time (`RTCD_RTC_AUDIOPTIMEMS`). `GET /system` gains `shards_pressured`, `shards_saturated`,
+`egress_pps` and `kernel_send_drops`. The recorder reads the length of each Opus packet from the
+packet, so recordings are right whatever the packet time is.
 
 ## Using it from class-management
 

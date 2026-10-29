@@ -14,8 +14,8 @@ use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use super::Engine;
 use super::session::{DownPhase, SessionKey, SourceKey, SubRef};
+use super::{Engine, Load};
 use crate::ids::TrackType;
 use crate::layers::{Layer, ScreenInputs, WATCH_EVERY};
 
@@ -24,6 +24,11 @@ pub const MAX_VIDEO_SUBSCRIPTIONS: usize = 100;
 /// At most one keyframe request per stream per this long: a sender asked too often spends its
 /// bandwidth on keyframes.
 const KEYFRAME_INTERVAL: Duration = Duration::from_secs(1);
+/// How many voices of a call are forwarded while the node is shedding load, whatever the
+/// configured limit is (a smaller configured limit stays).
+const SHEDDING_VOICES: usize = 2;
+/// And on a shard at its limit: the loudest voice only.
+const SATURATED_VOICES: usize = 1;
 
 #[derive(Deserialize)]
 struct Subscription {
@@ -60,13 +65,18 @@ impl Engine {
                     return None;
                 }
                 // The small layer while the receiver asked for it or the sender has paused the large.
-                let small =
-                    r.down.low_video.contains(&p.cfg.session_id) || p.up.camera_stall.stalled();
+                let small = r.down.squeezed
+                    || r.down.low_video.contains(&p.cfg.session_id)
+                    || p.up.camera_stall.stalled();
                 let preferred = if small { Layer::Low } else { Layer::High };
                 self.pick_layer(&mut candidates, preferred)
             }
             TrackType::Screen => {
-                let preferred = r.down.screen_level.level();
+                let preferred = if r.down.squeezed {
+                    Layer::Low
+                } else {
+                    r.down.screen_level.level()
+                };
                 self.pick_layer(&mut candidates, preferred)
             }
         }
@@ -241,10 +251,81 @@ impl Engine {
     /// Once-a-second upkeep of a session's video: the sender's large layer pausing and resuming,
     /// the receiver's keyframe requests that went unanswered, and its screen share layer.
     pub(super) fn housekeeping(&mut self, key: SessionKey, now: Instant) {
-        self.watch_camera(key, now);
-        self.retry_keyframes(key, now);
-        self.review_screen_level(key, now);
-        self.report_quality(key, now);
+        self.cfg
+            .egress
+            .update(now, self.cfg.egress_budget_bps, self.cfg.egress_budget_pps);
+        self.follow_budget(key, now);
+        self.follow_voice_limit(key);
+        // What is left looks at video: a class without a camera has nothing in it to look at, and
+        // reading a session's statistics is not free on the thread that forwards the voices.
+        if self.has_video(key) {
+            self.watch_camera(key, now);
+            self.retry_keyframes(key, now);
+            self.review_screen_level(key, now);
+            self.report_quality(key, now);
+        }
+    }
+
+    /// Whether the session sends or receives any video.
+    fn has_video(&self, key: SessionKey) -> bool {
+        self.sessions.get(key).is_some_and(|s| {
+            s.up.sources.iter().any(|x| x.ty.is_video())
+                || s.down.iter().any(|(_, d)| d.ty.is_video())
+        })
+    }
+
+    /// Whether the node is asked for more than it can send, or the shard for more than it can do:
+    /// a send budget (bits or packets) is nearly used, or the shard's thread has no room left.
+    fn shedding(&self) -> bool {
+        let budgeted = (self.cfg.egress_budget_bps > 0 || self.cfg.egress_budget_pps > 0)
+            && self.cfg.egress.squeezed();
+        budgeted || self.load != Load::Ok
+    }
+
+    /// Lets a call forward fewer voices while the node is shedding: a call with many open
+    /// microphones asks for a packet for every listener from each of them, and the listener hears
+    /// two or three.
+    fn follow_voice_limit(&mut self, key: SessionKey) {
+        let configured = self.cfg.audio_loudest;
+        let limit = if self.load == Load::Saturated {
+            SATURATED_VOICES
+        } else if self.shedding() {
+            match configured {
+                0 => SHEDDING_VOICES,
+                n => n.min(SHEDDING_VOICES),
+            }
+        } else {
+            configured
+        };
+        let Some(s) = self.sessions.get(key) else {
+            return;
+        };
+        if let Some(call) = self.calls.get_mut(&s.call) {
+            call.voices.set_limit(limit);
+        }
+    }
+
+    /// Holds a receiver to the small layers while the node is shedding (see `shedding`), and lets
+    /// it back up when it is not.
+    fn follow_budget(&mut self, key: SessionKey, now: Instant) {
+        let squeeze = self.shedding();
+        let Some(s) = self.sessions.get_mut(key) else {
+            return;
+        };
+        if s.down.squeezed == squeeze {
+            return;
+        }
+        s.down.squeezed = squeeze;
+        debug!(session = %s.cfg.session_id, squeeze, "send budget changed the layers");
+        if !s.down.ready {
+            return;
+        }
+        for member in self.call_members(key) {
+            if member != key {
+                self.sync_stream(key, member, TrackType::Video, now);
+                self.sync_stream(key, member, TrackType::Screen, now);
+            }
+        }
     }
 
     /// Moves the receivers of a camera between its layers as the large one pauses and resumes.
@@ -324,12 +405,12 @@ impl Engine {
         }
     }
 
-    /// Whether a session has video to look after once a second.
+    /// Whether a session has media to look after once a second: video (its layers, keyframes,
+    /// quality) or voice (how many voices its call forwards while the node sheds load).
     pub(super) fn needs_tick(&self, key: SessionKey) -> bool {
-        self.sessions.get(key).is_some_and(|s| {
-            s.up.sources.iter().any(|x| x.ty.is_video())
-                || s.down.iter().any(|(_, d)| d.ty.is_video())
-        })
+        self.sessions
+            .get(key)
+            .is_some_and(|s| !s.up.sources.is_empty() || s.down.iter().next().is_some())
     }
 
     /// The interval of the upkeep.

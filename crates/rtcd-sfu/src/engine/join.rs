@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 use super::session::{DownPhase, Downlink, Lifecycle, Session, SessionKey, SourceKey, Uplink};
 use super::signaling::{Phase, SignalingLock};
 use super::types::{CloseReason, Event};
-use super::{CallId, Engine};
+use super::{Call, CallId, Engine};
 use crate::metrics::Direction;
 use crate::peer::new_peer;
 
@@ -63,6 +63,7 @@ impl Engine {
         info!(session = %cfg.session_id, call = %cfg.call_id, user = %cfg.user_id, "session joined");
         self.metrics.session_started(&cfg.group_id);
         let session = Session {
+            call: call_id.clone(),
             cfg,
             pc,
             estimate,
@@ -92,7 +93,12 @@ impl Engine {
         let key = self.sessions.insert(session);
         self.by_id.insert(session_id, key);
         self.routes.add_ufrag(ufrag, key);
-        self.calls.entry(call_id).or_default().members.push(key);
+        let loudest = self.cfg.audio_loudest;
+        self.calls
+            .entry(call_id)
+            .or_insert_with(|| Call::new(loudest))
+            .members
+            .push(key);
         self.mark_dirty(key);
     }
 
@@ -174,6 +180,7 @@ impl Engine {
         };
         if let Some(call) = self.calls.get_mut(&call_id) {
             call.members.retain(|&m| m != key);
+            call.voices.remove(key);
             if call.screen == Some(key) {
                 call.screen = None;
             }

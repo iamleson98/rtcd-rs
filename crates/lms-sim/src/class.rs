@@ -194,6 +194,8 @@ pub async fn join(
         channel_id: format!("channel-{call}"),
         av1_support: false,
         dc_signaling: true,
+        host: false,
+        observer: false,
     }));
 
     let socket = UdpSocket::bind("127.0.0.1:0").await.expect("a UDP socket");

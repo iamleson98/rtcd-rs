@@ -1,9 +1,11 @@
 //! The media plane of rtcd.
 pub mod bwe;
 pub mod config;
+pub mod egress;
 pub mod engine;
 pub mod ids;
 pub mod layers;
+pub mod loudest;
 pub mod metrics;
 mod peer;
 pub mod rate;

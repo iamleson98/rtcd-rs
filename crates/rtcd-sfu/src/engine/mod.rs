@@ -40,14 +40,39 @@ use self::route::Routes;
 use self::session::{SessionKey, Sessions, SourceKey};
 use crate::config::EngineConfig;
 use crate::ids::Rng;
+use crate::loudest::Selector;
 use crate::metrics::Metrics;
 
+/// How much a shard is asked for compared with what its thread can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Load {
+    /// Room to spare.
+    #[default]
+    Ok,
+    /// No room left: small video layers and fewer voices.
+    Shedding,
+    /// At the limit: the same, harder, and the shard takes no new sessions.
+    Saturated,
+}
+
 /// A call: the sessions that hear each other.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Call {
     pub members: Vec<SessionKey>,
     /// The member sharing a screen, if any; one share per call.
     pub screen: Option<SessionKey>,
+    /// Which open microphones are forwarded.
+    pub voices: Selector<SessionKey>,
+}
+
+impl Call {
+    fn new(audio_loudest: usize) -> Self {
+        Self {
+            members: Vec::new(),
+            screen: None,
+            voices: Selector::new(audio_loudest),
+        }
+    }
 }
 
 /// Names a call: its group (the service client that owns it) and its id.
@@ -61,6 +86,9 @@ pub(crate) struct CallId {
 pub struct Engine {
     /// Counts packet writes, to time one in a few.
     write_clock: u32,
+    /// How much the shard this engine runs on is asked for compared with what it can do (see
+    /// `runtime::scaler::Pressure`).
+    load: Load,
     cfg: Arc<EngineConfig>,
     metrics: Arc<dyn Metrics>,
     rng: Rng,
@@ -88,9 +116,16 @@ impl std::fmt::Debug for Engine {
 }
 
 impl Engine {
+    /// Tells the engine how loaded its shard is: from `Shedding` on, its receivers are held to the
+    /// small video layers and its calls forward fewer voices (one, when `Saturated`).
+    pub fn set_load(&mut self, load: Load) {
+        self.load = load;
+    }
+
     pub fn new(cfg: Arc<EngineConfig>, metrics: Arc<dyn Metrics>, rng: Rng) -> Self {
         Self {
             write_clock: 0,
+            load: Load::Ok,
             cfg,
             metrics,
             rng,
