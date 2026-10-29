@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use recorder::media::Entry;
@@ -52,6 +53,9 @@ pub struct Deps {
     pub pending: Arc<Pending>,
     pub metrics: Arc<Metrics>,
     pub policy: Policy,
+    /// Captures started and not yet over for the server: counted up when one starts, down here
+    /// when its end has been reported. A node that is shutting down waits for it to reach zero.
+    pub unfinished: Arc<AtomicUsize>,
 }
 
 /// A recording's progress through the uploader.
@@ -108,6 +112,23 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, tx: mpsc::WeakUnboundedSender
                 }
                 run
             }
+            Cmd::Deadline => {
+                // The node is out of time: a capture that is over is reported now, with the
+                // files that are in. The rest are not coming (the server leaves them out).
+                let over: Vec<u64> = runs
+                    .iter()
+                    .filter(|(_, s)| s.ended.is_some())
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in over {
+                    if let Some(state) = runs.remove(&id)
+                        && let Some(ended) = state.ended
+                    {
+                        finish(&state.run, ended, &deps).await;
+                    }
+                }
+                continue;
+            }
         };
         if runs
             .get(&id)
@@ -145,6 +166,11 @@ async fn finish(run: &Run, ended: Ended, deps: &Deps) {
         // Only if no later run of the recording is using it.
         let _ = tokio::fs::remove_dir(parent).await;
     }
+    let _ = deps
+        .unfinished
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            Some(n.saturating_sub(1))
+        });
 }
 
 /// Whether trying again could help: a 4xx answer will not change.
@@ -238,6 +264,7 @@ mod tests {
         pending: Arc<Pending>,
         metrics: Arc<Metrics>,
         dir: PathBuf,
+        unfinished: Arc<AtomicUsize>,
     }
 
     fn harness(tag: &str, policy: Policy) -> Harness {
@@ -249,13 +276,16 @@ mod tests {
         let (tx, out) = mpsc::channel(64);
         reports.attach("c1", ConnHandle::new("mm".into(), tx));
         let pending = Arc::new(Pending::new(u64::MAX, metrics.clone()));
+        let unfinished = Arc::new(AtomicUsize::new(0));
         let cmds = spawn(Deps {
             reports,
             pending: pending.clone(),
             metrics: metrics.clone(),
             policy,
+            unfinished: unfinished.clone(),
         });
         Harness {
+            unfinished,
             cmds,
             out,
             pending,
@@ -613,5 +643,68 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn at_the_deadline_a_capture_that_is_over_is_reported_with_the_files_that_are_in() {
+        // One recording has its file stored. Another's upload crawls (a rate of 10 bytes a
+        // second), so when time runs out its capture is over but its file is not in.
+        let lms = Lms::start().await;
+        let mut h = harness("deadline", quick());
+        h.unfinished.store(1, Ordering::SeqCst);
+        let good = h.run(lms.api(), 10);
+        let stored = h.file(&good, "a.webm", b"stored", "voice");
+        h.cmds
+            .send(Cmd::File {
+                run: good.clone(),
+                index: 10,
+                entry: stored,
+            })
+            .unwrap();
+        let ClientMessage::RecordFile(f) = h.next().await else {
+            panic!("the first file is reported")
+        };
+        assert_eq!(f.index, 10);
+
+        let slow = Arc::new(Run {
+            id: 2,
+            api: lms
+                .api()
+                .retrying(0, Duration::from_millis(1))
+                .throttled(Arc::new(recorder::throttle::Throttle::new(10))),
+            dir: h.dir.join("slow"),
+            ..Arc::into_inner(h.run(lms.api(), 20)).unwrap()
+        });
+        let late = h.file(&slow, "b.webm", &vec![1u8; 100_000], "voice");
+        h.cmds
+            .send(Cmd::File {
+                run: slow.clone(),
+                index: 20,
+                entry: late,
+            })
+            .unwrap();
+        h.cmds
+            .send(Cmd::Ended {
+                run: slow.clone(),
+                ended: ended("call_ended", 1),
+            })
+            .unwrap();
+        h.quiet().await;
+        assert_eq!(h.unfinished.load(Ordering::SeqCst), 1, "still uploading");
+
+        h.cmds.send(Cmd::Deadline).unwrap();
+        let ClientMessage::RecordEnded(e) = h.next().await else {
+            panic!("the end is reported without waiting for the file")
+        };
+        assert_eq!(
+            (e.file_base, e.files, e.reason.as_str()),
+            (20, 1, "call_ended")
+        );
+        // The count goes down once the end is out and the directory removed, just after.
+        let gone = tokio::time::Instant::now() + Duration::from_secs(2);
+        while h.unfinished.load(Ordering::SeqCst) != 0 && tokio::time::Instant::now() < gone {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(h.unfinished.load(Ordering::SeqCst), 0);
     }
 }

@@ -223,6 +223,68 @@ async fn a_recording_asked_for_before_its_call_begins_with_the_call() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_shutdown_mid_recording_uploads_every_file_and_reports_the_end() {
+    let (mut c, dir) = call_of_two("shutdown").await;
+    c.wa.send(&start(&c.lms, REC_ID, "call1", 70)).await;
+    c.speak(100).await;
+
+    // The node is told to stop while the lesson runs and the recording is open.
+    let app = c.s.app.take().unwrap();
+    let down = tokio::spawn(app.shutdown(Some(Duration::from_secs(30))));
+    c.until("the end of the recording", |r| ended(r, REC_ID).is_some())
+        .await;
+    assert!(
+        !c.a.closed && !c.b.closed,
+        "reported while the sessions still drain"
+    );
+
+    let all = reports([&c.wa, &c.wb]);
+    let end = ended(&all, REC_ID).unwrap();
+    assert_eq!(
+        end.reason, "call_ended",
+        "the reason that lets the server carry the recording on elsewhere"
+    );
+    assert_eq!((end.file_base, end.files), (70, 2), "{all:?}");
+    let got = files(&all, REC_ID);
+    assert_eq!(got.iter().map(|f| f.index).collect::<Vec<_>>(), [70, 71]);
+    for f in &got {
+        let stored = c
+            .lms
+            .state
+            .lock()
+            .unwrap()
+            .uploads
+            .get(&f.index.to_string())
+            .cloned();
+        assert_eq!(
+            stored.map(|b| b.len() as u64),
+            Some(f.size),
+            "{f:?} is stored whole"
+        );
+    }
+
+    // A recording asked for on a node that is going is refused, so the server tries elsewhere.
+    c.wa.send(&start(&c.lms, "late", "call1", 0)).await;
+    c.until("the refusal", |r| ended(r, "late").is_some()).await;
+    assert_eq!(
+        ended(&reports([&c.wa, &c.wb]), "late").unwrap().reason,
+        "refused"
+    );
+
+    // The lesson's sessions end and the shutdown completes.
+    c.wa.leave("session-alice").await;
+    c.wb.leave("session-bob").await;
+    tokio::time::timeout(Duration::from_secs(30), down)
+        .await
+        .expect("the shutdown completes")
+        .unwrap();
+    let left: Vec<_> = std::fs::read_dir(&dir)
+        .map(|d| d.flatten().collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "left in the data dir: {left:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_second_recording_of_a_call_is_refused_and_a_repeated_start_changes_nothing() {
     let (mut c, _) = call_of_two("busy").await;
     c.wa.send(&start(&c.lms, REC_ID, "call1", 0)).await;

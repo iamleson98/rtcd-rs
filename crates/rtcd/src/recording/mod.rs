@@ -4,7 +4,7 @@
 //! it from there:
 //!
 //! * [`writer`]: threads that drain the queues and write WebM files with the `recorder` crate,
-//!   rotating them every ten minutes and numbering them in the order they close;
+//!   rotating them every two minutes and numbering them in the order they close;
 //! * [`uploader`]: a task that sends each closed file to the server with the recording's bot
 //!   session, then reports it, then deletes it, under one bandwidth cap for the whole node;
 //! * [`reports`]: what is told to the server over the clients' websockets, kept until a
@@ -21,7 +21,7 @@ mod writer;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -85,7 +85,19 @@ pub enum Cmd {
     Ended { run: Arc<Run>, ended: Ended },
     /// An upload task finished with a file (stored or given up on).
     Uploaded { run: u64 },
+    /// The node is out of time to shut down: report the captures that are over, with the files
+    /// that are in.
+    Deadline,
 }
+
+/// What `record_ended` says when a node shuts down under a recording.
+///
+/// The server's vocabulary has no reason for it. `call_ended` is the one that keeps the recording
+/// going: the server notes that the room closed and, if the call opens again within its grace
+/// (five minutes, `rtcdCallGrace`), which a rolling deploy does when the class reconnects to
+/// another node, sends the start again with the next file numbers and the same `t0`; otherwise it
+/// stops the recording. `failed` would end the capture for good.
+pub const SHUTDOWN_REASON: &str = "call_ended";
 
 /// Why a recording could not be registered.
 #[derive(Debug, PartialEq, Eq)]
@@ -155,6 +167,15 @@ impl Registry {
             .map(|a| a.call_id.clone())
     }
 
+    /// Every capture as (client, recording, call).
+    pub fn all(&self) -> Vec<(String, String, String)> {
+        self.active
+            .lock()
+            .iter()
+            .map(|(id, a)| (a.client_id.clone(), id.clone(), a.call_id.clone()))
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.active.lock().len()
     }
@@ -175,6 +196,10 @@ struct Live {
     runs: AtomicU64,
     data_dir: PathBuf,
     max_bytes: u64,
+    /// The node is shutting down: nothing new is taken, and what ends reports `SHUTDOWN_REASON`.
+    draining: Arc<AtomicBool>,
+    /// Captures started whose end the server has not been told yet.
+    unfinished: Arc<AtomicUsize>,
 }
 
 /// Recording on this node.
@@ -256,16 +281,21 @@ impl Recordings {
         if let Err(e) = std::fs::create_dir_all(&data_dir) {
             error!(dir = %data_dir.display(), error = %e, "cannot create the recordings directory; recordings will fail");
         }
+        // Once, before this process has recorded anything, so what is found is not its own. The
+        // directory must be this process's alone (an emptyDir of its pod): a second process using
+        // it would have its files removed by the first to start.
         clear_leftovers(&data_dir);
         let pending = Arc::new(Pending::new(
             cfg.max_pending_bytes.max(1) as u64,
             metrics.clone(),
         ));
+        let unfinished = Arc::new(AtomicUsize::new(0));
         let uploads = uploader::spawn(uploader::Deps {
             reports: reports.clone(),
             pending: pending.clone(),
             metrics: metrics.clone(),
             policy: uploader::Policy::default(),
+            unfinished: unfinished.clone(),
         });
         // The writers only append to files; a few threads serve every recording.
         let cores = std::thread::available_parallelism().map_or(1, usize::from);
@@ -283,6 +313,8 @@ impl Recordings {
                 runs: AtomicU64::new(0),
                 data_dir,
                 max_bytes: cfg.max_bytes.max(1) as u64,
+                draining: Arc::new(AtomicBool::new(false)),
+                unfinished,
             }),
             reports,
             metrics,
@@ -313,6 +345,9 @@ impl Recordings {
                 "recording is not enabled on this node",
             );
         };
+        if live.draining.load(Ordering::Acquire) {
+            return self.refuse(client_id, &req, "refused", "this node is shutting down");
+        }
         if !valid_id(&req.recording_id) || req.call_id.is_empty() {
             return self.refuse(
                 client_id,
@@ -380,10 +415,12 @@ impl Recordings {
                 pending: live.pending.clone(),
                 registry: live.registry.clone(),
                 metrics: self.metrics.clone(),
+                draining: live.draining.clone(),
             },
             Settings::default(),
         );
         self.metrics.record_capture(1);
+        live.unfinished.fetch_add(1, Ordering::AcqRel);
         live.writers.add(job);
         info!(recording = %req.recording_id, call = %req.call_id, file_base = req.file_base, "recording a call");
         // If the SFU cannot take the recording it drops the sink, which the writer takes for a
@@ -410,6 +447,55 @@ impl Recordings {
         if let Err(e) = sfu.record_stop(client_id, &call, recording_id) {
             warn!(recording = recording_id, error = %e, "the SFU would not stop the recording");
         }
+    }
+
+    /// The node is shutting down: takes no new recording, lifts the upload rate (the media this
+    /// node sends is about to end anyway, and the files must get out first), and stops every
+    /// capture at once so that its open files close and are uploaded. Call it before the SFU
+    /// starts to drain, then [`wait_drained`](Self::wait_drained).
+    pub fn begin_drain(&self, sfu: &Sfu) {
+        let Some(live) = &self.live else {
+            return;
+        };
+        live.draining.store(true, Ordering::Release);
+        live.throttle.lift();
+        let all = live.registry.all();
+        info!(
+            captures = all.len(),
+            "shutting down: stopping recordings and uploading their files"
+        );
+        for (client, recording, call) in all {
+            if let Err(e) = sfu.record_stop(&client, &call, &recording) {
+                warn!(recording = %recording, error = %e, "the SFU would not stop a recording for the shutdown");
+            }
+        }
+    }
+
+    /// Waits until every capture has ended and been reported, or `within` has passed. At the
+    /// deadline the captures that are over are reported with the files that are in, and the files
+    /// that are not are lost: they are counted and logged once. Returns how many were lost.
+    pub async fn wait_drained(&self, within: Duration) -> u64 {
+        let Some(live) = &self.live else {
+            return 0;
+        };
+        let end = tokio::time::Instant::now() + within;
+        while live.unfinished.load(Ordering::Acquire) > 0 {
+            if tokio::time::Instant::now() >= end {
+                let lost = live.pending.files();
+                warn!(
+                    lost_files = lost,
+                    lost_bytes = live.pending.bytes(),
+                    unfinished = live.unfinished.load(Ordering::Acquire),
+                    "out of time to shut down: recording files that were not uploaded are lost"
+                );
+                let _ = live.uploads.send(Cmd::Deadline);
+                // Let the uploader's reports reach the connections, which close after this.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                return lost;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        0
     }
 
     /// Captures running on this node.

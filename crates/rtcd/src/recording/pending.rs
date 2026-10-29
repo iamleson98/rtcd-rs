@@ -13,6 +13,7 @@ use crate::metrics::Metrics;
 #[derive(Debug)]
 pub struct Pending {
     bytes: AtomicU64,
+    files: AtomicU64,
     cap: u64,
     metrics: Arc<Metrics>,
 }
@@ -21,6 +22,7 @@ impl Pending {
     pub fn new(cap: u64, metrics: Arc<Metrics>) -> Self {
         Self {
             bytes: AtomicU64::new(0),
+            files: AtomicU64::new(0),
             cap,
             metrics,
         }
@@ -28,12 +30,18 @@ impl Pending {
 
     /// A file of `n` bytes closed and waits for upload.
     pub fn add(&self, n: u64) {
+        self.files.fetch_add(1, Ordering::Relaxed);
         let now = self.bytes.fetch_add(n, Ordering::Relaxed) + n;
         self.metrics.record_pending(now);
     }
 
     /// A file of `n` bytes was uploaded or given up on, and removed.
     pub fn release(&self, n: u64) {
+        let _ = self
+            .files
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |f| {
+                Some(f.saturating_sub(1))
+            });
         let before = self
             .bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
@@ -50,6 +58,11 @@ impl Pending {
 
     pub fn bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// How many files wait.
+    pub fn files(&self) -> u64 {
+        self.files.load(Ordering::Relaxed)
     }
 }
 

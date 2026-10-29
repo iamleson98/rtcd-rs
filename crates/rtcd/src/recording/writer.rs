@@ -26,12 +26,15 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, info, warn};
 
 use super::pending::Pending;
-use super::{Cmd, Ended, Registry, Run};
+use super::{Cmd, Ended, Registry, Run, SHUTDOWN_REASON};
 use crate::metrics::Metrics;
 
 /// A file is closed and the next one begun after it has lasted this long, so that a lesson's files
-/// can be uploaded while it runs.
-pub const ROTATE_EVERY: Duration = Duration::from_secs(600);
+/// are uploaded while it runs. It also bounds what a node shutting down still holds: at 0.29 GB per
+/// recorded lesson-hour (measured 2026-10-29), 175 lessons hold ~1.7 GB of open files after two
+/// minutes, which leaves the node in the 80 s drain at ~170 Mbit/s with the upload rate lifted; ten
+/// minutes would be ~8.5 GB, more than any drain can send.
+pub const ROTATE_EVERY: Duration = Duration::from_secs(120);
 /// What a writer thread sleeps when none of its recordings had anything.
 const IDLE_SLEEP: Duration = Duration::from_millis(5);
 /// How often the streams of a recording are given the time, when its queue is empty.
@@ -97,6 +100,7 @@ pub struct Job {
     pending: Arc<Pending>,
     registry: Arc<Registry>,
     metrics: Arc<Metrics>,
+    draining: Arc<AtomicBool>,
     settings: Settings,
     /// Packets left out because uploads were behind, and how many of those the metrics know.
     writer_dropped: u64,
@@ -123,6 +127,8 @@ pub struct Links {
     pub pending: Arc<Pending>,
     pub registry: Arc<Registry>,
     pub metrics: Arc<Metrics>,
+    /// The node is shutting down.
+    pub draining: Arc<AtomicBool>,
 }
 
 impl Job {
@@ -145,6 +151,7 @@ impl Job {
             pending: links.pending,
             registry: links.registry,
             metrics: links.metrics,
+            draining: links.draining,
             settings,
             writer_dropped: 0,
             writer_dropped_reported: 0,
@@ -299,6 +306,15 @@ impl Job {
             return;
         }
         self.ended = true;
+        // Under a node that is shutting down, the capture stopped because the node is going, not
+        // because anyone asked or because it failed: the server needs to hear that the call may
+        // come back elsewhere.
+        let reason =
+            if self.draining.load(Ordering::Acquire) && matches!(reason, "stopped" | "failed") {
+                SHUTDOWN_REASON
+            } else {
+                reason
+            };
         for s in self.streams.values_mut() {
             s.rec.finish(at, "the recording ended");
         }
@@ -461,6 +477,7 @@ mod tests {
         metrics: Arc<Metrics>,
         run: Arc<Run>,
         t0: Instant,
+        draining: Arc<AtomicBool>,
     }
 
     fn rig(tag: &str, max_bytes: u64, pending_cap: u64, settings: Settings) -> Rig {
@@ -482,6 +499,7 @@ mod tests {
         let pending = Arc::new(Pending::new(pending_cap, metrics.clone()));
         let registry = Arc::new(Registry::default());
         registry.begin("rec1", "mm", "call", 1).unwrap();
+        let draining = Arc::new(AtomicBool::new(false));
         let (uploads, cmds) = unbounded_channel();
         let (sink, rx) = record_channel(65536);
         let job = Job::new(
@@ -493,10 +511,12 @@ mod tests {
                 pending: pending.clone(),
                 registry: registry.clone(),
                 metrics: metrics.clone(),
+                draining: draining.clone(),
             },
             settings,
         );
         Rig {
+            draining,
             job,
             sink,
             cmds,
@@ -554,7 +574,7 @@ mod tests {
                 match cmd {
                     Cmd::File { index, entry, .. } => files.push((index, entry)),
                     Cmd::Ended { ended: e, .. } => ended = Some(e),
-                    Cmd::Uploaded { .. } => {}
+                    Cmd::Uploaded { .. } | Cmd::Deadline => {}
                 }
             }
             (files, ended)
@@ -943,6 +963,41 @@ mod tests {
     }
 
     #[test]
+    fn a_capture_that_ends_under_a_shutdown_says_the_call_may_come_back() {
+        for (end, expect) in [
+            (Some(RecordEnd::Stopped), "call_ended"),
+            (None, "call_ended"), // the shard let go without an end
+        ] {
+            let rig = rig("shutdown", u64::MAX, u64::MAX, eager());
+            rig.draining.store(true, Ordering::SeqCst);
+            let t0 = rig.t0;
+            rig.open(0, TrackType::Voice, "a", "ua");
+            rig.packet(0, opus(t0, 1, 0, &[0xfc, 1]));
+            if let Some(reason) = end {
+                rig.end(reason, t0 + Duration::from_millis(100));
+            }
+            let Rig {
+                mut job,
+                sink,
+                mut cmds,
+                ..
+            } = rig;
+            drop(sink);
+            assert_eq!(job.pump(t0 + Duration::from_millis(100)), Pump::Done);
+            let mut got = None;
+            let mut files = 0;
+            while let Ok(cmd) = cmds.try_recv() {
+                match cmd {
+                    Cmd::Ended { ended, .. } => got = Some(ended.reason),
+                    Cmd::File { .. } => files += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!((got, files), (Some(expect), 1), "its open file closed");
+        }
+    }
+
+    #[test]
     fn a_refused_recording_says_so_and_has_no_files() {
         let mut rig = rig("refused", u64::MAX, u64::MAX, eager());
         let now = rig.t0;
@@ -1017,7 +1072,7 @@ mod tests {
                 match cmd {
                     Cmd::File { .. } => files += 1,
                     Cmd::Ended { ended: e, .. } => ended = Some(e),
-                    Cmd::Uploaded { .. } => {}
+                    Cmd::Uploaded { .. } | Cmd::Deadline => {}
                 }
             }
             thread::sleep(Duration::from_millis(5));

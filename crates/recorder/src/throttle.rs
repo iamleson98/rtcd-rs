@@ -6,6 +6,7 @@
 //! blocks for good, and callers that arrive together are served in the order they reserved.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// How much unused rate is kept for a burst: a quarter of a second's worth.
@@ -24,6 +25,8 @@ pub struct Throttle {
     /// Bytes per second.
     rate: f64,
     state: Mutex<State>,
+    /// The rate no longer applies (see [`Throttle::lift`]).
+    lifted: AtomicBool,
 }
 
 impl Throttle {
@@ -36,11 +39,21 @@ impl Throttle {
                 tokens: rate * BURST,
                 at: Instant::now(),
             }),
+            lifted: AtomicBool::new(false),
         }
+    }
+
+    /// Stops holding anything back, for good: a process that is about to exit and has files to
+    /// get out before it does, when the media it sends no longer matters as much.
+    pub fn lift(&self) {
+        self.lifted.store(true, Ordering::Release);
     }
 
     /// Reserves `bytes` at `now` and says how long to wait before sending them.
     pub fn reserve(&self, bytes: u64, now: Instant) -> Duration {
+        if self.lifted.load(Ordering::Acquire) {
+            return Duration::ZERO;
+        }
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let elapsed = now.saturating_duration_since(s.at).as_secs_f64();
         s.at = s.at.max(now);
@@ -96,6 +109,15 @@ mod tests {
             (wait.as_secs_f64() - 0.25).abs() < 1e-6,
             "an hour saved no more than a burst: {wait:?}"
         );
+    }
+
+    #[test]
+    fn a_lifted_throttle_holds_nothing_back() {
+        let t = Throttle::new(1000);
+        let now = Instant::now();
+        assert!(t.reserve(10_000, now) > Duration::from_secs(5));
+        t.lift();
+        assert_eq!(t.reserve(1_000_000, now), Duration::ZERO);
     }
 
     #[tokio::test]
