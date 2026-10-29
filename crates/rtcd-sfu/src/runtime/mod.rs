@@ -30,12 +30,15 @@ pub use scaler::ScalingPolicy;
 use self::directory::Directory;
 use self::registry::Registry;
 use self::scaler::{Scaler, ShardLoad, Step};
-use self::shard::{Shard, ShardCommand, ShardHandle, ShardParts, UdpSock, Undelivered};
+use self::shard::{
+    RecordStart, RecordStop, Shard, ShardCommand, ShardHandle, ShardParts, UdpSock, Undelivered,
+};
 use self::table::ShardTable;
 use crate::config::LocalAddress;
 use crate::engine::{CloseReason, Command, Engine, Event};
 use crate::ids::Rng;
 use crate::metrics::Metrics;
+use crate::record::{RecordError, RecordSink};
 
 /// Receives what the SFU reports about sessions. Called from the SFU's threads: it must not block.
 pub trait EventSink: Send + Sync + 'static {
@@ -431,6 +434,71 @@ impl Sfu {
             .map_err(|e| match e {
                 Undelivered::Full => SignalError::Overloaded,
                 Undelivered::Stopped => SignalError::UnknownSession,
+            })
+    }
+
+    /// Starts recording a call that has sessions: its streams are copied to `sink`, which first
+    /// gets [`RecordItem::Begin`](crate::record::RecordItem::Begin) with `recording_id` and `t0`
+    /// and ends with an [`End`](crate::record::RecordItem::End). The rest is reported through the
+    /// sink: a recording the call's shard cannot start (the call ended meanwhile, or it is
+    /// recorded already) ends at once as `Refused`.
+    pub fn record_start(
+        &self,
+        group: &str,
+        call: &str,
+        recording_id: &str,
+        t0: Instant,
+        sink: RecordSink,
+    ) -> Result<(), RecordError> {
+        let shard = self
+            .core
+            .registry
+            .shard_of_call(group, call)
+            .ok_or(RecordError::UnknownCall)?;
+        self.shard_send(
+            shard,
+            ShardCommand::RecordStart(Box::new(RecordStart {
+                group: group.to_owned(),
+                call: call.to_owned(),
+                recording_id: recording_id.to_owned(),
+                t0,
+                sink,
+            })),
+        )
+    }
+
+    /// Stops the recording of a call; its sink gets what is left and an `End`. A call that is not
+    /// recorded under that id is left alone.
+    pub fn record_stop(
+        &self,
+        group: &str,
+        call: &str,
+        recording_id: &str,
+    ) -> Result<(), RecordError> {
+        let shard = self
+            .core
+            .registry
+            .shard_of_call(group, call)
+            .ok_or(RecordError::UnknownCall)?;
+        self.shard_send(
+            shard,
+            ShardCommand::RecordStop(RecordStop {
+                group: group.to_owned(),
+                call: call.to_owned(),
+                recording_id: recording_id.to_owned(),
+            }),
+        )
+    }
+
+    fn shard_send(&self, shard: usize, cmd: ShardCommand) -> Result<(), RecordError> {
+        self.core
+            .table
+            .get(shard)
+            .ok_or(RecordError::UnknownCall)?
+            .send(cmd)
+            .map_err(|e| match e {
+                Undelivered::Full => RecordError::Overloaded,
+                Undelivered::Stopped => RecordError::UnknownCall,
             })
     }
 

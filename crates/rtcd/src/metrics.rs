@@ -24,6 +24,10 @@ const RTT_BUCKETS: [f64; 12] = [
 const ESTIMATE_BUCKETS: [f64; 12] = [
     100e3, 250e3, 500e3, 750e3, 1e6, 1.5e6, 2e6, 3e6, 4e6, 6e6, 10e6, 20e6,
 ];
+/// Items queued for a recording's writer; the queue holds 8,192.
+const RECORD_QUEUE_BUCKETS: [f64; 10] = [
+    0.0, 1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 2048.0, 4096.0, 8192.0,
+];
 /// Handshakes and signaling take longer than packet latencies: seconds, not milliseconds.
 const SETUP_BUCKETS: [f64; 14] = [
     0.001, 0.005, 0.0075, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.3, 0.4, 0.5, 0.75, 1.0,
@@ -65,6 +69,8 @@ pub struct Metrics {
     screen_layer_seconds: [Counter; 2],
     /// Keyframe requests: [sent, held back].
     keyframe_requests: [Counter; 2],
+    record_dropped: Counter,
+    record_queue_depth: prometheus::Histogram,
 }
 
 impl std::fmt::Debug for Metrics {
@@ -383,6 +389,33 @@ impl Metrics {
                 );
                 ["sent", "held_back"].map(|l| family.with_label_values(&[l]))
             },
+            record_dropped: {
+                let c = Counter::with_opts(
+                    Opts::new(
+                        "dropped_packets_total",
+                        "Packets of a recording left out because its queue to the writer was full",
+                    )
+                    .namespace(NAMESPACE)
+                    .subsystem("record"),
+                )
+                .expect("valid metric");
+                r.register(Box::new(c.clone())).expect("unique metric");
+                c
+            },
+            record_queue_depth: {
+                let h = prometheus::Histogram::with_opts(
+                    HistogramOpts::new(
+                        "queue_depth",
+                        "Items waiting for a recording's writer (a sample a second per recording)",
+                    )
+                    .namespace(NAMESPACE)
+                    .subsystem("record")
+                    .buckets(RECORD_QUEUE_BUCKETS.to_vec()),
+                )
+                .expect("valid metric");
+                r.register(Box::new(h.clone())).expect("unique metric");
+                h
+            },
             registry,
         }
     }
@@ -556,6 +589,14 @@ impl SfuMetrics for Metrics {
         self.keyframe_requests[usize::from(!sent)].inc();
     }
 
+    fn record_dropped(&self, packets: u64) {
+        self.record_dropped.inc_by(packets as f64);
+    }
+
+    fn record_queue_depth(&self, depth: u64) {
+        self.record_queue_depth.observe(depth as f64);
+    }
+
     fn rtp_write_time(&self, group: &str, kind: TrackType, took: Duration) {
         self.rtp_write_time
             .with_label_values(&[group, kind.as_str()])
@@ -594,6 +635,8 @@ mod tests {
         m.bandwidth_estimate(2.5e6);
         m.screen_layer_time(true, Duration::from_secs(1));
         m.keyframe_request(false);
+        m.record_dropped(5);
+        m.record_queue_depth(12);
         m.ws_connected("client");
         m.ws_message("client", "join", "in");
         let text = m.render();
@@ -619,6 +662,8 @@ mod tests {
             "rtcd_rtc_bandwidth_estimate_bps_count 1",
             "rtcd_rtc_screen_layer_seconds_total{layer=\"large\"} 1",
             "rtcd_rtc_keyframe_requests_total{result=\"held_back\"} 1",
+            "rtcd_record_dropped_packets_total 5",
+            "rtcd_record_queue_depth_count 1",
             "rtcd_ws_connections_total{clientID=\"client\"} 1",
             "rtcd_ws_messages_total{clientID=\"client\",direction=\"in\",type=\"join\"} 1",
         ] {

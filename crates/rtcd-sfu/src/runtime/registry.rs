@@ -252,6 +252,14 @@ impl Registry {
             .collect()
     }
 
+    /// The shard a call lives on, while it has sessions.
+    pub fn shard_of_call(&self, group: &str, call: &str) -> Option<usize> {
+        self.lock()
+            .calls
+            .get(&(group.to_owned(), call.to_owned()))
+            .map(|(shard, _)| *shard)
+    }
+
     pub fn len(&self) -> usize {
         self.lock().sessions.len()
     }
@@ -508,6 +516,17 @@ mod tests {
         assert!(r.get("g", "other", "s").is_none());
         assert_eq!(r.call("g", "c").len(), 1);
         assert!(r.call("g", "none").is_empty());
+    }
+
+    #[test]
+    fn a_call_is_found_on_its_shard_while_it_has_sessions() {
+        let r = Registry::new(2);
+        let shard = r.admit(&cfg("c", "s1")).unwrap();
+        assert_eq!(r.shard_of_call("g", "c"), Some(shard));
+        assert_eq!(r.shard_of_call("other", "c"), None);
+        assert_eq!(r.shard_of_call("g", "none"), None);
+        r.release("s1");
+        assert_eq!(r.shard_of_call("g", "c"), None);
     }
 
     #[test]

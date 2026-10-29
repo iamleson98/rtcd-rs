@@ -3,11 +3,12 @@
 
 mod live;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use live::Live;
 use rtcd_proto::MessageType;
 use rtcd_sfu::engine::{CloseReason, Event};
+use rtcd_sfu::record::RecordError;
 use rtcd_sfu::runtime::ScalingPolicy;
 
 #[test]
@@ -455,4 +456,84 @@ fn calls_that_start_together_are_spread_before_their_participants_arrive() {
     live.join("d1", "call4");
     live.join("e1", "call5");
     assert_eq!(live.sfu.shard_count(), 3, "and the fifth finds both full");
+}
+
+/// A recording is started on the shard the call lives on, whichever it is, and each call's media
+/// goes to its own recording only.
+#[test]
+fn a_call_is_recorded_on_whichever_shard_it_lives_on() {
+    use rtcd_sfu::record::{RecordEnd, RecordItem, record_channel};
+    let mut live = Live::start(4);
+    let mut speakers = Vec::new();
+    for c in 0..6 {
+        let a = live.join(&format!("a{c}"), &format!("call{c}"));
+        live.join(&format!("b{c}"), &format!("call{c}"));
+        speakers.push(a);
+    }
+    let mut recordings = Vec::new();
+    for c in 0..6 {
+        let (sink, rx) = record_channel(1024);
+        live.sfu
+            .record_start(
+                "group",
+                &format!("call{c}"),
+                &format!("rec{c}"),
+                Instant::now(),
+                sink,
+            )
+            .expect("the call exists");
+        recordings.push(rx);
+    }
+    let (sink, _rx) = record_channel(8);
+    assert_eq!(
+        live.sfu
+            .record_start("group", "nobody", "rec", Instant::now(), sink),
+        Err(RecordError::UnknownCall)
+    );
+
+    for &a in &speakers {
+        live.speak(a, 40);
+    }
+    live.run(Duration::from_millis(400));
+    for c in 0..6 {
+        live.sfu
+            .record_stop("group", &format!("call{c}"), &format!("rec{c}"))
+            .unwrap();
+    }
+    live.run(Duration::from_millis(300));
+
+    for (c, rx) in recordings.iter_mut().enumerate() {
+        let items: Vec<RecordItem> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let RecordItem::Begin(begin) = &items[0] else {
+            panic!("call{c}: {items:?}");
+        };
+        assert_eq!(begin.recording_id, format!("rec{c}"));
+        let sessions: Vec<&str> = items
+            .iter()
+            .filter_map(|i| match i {
+                RecordItem::Open(o) => Some(o.session_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sessions,
+            [format!("session-a{c}")],
+            "only its own call's speaker"
+        );
+        let packets = items
+            .iter()
+            .filter(|i| matches!(i, RecordItem::Packet(_)))
+            .count();
+        assert!(packets >= 30, "call{c}: {packets} packets");
+        assert!(
+            matches!(
+                items.last(),
+                Some(RecordItem::End {
+                    reason: RecordEnd::Stopped,
+                    ..
+                })
+            ),
+            "call{c}"
+        );
+    }
 }

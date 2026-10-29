@@ -23,6 +23,7 @@ use super::table::ShardTable;
 use super::tcp::TcpConn;
 use crate::engine::{Command, Engine, Event, FastMap, Load, Proto, RouteUpdate};
 use crate::metrics::{Metrics, NetTraffic};
+use crate::record::RecordSink;
 
 const WAKER: Token = Token(0);
 const TCP_BASE: usize = 1 << 16;
@@ -58,6 +59,10 @@ pub(crate) struct Forwarded {
 #[derive(Debug)]
 pub(crate) enum ShardCommand {
     Engine(Command),
+    /// Start recording a call.
+    RecordStart(Box<RecordStart>),
+    /// Stop recording a call.
+    RecordStop(RecordStop),
     /// Datagrams another shard read that belong to this one's sessions.
     Datagrams(Vec<Forwarded>),
     /// A TCP connection another shard accepted whose first packet named a session of this one,
@@ -73,6 +78,24 @@ pub(crate) enum ShardCommand {
         peer: SocketAddr,
     },
     Shutdown,
+}
+
+/// The arguments of [`Engine::record_start`].
+#[derive(Debug)]
+pub(crate) struct RecordStart {
+    pub group: String,
+    pub call: String,
+    pub recording_id: String,
+    pub t0: Instant,
+    pub sink: RecordSink,
+}
+
+/// The arguments of [`Engine::record_stop`].
+#[derive(Debug)]
+pub(crate) struct RecordStop {
+    pub group: String,
+    pub call: String,
+    pub recording_id: String,
 }
 
 /// Why a command did not reach a shard.
@@ -743,6 +766,15 @@ impl Shard {
         loop {
             match self.commands.try_recv() {
                 Ok(ShardCommand::Engine(cmd)) => self.engine.handle_command(now, cmd),
+                Ok(ShardCommand::RecordStart(r)) => {
+                    let r = *r;
+                    self.engine
+                        .record_start(now, &r.group, &r.call, &r.recording_id, r.t0, r.sink);
+                }
+                Ok(ShardCommand::RecordStop(r)) => {
+                    self.engine
+                        .record_stop(now, &r.group, &r.call, &r.recording_id);
+                }
                 Ok(ShardCommand::Datagrams(batch)) => {
                     for d in batch {
                         self.engine
