@@ -192,7 +192,7 @@ pub struct RtcConfig {
     /// The packet time, in milliseconds, browsers are asked to send their voice with. A longer one
     /// makes fewer, larger packets: 40 halves the packets a call's open microphones cost every
     /// listener, for 20 ms more delay (a browser sends 20 on its own). 0, the default, leaves it
-    /// to the browser; otherwise a multiple of 10 up to 120.
+    /// to the browser; otherwise a multiple of 20 (Opus's frame) up to 120.
     pub audio_ptime_ms: i64,
     /// The most this node should send, in megabits per second. Near it every receiver's cameras
     /// and screen shares fall back to their small layer, so the node slows down evenly instead of
@@ -206,10 +206,11 @@ pub struct RtcConfig {
     /// 0 (the default) sets no budget.
     pub egress_budget_pps: i64,
     /// Whether a join is refused while the shard that would serve it is at its limit (a thread
-    /// busy for five seconds at 98.5 % or more, after shedding what it can): the participants it
+    /// busy for three seconds at 95 % or more, after shedding what it can): the participants it
     /// has keep their quality, where letting more in makes every call on the shard lose packets.
-    /// The default is on; a refused participant is told the call could not be joined and tries
-    /// again, and a new call goes to a shard that is not at its limit when there is one.
+    /// The default is on. A refused session is closed, and the participant joins again; a new call
+    /// goes to a shard that is not at its limit when there is one. The call's host and recorder,
+    /// and a participant who is in the call or left it in the last minute, are never refused.
     pub refuse_when_saturated: bool,
     /// Seconds to let running sessions end on shutdown before ending them; 0 waits for them
     /// without limit, as the Go service does (a second signal ends them at once).
@@ -541,10 +542,10 @@ impl Config {
         if !(0..=64).contains(&rtc.audio_loudest) {
             return Err(invalid("AudioLoudest", "must be between 0 and 64"));
         }
-        if !(0..=120).contains(&rtc.audio_ptime_ms) || rtc.audio_ptime_ms % 10 != 0 {
+        if !(0..=120).contains(&rtc.audio_ptime_ms) || rtc.audio_ptime_ms % 20 != 0 {
             return Err(invalid(
                 "AudioPtimeMs",
-                "must be 0 or a multiple of 10 up to 120",
+                "must be 0 or a multiple of 20 up to 120",
             ));
         }
         if rtc.drain_timeout_seconds < 0 {
@@ -875,9 +876,11 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
         assert!(bad(&|c| c.rtc.nack_buffer_size = 16384).contains("exceed 8192"));
         assert!(bad(&|c| c.rtc.audio_loudest = -1).contains("between 0 and 64"));
         assert!(bad(&|c| c.rtc.audio_loudest = 65).contains("between 0 and 64"));
-        assert!(bad(&|c| c.rtc.audio_ptime_ms = 25).contains("multiple of 10"));
-        assert!(bad(&|c| c.rtc.audio_ptime_ms = 130).contains("multiple of 10"));
-        assert!(bad(&|c| c.rtc.audio_ptime_ms = -10).contains("multiple of 10"));
+        assert!(bad(&|c| c.rtc.audio_ptime_ms = 25).contains("multiple of 20"));
+        assert!(bad(&|c| c.rtc.audio_ptime_ms = 10).contains("multiple of 20"));
+        assert!(bad(&|c| c.rtc.audio_ptime_ms = 30).contains("multiple of 20"));
+        assert!(bad(&|c| c.rtc.audio_ptime_ms = 140).contains("multiple of 20"));
+        assert!(bad(&|c| c.rtc.audio_ptime_ms = -20).contains("multiple of 20"));
         assert!(bad(&|c| c.rtc.egress_budget_mbps = -1).contains("between 0 and 100000"));
         assert!(bad(&|c| c.rtc.egress_budget_pps = -1).contains("between 0 and 100000000"));
         assert!(

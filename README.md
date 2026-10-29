@@ -104,9 +104,12 @@ browsers to send 40 ms in a packet instead, by writing `a=ptime` and `a=maxptime
 section the node receives on, in each description it sends (a browser given a description without
 one goes back to 20). That halves the voice packets of a call and the header bytes with them, at 20
 ms more delay and 40 ms lost to a lost packet instead of 20 (Opus's in-band repair covers it).
-Chromium applies it to what it sends (checked: 50.8 packets a second without, 25.6 with 40 and 17.6
-with 60); a browser that ignores it stays at 20. Forwarded voice keeps the packet time it was sent
-with. The value is 0 (the browser decides, the default) or a multiple of 10 up to 120.
+Chrome 156, Firefox 158 and Safari 26.6 apply it to what they send (checked: 50.8 packets a second
+without, 25.6 with 40 and 17.6 with 60 in Chromium; in a call through this node with 40, 25 a second
+from each of the three, and each heard the others at 25 a second without loss); a browser that
+ignores it stays at 20. Forwarded voice keeps the packet time it was sent with, and the voice
+activity detector follows it. The value is 0 (the browser decides, the default) or a multiple of 20
+up to 120.
 
 ## Large calls: a send budget
 
@@ -147,13 +150,17 @@ thirty seconds under 70 % (`src/runtime/scaler.rs`, `Pressure`).
 Past that there is a cliff. Measured on the OVH video VPS, a shard thread at 97 % lost 0.2 % of its
 packets and at 100 % about a third, because lost packets are asked for again and the thread has no
 time left for them, so it does not recover by itself. A shard at 95 % busy for three seconds is
-saturated: its calls forward the loudest voice only, and it refuses new sessions (a call that lives
+saturated: its calls forward the loudest voice only (a second speaker is heard from about half a
+second after starting, the selector's hysteresis and release; this is the emergency setting, and
+the price of keeping the other calls clean), and it refuses new sessions (a call that lives
 on it cannot move, so its next participant is refused; a new call goes to a shard that is not
 saturated, and is refused when none is), so the sessions it has keep their quality. It leaves that
 state after ten seconds under 90 %. The call's host (the join request's `host` field, which the LMS
 server sets for a class's teacher) and its recorder (`observer`) are never refused: a teacher whose
 connection dropped comes back as a new session, a node with no room still lets the teacher open the
-class, and a class that is being recorded keeps its recorder (a recorder costs about 3 % of a core
+class, and a class that is being recorded keeps its recorder. Nor is a participant refused who has a
+session in the call or whose last one ended in the last minute: a student's connection dropped, and
+they come back as a new session, not as someone the shard was not already serving (a recorder costs about 3 % of a core
 and 12 Mbit/s for a class of 30 with 24 cameras, measured with `lms-sim`).
 `RTCD_RTC_REFUSEWHENSATURATED=false` turns the refusal off.
 `GET /system` reports `shards_pressured` and `shards_saturated`.
