@@ -186,22 +186,12 @@ impl Api {
                 uploads.sort_by_key(|t| std::cmp::Reverse(files[t.index].size));
                 self.in_parallel(uploads.into_iter().map(|t| async move {
                     let n = t.index;
-                    let f = &files[n];
-                    let result = if t.upload_id.is_empty() {
-                        self.upload_whole(n, f, t).await.map(|()| None)
-                    } else {
-                        let upload_id = t.upload_id.clone();
-                        self.upload_parts(n, f, t).await.map(|()| {
-                            Some(MultipartDone {
-                                index: n,
-                                upload_id,
-                            })
+                    self.send_direct(n, &files[n], t)
+                        .await
+                        .map_err(|e| UploadError::File {
+                            index: n,
+                            source: Box::new(e),
                         })
-                    };
-                    result.map_err(|e| UploadError::File {
-                        index: n,
-                        source: Box::new(e),
-                    })
                 }))
                 .await?
             };
@@ -211,6 +201,61 @@ impl Api {
         }
         multipart.sort_by_key(|m| m.index);
         Ok(multipart)
+    }
+
+    /// Sends one file as object `index`, wherever the server says it goes, and returns the upload
+    /// in parts for the server to finish, if it was one. For a recording whose files are uploaded
+    /// as they close, so their numbers are not their places in a list.
+    pub async fn upload_file(
+        &self,
+        index: usize,
+        file: &Entry,
+    ) -> Result<Option<MultipartDone>, UploadError> {
+        let ask = [UploadRequest {
+            index,
+            kind: &file.kind,
+            size: file.size,
+            upload_id: "",
+            first_part: 0,
+        }];
+        let mut targets = self.targets(&ask).await?;
+        let sent = if !targets.direct {
+            self.upload_to_server(index, file).await.map(|()| None)
+        } else {
+            let t = match (targets.uploads.pop(), targets.uploads.is_empty()) {
+                (Some(t), true) if t.index == index => t,
+                _ => {
+                    return Err(UploadError::Protocol(format!(
+                        "asked where file {index} goes, told something else"
+                    )));
+                }
+            };
+            self.send_direct(index, file, t).await
+        };
+        sent.map_err(|e| UploadError::File {
+            index,
+            source: Box::new(e),
+        })
+    }
+
+    /// Sends a file to the storage URLs `t` names: whole, or in parts.
+    async fn send_direct(
+        &self,
+        n: usize,
+        f: &Entry,
+        t: Target,
+    ) -> Result<Option<MultipartDone>, UploadError> {
+        if t.upload_id.is_empty() {
+            self.upload_whole(n, f, t).await.map(|()| None)
+        } else {
+            let upload_id = t.upload_id.clone();
+            self.upload_parts(n, f, t).await.map(|()| {
+                Some(MultipartDone {
+                    index: n,
+                    upload_id,
+                })
+            })
+        }
     }
 
     /// Runs the uploads a few at a time; the first failure ends them all.
@@ -367,7 +412,17 @@ impl Api {
                 file.seek(SeekFrom::Start(offset))
                     .await
                     .map_err(|e| ApiError::Network(e.to_string()))?;
+                let throttle = self.throttle.clone();
                 let stream = ReaderStream::with_capacity(file.take(size), 256 << 10)
+                    .then(move |chunk| {
+                        let throttle = throttle.clone();
+                        async move {
+                            if let (Ok(bytes), Some(t)) = (&chunk, &throttle) {
+                                t.take(bytes.len() as u64).await;
+                            }
+                            chunk
+                        }
+                    })
                     .map_err(std::io::Error::other);
                 let mut req = self
                     .uploads
@@ -584,6 +639,130 @@ mod tests {
         assert_eq!(body["files"][1]["size"], 25);
         assert_eq!(body["files"][0]["kind"], "voice");
         assert_eq!(body["multipart"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn one_file_is_sent_as_the_object_its_index_names() {
+        let (files, bodies) = files("one");
+        // Through the server.
+        let fake = Fake::start(|r, _, _| {
+            if r.path.ends_with("/uploads") {
+                (200, Some(json!({"direct": false, "uploads": []})))
+            } else {
+                (200, None)
+            }
+        })
+        .await;
+        let done = fake.api().upload_file(1007, &files[1]).await.unwrap();
+        assert_eq!(done, None);
+        let seen = fake.seen();
+        let asked: Value = serde_json::from_slice(&seen[0].body).unwrap();
+        assert_eq!(
+            asked["files"],
+            json!([{"index": 1007, "kind": "camera", "size": 25}])
+        );
+        assert_eq!(seen[1].path, format!("{REC_PATH}/files/1007"));
+        assert_eq!(seen[1].body, bodies[1]);
+        assert_eq!(seen[1].auth, "Bearer bot-token");
+
+        // Straight to storage, whole and in parts: the answer names the file asked for.
+        let fake = Fake::start(|r, _, site| {
+            if r.path.ends_with("/uploads") {
+                let v: Value = serde_json::from_slice(&r.body).unwrap();
+                let kind = v["files"][0]["kind"].as_str().unwrap();
+                if kind == "voice" {
+                    (200, Some(json!({"direct": true, "uploads": [
+                        {"index": 1008, "content_type": "audio/webm", "url": format!("{site}/store/voice")}
+                    ]})))
+                } else {
+                    let part = |n: u64| json!({"number": n, "url": format!("{site}/store/up/{n}")});
+                    (200, Some(json!({"direct": true, "uploads": [
+                        {"index": 1009, "content_type": "video/webm", "upload_id": "up", "part_size": 10, "parts": [part(1), part(2), part(3)]}
+                    ]})))
+                }
+            } else {
+                (200, None)
+            }
+        })
+        .await;
+        let api = fake.api();
+        assert_eq!(api.upload_file(1008, &files[0]).await.unwrap(), None);
+        assert_eq!(
+            api.upload_file(1009, &files[1]).await.unwrap(),
+            Some(MultipartDone {
+                index: 1009,
+                upload_id: "up".into()
+            })
+        );
+        let seen = fake.seen();
+        assert!(
+            seen.iter()
+                .filter(|r| r.path.starts_with("/store/"))
+                .all(|r| r.auth.is_empty()),
+            "the bot's token never goes to storage"
+        );
+        let stored: Vec<u8> = ["/store/up/1", "/store/up/2", "/store/up/3"]
+            .iter()
+            .flat_map(|p| seen.iter().find(|r| r.path == *p).unwrap().body.clone())
+            .collect();
+        assert_eq!(stored, bodies[1]);
+
+        // An answer about another file is a protocol error, not a wrong upload.
+        let fake = Fake::start(|r, _, site| {
+            if r.path.ends_with("/uploads") {
+                (
+                    200,
+                    Some(json!({"direct": true, "uploads": [
+                        {"index": 5, "content_type": "audio/webm", "url": format!("{site}/store/x")}
+                    ]})),
+                )
+            } else {
+                (200, None)
+            }
+        })
+        .await;
+        let err = fake.api().upload_file(1007, &files[0]).await.unwrap_err();
+        assert!(matches!(err, UploadError::Protocol(_)), "{err}");
+        assert_eq!(fake.seen().len(), 1, "nothing was sent to the wrong place");
+    }
+
+    #[tokio::test]
+    async fn uploads_are_held_to_the_rate_of_their_bucket() {
+        let dir = std::env::temp_dir().join(format!("upload-{}-throttle", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big");
+        std::fs::write(&path, vec![7u8; 600_000]).unwrap();
+        let entry = manifest_files(vec![Entry {
+            kind: VOICE.into(),
+            session_id: String::new(),
+            user_id: String::new(),
+            start_ms: 0,
+            end_ms: 1,
+            width: 0,
+            height: 0,
+            size: 0,
+            path,
+        }])
+        .unwrap();
+        let fake = Fake::start(|r, _, _| {
+            if r.path.ends_with("/uploads") {
+                (200, Some(json!({"direct": false, "uploads": []})))
+            } else {
+                (200, None)
+            }
+        })
+        .await;
+        // 600 kB at 1 MB/s with a burst of 250 kB: about 350 ms past the burst.
+        let api = fake
+            .api()
+            .throttled(std::sync::Arc::new(crate::throttle::Throttle::new(
+                1_000_000,
+            )));
+        let started = std::time::Instant::now();
+        api.upload_file(0, &entry[0]).await.unwrap();
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(300), "{took:?}");
+        assert_eq!(fake.seen().last().unwrap().body.len(), 600_000);
     }
 
     #[tokio::test]

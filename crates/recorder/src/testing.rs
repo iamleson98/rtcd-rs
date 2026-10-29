@@ -40,6 +40,14 @@ pub struct Fake {
     shared: Arc<Shared>,
 }
 
+impl std::fmt::Debug for Fake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fake")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Fake {
     pub async fn start(
         reply: impl Fn(&Request, usize, &str) -> (u16, Option<Value>) + Send + Sync + 'static,
@@ -151,10 +159,27 @@ pub struct LmsState {
     pub sockets: usize,
 }
 
+impl std::fmt::Debug for LmsState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LmsState")
+            .field("status", &self.status)
+            .field("paths", &self.paths)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Plays the whole app for one recording.
 pub struct Lms {
     pub url: String,
     pub state: Arc<Mutex<LmsState>>,
+}
+
+impl std::fmt::Debug for Lms {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lms")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
 }
 
 fn now_ms() -> i64 {

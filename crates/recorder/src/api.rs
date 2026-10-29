@@ -2,6 +2,7 @@
 //! (`/api/v4/lms/recorder/recordings/{id}/...`), and storage, called with the URLs the server
 //! presigns.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::{Client, Method, RequestBuilder, StatusCode};
@@ -11,6 +12,7 @@ use tracing::error;
 
 use crate::config::Config;
 use crate::media::Entry;
+use crate::throttle::Throttle;
 use crate::upload::MultipartDone;
 
 #[derive(Debug, thiserror::Error)]
@@ -57,18 +59,60 @@ pub fn install_tls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// The HTTP clients uploads go through. A process that serves several recordings builds them once
+/// and gives each recording's [`Api`] a handle: they hold the connection pools.
 #[derive(Debug, Clone)]
+pub struct HttpClients {
+    client: Client,
+    uploads: Client,
+}
+
+impl HttpClients {
+    pub fn new() -> Self {
+        install_tls_provider();
+        let client = Client::builder()
+            .timeout(Duration::from_secs(300))
+            .user_agent("rtcd-recorder")
+            .build()
+            .expect("an http client");
+        // Carries the files, to storage or the server: no overall timeout, each request is
+        // bounded by its size.
+        let uploads = Client::builder()
+            .user_agent("rtcd-recorder")
+            .build()
+            .expect("an http client");
+        Self { client, uploads }
+    }
+}
+
+impl Default for HttpClients {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone)]
 pub struct Api {
     pub(crate) site: String,
     pub(crate) base: String,
     pub(crate) token: String,
     pub(crate) client: Client,
-    /// Carries the files, to storage or the server: no overall timeout, each request is bounded
-    /// by its size.
     pub(crate) uploads: Client,
     /// Retries and backoff shape the uploads' retry loop.
     pub(crate) retries: u32,
     pub(crate) backoff: Duration,
+    /// Holds the bytes of every upload to a rate, if set.
+    pub(crate) throttle: Option<Arc<Throttle>>,
+}
+
+impl std::fmt::Debug for Api {
+    /// Never shows the token.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Api")
+            .field("base", &self.base)
+            .field("token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 /// What the recorder needs to know about its recording.
@@ -86,28 +130,46 @@ pub struct Room {
 
 impl Api {
     pub fn new(cfg: &Config) -> Self {
-        install_tls_provider();
-        let client = Client::builder()
-            .timeout(Duration::from_secs(300))
-            .user_agent("rtcd-recorder")
-            .build()
-            .expect("an http client");
-        let uploads = Client::builder()
-            .user_agent("rtcd-recorder")
-            .build()
-            .expect("an http client");
+        Self::with_clients(
+            &HttpClients::new(),
+            &cfg.site_url,
+            &cfg.recording_id,
+            &cfg.auth_token,
+        )
+    }
+
+    /// The API of one recording, called with its bot session's `token`, through `clients`.
+    pub fn with_clients(
+        clients: &HttpClients,
+        site_url: &str,
+        recording_id: &str,
+        token: &str,
+    ) -> Self {
+        let site = site_url.trim_end_matches('/').to_owned();
         Self {
-            site: cfg.site_url.clone(),
-            base: format!(
-                "{}/api/v4/lms/recorder/recordings/{}",
-                cfg.site_url, cfg.recording_id
-            ),
-            token: cfg.auth_token.clone(),
-            client,
-            uploads,
+            base: format!("{site}/api/v4/lms/recorder/recordings/{recording_id}"),
+            site,
+            token: token.to_owned(),
+            client: clients.client.clone(),
+            uploads: clients.uploads.clone(),
             retries: 8,
             backoff: Duration::from_secs(2),
+            throttle: None,
         }
+    }
+
+    /// Holds every upload made through this to the bucket's rate.
+    pub fn throttled(mut self, throttle: Arc<Throttle>) -> Self {
+        self.throttle = Some(throttle);
+        self
+    }
+
+    /// How often a request is tried again after a network or server error, and how long the first
+    /// wait is (the n-th is n times as long).
+    pub fn retrying(mut self, retries: u32, backoff: Duration) -> Self {
+        self.retries = retries;
+        self.backoff = backoff;
+        self
     }
 
     pub(crate) fn authed(&self, method: Method, url: &str) -> RequestBuilder {

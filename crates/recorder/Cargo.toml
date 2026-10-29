@@ -14,7 +14,12 @@ workspace = true
 name = "recorder"
 path = "src/main.rs"
 
+[features]
+# The fake LMS and storage the tests of this crate and of rtcd talk to.
+testing = ["dep:axum"]
+
 [dependencies]
+axum = { version = "0.8.9", features = ["ws"], optional = true }
 rtcd-proto = { path = "../rtcd-proto" }
 rtcd-net = { path = "../rtcd-net" }
 rtc = { path = "../../vendor/rtc" }

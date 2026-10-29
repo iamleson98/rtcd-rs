@@ -11,9 +11,10 @@ pub mod reorder;
 pub mod session;
 pub mod socket;
 pub mod tap;
+pub mod throttle;
 pub mod upload;
 pub mod vp8;
 pub mod webm;
 
-#[cfg(test)]
-mod testing;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
