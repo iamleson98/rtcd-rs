@@ -8,7 +8,8 @@ use std::time::Instant;
 use mio::net::TcpStream;
 use rtcd_net::{FrameReader, encode_frame};
 
-/// Written bytes are dropped from the front of an [`Outbox`] once there are this many.
+/// Written bytes are dropped from the front of an [`Outbox`] once there are this many, and as many
+/// as the bytes still owed: moving the owed bytes costs no more than the writes that made room.
 const COMPACT_AT: usize = 32 * 1024;
 
 /// Framed bytes waiting for a socket.
@@ -26,13 +27,14 @@ impl Outbox {
     }
 
     /// Records that the socket took `n` bytes. A connection that is never fully caught up (a slow
-    /// network) must not keep every byte it ever sent: the written front is dropped.
+    /// network) must not keep every byte it ever sent: the written front is dropped once it is as
+    /// long as what is still owed, so that a backlog of megabytes is not moved at every 32 KiB.
     fn took(&mut self, n: usize) {
         self.written += n;
         if self.written == self.buf.len() {
             self.buf.clear();
             self.written = 0;
-        } else if self.written >= COMPACT_AT {
+        } else if self.written >= COMPACT_AT && self.written * 2 >= self.buf.len() {
             self.buf.drain(..self.written);
             self.written = 0;
         }
@@ -141,9 +143,26 @@ mod tests {
             widest = widest.max(out.buf.len());
         }
         assert!(
-            widest < 256 * 1024 + COMPACT_AT + 2 * 1200,
+            widest < 2 * (256 * 1024 + 2 * 1200) + COMPACT_AT,
             "the buffer reached {widest} bytes"
         );
+    }
+
+    #[test]
+    fn a_big_backlog_is_not_moved_for_every_few_bytes_written() {
+        let mut out = Outbox::default();
+        out.buf.resize(4 * 1024 * 1024, 7);
+        for _ in 0..4 {
+            out.took(COMPACT_AT);
+        }
+        assert_eq!(
+            out.written,
+            4 * COMPACT_AT,
+            "128 KiB of 4 MiB written is not worth moving the other 3.9"
+        );
+        out.took(2 * 1024 * 1024);
+        assert_eq!(out.written, 0, "half of it written: the front goes");
+        assert_eq!(out.pending().len(), 2 * 1024 * 1024 - 4 * COMPACT_AT);
     }
 
     #[test]
