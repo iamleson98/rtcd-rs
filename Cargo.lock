@@ -1878,7 +1878,6 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
- "flate2",
  "futures-util",
  "lms-sim",
  "rand 0.10.3",
@@ -2290,6 +2289,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "bcrypt",
+ "bytes",
  "clap",
  "crc32fast",
  "futures-util",
@@ -2298,6 +2298,7 @@ dependencies = [
  "parking_lot",
  "prometheus",
  "rand 0.10.3",
+ "recorder",
  "redb",
  "reqwest",
  "rtcd-net",

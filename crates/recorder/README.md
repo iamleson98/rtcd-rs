@@ -26,9 +26,6 @@ endpoints, the same manifest, the same files, the same JSON log lines, the same 
   did.
 - **Log**: one line when a file opens and one when it closes, with why (`silent`, `the track was removed`,
   `the sender turned it off`, `the picture changed size`, `the call ended`).
-- **Board** (`board.rs`): the whiteboard's snapshot at the start and every change after (strokes, moves,
-  deletes, clears, the lock, people's pointers and the strokes they are drawing), with its time, as
-  gzipped NDJSON.
 - **Upload** (`upload.rs`, `api.rs`): each file becomes an object of its own, numbered by its place on
   the timeline, read straight from disk. The server says where each goes: straight to storage at URLs it
   presigns (a file over 64 MB in parts), so the bytes leave the cluster once; or, where storage is not

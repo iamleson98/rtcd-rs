@@ -58,7 +58,6 @@ pub const VOICE: &str = "voice";
 pub const CAMERA: &str = "camera";
 pub const SCREEN: &str = "screen";
 pub const SCREEN_AUDIO: &str = "screen_audio";
-pub const BOARD: &str = "board";
 
 /// Maps the SFU's track ids (`<type>_<session>_<random>`) to a kind.
 pub fn track_kind(track_id: &str) -> Option<&'static str> {
@@ -142,6 +141,12 @@ impl Recording {
     pub fn files(&self) -> Vec<Entry> {
         self.files.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
+
+    /// The files finished since this was last called: for a recording whose files are taken away
+    /// (uploaded) while it runs.
+    pub fn take_files(&self) -> Vec<Entry> {
+        std::mem::take(&mut *self.files.lock().unwrap_or_else(|p| p.into_inner()))
+    }
 }
 
 /// Maps call sessions to their users (`call_state`, `user_joined`). A file looks its user up when
@@ -158,6 +163,8 @@ pub struct StreamInfo {
 
 struct Segment {
     entry: Entry,
+    /// When the file was opened (the arrival of its first frame).
+    opened: Instant,
     /// The picture size the file was opened with (the first keyframe's).
     size: (u32, u32),
     writer: WebmWriter,
@@ -189,6 +196,9 @@ pub struct StreamRecorder {
     last_ask: Option<Instant>,
     /// Frames before this are the tail of a stream the sender has just turned off.
     ignore_until: Option<Instant>,
+    /// A file is closed and the next one opened once it has lasted this long, so that files can
+    /// be taken away while the recording runs.
+    rotate_every: Option<Duration>,
     /// Frames and packets lost, for the log at the end.
     pub lost: u64,
 }
@@ -250,7 +260,23 @@ impl StreamRecorder {
             size_since: None,
             last_ask: None,
             ignore_until: None,
+            rotate_every: None,
             lost: 0,
+        }
+    }
+
+    /// Ends each file once it has lasted `every`: a voice at its next packet, a video at its next
+    /// keyframe (so every file opens on one), with the old picture held up to the new.
+    pub fn rotating(mut self, every: Duration) -> Self {
+        self.rotate_every = Some(every);
+        self
+    }
+
+    /// Whether the open file has lasted as long as files may.
+    fn rotation_due(&self, at: Instant) -> bool {
+        match (&self.seg, self.rotate_every) {
+            (Some(seg), Some(every)) => at.saturating_duration_since(seg.opened) >= every,
+            _ => false,
         }
     }
 
@@ -366,6 +392,9 @@ impl StreamRecorder {
             self.close_segment("silent", None);
         }
         self.last_media = Some(arrived);
+        if key && self.rotation_due(arrived) {
+            self.close_segment("rotated", Some(arrived));
+        }
         // A keyframe of another size (the SFU moved the share to its other layer, or the sharer
         // picked another window) starts a file of its own, so each file's header tells the truth.
         // The old picture is held up to the new one. Until the new size has lasted, the frames of
@@ -425,6 +454,9 @@ impl StreamRecorder {
             self.close_segment("silent", None);
         }
         self.last_media = Some(now);
+        if self.rotation_due(now) {
+            self.close_segment("rotated", None);
+        }
         if self.seg.is_none()
             && let Err(e) = self.open(now, ts, Track::Opus, (0, 0))
         {
@@ -470,6 +502,7 @@ impl StreamRecorder {
         );
         self.seg = Some(Segment {
             entry,
+            opened: arrived,
             size,
             writer,
             prev_ts: ts,
@@ -998,6 +1031,65 @@ mod tests {
         let files = rec.files();
         assert_eq!(files.len(), 1);
         assert_eq!(block_times(&files[0].path), [0, 33, 66, 100, 133]);
+    }
+
+    #[test]
+    fn a_voice_is_rotated_at_once_and_a_video_at_its_next_keyframe() {
+        let (rec, start) = setup("rotate", u64::MAX);
+        let every = Duration::from_millis(1500);
+        let mut voice = voice(&rec).rotating(every);
+        speak(&mut voice, start, 0, 0, 200); // 4 s
+        voice.finish(start + Duration::from_secs(4), "test");
+        let mut cam = camera(&rec).rotating(every);
+        for i in 0..90u32 {
+            // A keyframe every 2 s (60 frames of 33 ms), a frame every 33 ms.
+            cam.packet(vp8_frame(
+                start + Duration::from_millis(33 * u64::from(i)),
+                i as u16,
+                i * 2970,
+                i % 60 == 0,
+            ));
+        }
+        cam.finish(start + Duration::from_secs(3), "test");
+
+        let files = rec.files();
+        let of = |kind: &str| -> Vec<(i64, i64)> {
+            files
+                .iter()
+                .filter(|f| f.kind == kind)
+                .map(|f| (f.start_ms, f.end_ms))
+                .collect()
+        };
+        assert_eq!(
+            of(VOICE),
+            [(0, 1500), (1500, 3000), (3000, 4000)],
+            "a voice is cut at the first packet past the deadline"
+        );
+        let video = of(CAMERA);
+        assert_eq!(video.len(), 2, "{video:?}");
+        assert_eq!(
+            video[1].0, 1980,
+            "the deadline passed at 1.5 s; the next keyframe is frame 60 at 1.98 s"
+        );
+        assert_eq!(video[0].1, video[1].0, "the old picture is held to the new");
+        for f in files.iter().filter(|f| f.kind == CAMERA) {
+            let data = std::fs::read(&f.path).unwrap();
+            let top = elements(&data, 0, data.len());
+            let seg = top.iter().find(|e| e.id == SEGMENT).unwrap();
+            let first = find(&data, find(&data, *seg, CLUSTER)[0], SIMPLE_BLOCK)[0];
+            assert_eq!(data[first.start + 3], 0x80, "{f:?} opens on a keyframe");
+        }
+    }
+
+    #[test]
+    fn finished_files_can_be_taken_as_they_close() {
+        let (rec, start) = setup("take", u64::MAX);
+        let mut s = voice(&rec);
+        speak(&mut s, start, 0, 0, 10);
+        assert!(rec.take_files().is_empty(), "the file is still open");
+        s.finish(start + Duration::from_secs(1), "test");
+        assert_eq!(rec.take_files().len(), 1);
+        assert!(rec.take_files().is_empty(), "each file is handed out once");
     }
 
     #[test]

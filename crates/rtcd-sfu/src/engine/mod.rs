@@ -14,6 +14,8 @@ mod join;
 mod media;
 mod negotiate;
 mod quality;
+mod record;
+pub(crate) use record::WAIT_FOR_CALL;
 mod route;
 mod session;
 mod signaling;
@@ -63,6 +65,8 @@ pub(crate) struct Call {
     pub screen: Option<SessionKey>,
     /// Which open microphones are forwarded.
     pub voices: Selector<SessionKey>,
+    /// The recording of the call, if it is being recorded.
+    pub record: Option<u32>,
 }
 
 impl Call {
@@ -71,6 +75,7 @@ impl Call {
             members: Vec::new(),
             screen: None,
             voices: Selector::new(audio_loudest),
+            record: None,
         }
     }
 }
@@ -98,6 +103,8 @@ pub struct Engine {
     routes: Routes,
     /// Who receives each stream a participant sends.
     fanout: HashMap<SourceKey, media::Fan>,
+    /// The recordings of the calls on this engine.
+    recordings: record::Recordings,
     /// Sessions with work to do.
     dirty: Vec<SessionKey>,
     timers: BTreeMap<(Instant, u64), SessionKey>,
@@ -134,6 +141,7 @@ impl Engine {
             calls: HashMap::new(),
             routes: Routes::default(),
             fanout: HashMap::new(),
+            recordings: record::Recordings::default(),
             dirty: Vec::new(),
             timers: BTreeMap::new(),
             timer_seq: 0,
@@ -199,6 +207,7 @@ impl Engine {
 
     /// Advances time: wakes every session whose deadline has passed.
     pub fn handle_timeout(&mut self, now: Instant) {
+        self.retry_recordings(now);
         while let Some((&(at, seq), &key)) = self.timers.iter().next() {
             if at > now {
                 break;
@@ -218,7 +227,11 @@ impl Engine {
 
     /// When the engine next needs [`handle_timeout`](Self::handle_timeout).
     pub fn poll_timeout(&self) -> Option<Instant> {
-        self.timers.keys().next().map(|&(at, _)| at)
+        let timer = self.timers.keys().next().map(|&(at, _)| at);
+        match (timer, self.recordings.retry_at()) {
+            (Some(t), Some(r)) => Some(t.min(r)),
+            (t, r) => t.or(r),
+        }
     }
 
     /// The next datagram to send.
@@ -456,7 +469,7 @@ impl Engine {
             MessageType::ScreenOn => self.screen_on(key, &msg.data, now),
             MessageType::ScreenOff => self.screen_off(key, now),
             MessageType::VideoOn => self.video_on(key, &msg.data),
-            MessageType::VideoOff => {}
+            MessageType::VideoOff => self.record_off(key, crate::ids::TrackType::Video, now),
             MessageType::VideoSubscribe => self.video_subscribe(key, &msg.data, now),
             MessageType::VoiceOn | MessageType::VoiceOff => {
                 warn!(session = %msg.session_id, "client sent a message only the SFU sends");

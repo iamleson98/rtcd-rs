@@ -49,8 +49,17 @@ impl Impair {
     }
 }
 
+/// What rtcd reports about recordings (`record_file`, `record_ended`). It goes to any one
+/// connection of the client, as it does for the real server, so every connection of this client
+/// hands such messages here instead of to its owner.
+#[derive(Debug, Default)]
+struct ReportLog {
+    messages: Mutex<Vec<ClientMessage>>,
+}
+
 pub struct Rtcd {
     app: Option<App>,
+    reports: Arc<ReportLog>,
     pub http: String,
     /// Where clients send media: rtcd's own address, or the lossy relay in front of it.
     pub media: SocketAddr,
@@ -92,6 +101,12 @@ impl Rtcd {
 
     /// Like [`start`](Self::start), behind a network that does what `impair` says.
     pub async fn start_impaired(impair: Impair) -> Self {
+        Self::start_configured(impair, |_| {}).await
+    }
+
+    /// Like [`start_impaired`](Self::start_impaired), with `configure` applied to the service's
+    /// settings after the environment's (to turn recording on, say).
+    pub async fn start_configured(impair: Impair, configure: impl FnOnce(&mut Config)) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -110,6 +125,7 @@ impl Rtcd {
         // (RTCD_RTC_EGRESSBUDGETPPS=1 makes the node shed from the first second).
         cfg.apply_env(&std::env::vars().collect())
             .expect("the RTCD_* settings in the environment are valid");
+        configure(&mut cfg);
         // Behind a lossy relay, the candidates rtcd offers name the relay's port.
         let front = if !impair.is_none() {
             Some(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap())
@@ -142,6 +158,7 @@ impl Rtcd {
         assert_eq!(r.status(), 201);
         Self {
             app: Some(app),
+            reports: Arc::default(),
             http,
             media,
             dir,
@@ -177,17 +194,29 @@ impl Rtcd {
                 }
             }
         });
+        let reports = self.reports.clone();
         tokio::spawn(async move {
             while let Some(Ok(m)) = read.next().await {
                 if let WsMessage::Binary(b) = m
                     && let Ok(msg) = ClientMessage::unpack(&b)
-                    && in_tx.send(msg).is_err()
                 {
-                    break;
+                    if matches!(
+                        msg,
+                        ClientMessage::RecordFile(_) | ClientMessage::RecordEnded(_)
+                    ) {
+                        reports.messages.lock().unwrap().push(msg);
+                    } else if in_tx.send(msg).is_err() {
+                        break;
+                    }
                 }
             }
         });
         RtcdConn { tx, rx }
+    }
+
+    /// The recording reports (`record_file`, `record_ended`) received on any connection so far.
+    pub fn reports(&self) -> Vec<ClientMessage> {
+        self.reports.messages.lock().unwrap().clone()
     }
 
     /// Packets to this client are not lost (the synthetic participants: only the recorder is tried).

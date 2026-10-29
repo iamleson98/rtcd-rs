@@ -237,9 +237,14 @@ impl App {
     pub async fn shutdown(self, drain: Option<Duration>) {
         let sfu = self.service.sfu.clone();
         let drain = drain.unwrap_or(Duration::from_secs(60 * 60 * 24 * 365));
+        // Recordings stop at once so that their files are closed and uploaded within the drain
+        // (the lesson goes on for those who are in it, unrecorded from here).
+        self.service.recordings.begin_drain(&sfu);
         let drained = tokio::task::spawn_blocking(move || sfu.shutdown(drain));
-        // Connections stay open while sessions drain: their clients still send and receive.
-        let _ = drained.await;
+        let uploaded = self.service.recordings.wait_drained(drain);
+        // Connections stay open while sessions drain: their clients still send and receive, and
+        // the recordings' reports go out over them.
+        let (_, _) = tokio::join!(drained, uploaded);
         self.service.close_connections();
         let _ = self.stop.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(10), self.server).await;

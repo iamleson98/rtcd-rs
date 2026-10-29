@@ -3,7 +3,7 @@
 
 mod live;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use live::Live;
 use rtcd_proto::MessageType;
@@ -455,4 +455,220 @@ fn calls_that_start_together_are_spread_before_their_participants_arrive() {
     live.join("d1", "call4");
     live.join("e1", "call5");
     assert_eq!(live.sfu.shard_count(), 3, "and the fifth finds both full");
+}
+
+/// A recording is started on the shard the call lives on, whichever it is, and each call's media
+/// goes to its own recording only.
+#[test]
+fn a_call_is_recorded_on_whichever_shard_it_lives_on() {
+    use rtcd_sfu::record::{RecordEnd, RecordItem, record_channel};
+    let mut live = Live::start(4);
+    let mut speakers = Vec::new();
+    for c in 0..6 {
+        let a = live.join(&format!("a{c}"), &format!("call{c}"));
+        live.join(&format!("b{c}"), &format!("call{c}"));
+        speakers.push(a);
+    }
+    let mut recordings = Vec::new();
+    for c in 0..6 {
+        let (sink, rx) = record_channel(1024);
+        live.sfu
+            .record_start(
+                "group",
+                &format!("call{c}"),
+                &format!("rec{c}"),
+                Instant::now(),
+                sink,
+            )
+            .expect("the call exists");
+        recordings.push(rx);
+    }
+
+    for &a in &speakers {
+        live.speak(a, 40);
+    }
+    live.run(Duration::from_millis(400));
+    for c in 0..6 {
+        live.sfu
+            .record_stop("group", &format!("call{c}"), &format!("rec{c}"))
+            .unwrap();
+    }
+    live.run(Duration::from_millis(300));
+
+    for (c, rx) in recordings.iter_mut().enumerate() {
+        let items: Vec<RecordItem> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let RecordItem::Begin(begin) = &items[0] else {
+            panic!("call{c}: {items:?}");
+        };
+        assert_eq!(begin.recording_id, format!("rec{c}"));
+        let sessions: Vec<&str> = items
+            .iter()
+            .filter_map(|i| match i {
+                RecordItem::Open(o) => Some(o.session_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sessions,
+            [format!("session-a{c}")],
+            "only its own call's speaker"
+        );
+        let packets = items
+            .iter()
+            .filter(|i| matches!(i, RecordItem::Packet(_)))
+            .count();
+        assert!(packets >= 30, "call{c}: {packets} packets");
+        assert!(
+            matches!(
+                items.last(),
+                Some(RecordItem::End {
+                    reason: RecordEnd::Stopped,
+                    ..
+                })
+            ),
+            "call{c}"
+        );
+    }
+}
+
+/// The server's call-start hook can ask for a recording before the first participant has joined:
+/// it waits, whichever shard the call lands on, and begins with the first session.
+#[test]
+fn a_recording_asked_for_before_the_first_join_begins_with_it() {
+    use rtcd_sfu::record::{RecordEnd, RecordItem, record_channel};
+    let mut live = Live::start(4);
+    // Other calls already fill some shards.
+    live.join("x0", "other0");
+    live.join("x1", "other1");
+    let t0 = Instant::now();
+    let (sink, mut rx) = record_channel(1024);
+    live.sfu
+        .record_start("group", "late", "rec1", t0, sink)
+        .expect("accepted though the call has no session");
+    let (again, mut dropped) = record_channel(8);
+    live.sfu
+        .record_start("group", "late", "rec1", t0, again)
+        .expect("asking again is a no-op");
+    let (other, mut refused) = record_channel(8);
+    live.sfu
+        .record_start("group", "late", "rec2", t0, other)
+        .unwrap();
+    assert!(matches!(refused.try_recv(), Ok(RecordItem::Begin(_))));
+    assert!(matches!(
+        refused.try_recv(),
+        Ok(RecordItem::End {
+            reason: RecordEnd::Refused,
+            ..
+        })
+    ));
+    assert!(matches!(dropped.try_recv(), Ok(RecordItem::Begin(_))));
+    assert!(matches!(
+        dropped.try_recv(),
+        Ok(RecordItem::End {
+            reason: RecordEnd::AlreadyRecording,
+            ..
+        })
+    ));
+
+    let a = live.join("alice", "late");
+    live.join("bob", "late");
+    live.speak(a, 40);
+    live.run(Duration::from_millis(400));
+    live.sfu.record_stop("group", "late", "rec1").unwrap();
+    live.run(Duration::from_millis(300));
+    let items: Vec<RecordItem> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(matches!(&items[0], RecordItem::Begin(b) if b.recording_id == "rec1" && b.t0 == t0));
+    let packets = items
+        .iter()
+        .filter(|i| matches!(i, RecordItem::Packet(_)))
+        .count();
+    assert!(packets >= 30, "{packets} packets");
+    assert!(matches!(
+        items.last(),
+        Some(RecordItem::End {
+            reason: RecordEnd::Stopped,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_recording_that_waits_for_its_call_can_be_stopped() {
+    use rtcd_sfu::record::{RecordEnd, RecordItem, record_channel};
+    let mut live = Live::start(2);
+    let (sink, mut rx) = record_channel(8);
+    live.sfu
+        .record_start("group", "late", "rec1", Instant::now(), sink)
+        .unwrap();
+    live.sfu.record_stop("group", "late", "rec1").unwrap();
+    assert!(matches!(rx.try_recv(), Ok(RecordItem::Begin(_))));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(RecordItem::End {
+            reason: RecordEnd::Stopped,
+            ..
+        })
+    ));
+    // The call that comes is not recorded.
+    let a = live.join("alice", "late");
+    live.speak(a, 10);
+    live.run(Duration::from_millis(200));
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        live.sfu.record_stop("group", "late", "rec1"),
+        Ok(()),
+        "a call that has a session, no recording of that id"
+    );
+    assert_eq!(
+        live.sfu.record_stop("group", "never", "rec1"),
+        Err(rtcd_sfu::record::RecordError::UnknownCall)
+    );
+}
+
+/// A recording that waits for a call that never gets a session does not wait for ever, and the
+/// number that wait is bounded.
+#[test]
+fn recordings_that_wait_for_a_call_are_bounded_in_number_and_time() {
+    use rtcd_sfu::record::{RecordEnd, RecordItem, record_channel};
+    let live = Live::start(1);
+    let mut first = None;
+    for n in 0..1024 {
+        let (sink, rx) = record_channel(4);
+        live.sfu
+            .record_start("group", &format!("never{n}"), "rec", Instant::now(), sink)
+            .unwrap();
+        first.get_or_insert(rx);
+    }
+    let (sink, mut over) = record_channel(4);
+    live.sfu
+        .record_start("group", "one-too-many", "rec", Instant::now(), sink)
+        .unwrap();
+    assert!(matches!(over.try_recv(), Ok(RecordItem::Begin(_))));
+    assert!(matches!(
+        over.try_recv(),
+        Ok(RecordItem::End {
+            reason: RecordEnd::Refused,
+            ..
+        })
+    ));
+
+    // After ten seconds the next request sweeps them out.
+    std::thread::sleep(Duration::from_millis(10_500));
+    let (sink, mut sweeper) = record_channel(4);
+    live.sfu
+        .record_start("group", "fresh", "rec", Instant::now(), sink)
+        .unwrap();
+    let mut first = first.unwrap();
+    assert!(matches!(first.try_recv(), Ok(RecordItem::Begin(_))));
+    assert!(matches!(
+        first.try_recv(),
+        Ok(RecordItem::End {
+            reason: RecordEnd::Refused,
+            ..
+        })
+    ));
+    assert!(
+        sweeper.try_recv().is_err(),
+        "the new one waits, as the first did"
+    );
 }

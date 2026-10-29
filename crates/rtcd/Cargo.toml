@@ -22,6 +22,7 @@ hyper-util = { version = "0.1.21", features = ["server-auto", "tokio", "service"
 parking_lot = "0.12.5"
 prometheus = { version = "0.14.0", features = ["process"] }
 rand = "0.10.3"
+recorder = { version = "0.1.0", path = "../recorder" }
 redb = "4.4.0"
 rtcd-net = { version = "0.1.0", path = "../rtcd-net" }
 rtcd-proto = { version = "0.1.0", path = "../rtcd-proto" }
@@ -39,6 +40,8 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json", "fmt"] }
 
 [dev-dependencies]
+bytes = "1.12.1"
+recorder = { path = "../recorder", features = ["testing"] }
 base64 = "0.23.1"
 bcrypt = "0.19.3"
 futures-util = "0.3.34"

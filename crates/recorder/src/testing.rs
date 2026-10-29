@@ -40,6 +40,14 @@ pub struct Fake {
     shared: Arc<Shared>,
 }
 
+impl std::fmt::Debug for Fake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fake")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Fake {
     pub async fn start(
         reply: impl Fn(&Request, usize, &str) -> (u16, Option<Value>) + Send + Sync + 'static,
@@ -118,7 +126,7 @@ async fn handle(
     }
 }
 
-// ─── A whole fake app: the recorder endpoints, the board, the calls API and the websocket ───────
+// ─── A whole fake app: the recorder endpoints, the calls API and the websocket ───────
 
 use std::future::Future;
 use std::pin::Pin;
@@ -151,10 +159,27 @@ pub struct LmsState {
     pub sockets: usize,
 }
 
+impl std::fmt::Debug for LmsState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LmsState")
+            .field("status", &self.status)
+            .field("paths", &self.paths)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Plays the whole app for one recording.
 pub struct Lms {
     pub url: String,
     pub state: Arc<Mutex<LmsState>>,
+}
+
+impl std::fmt::Debug for Lms {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lms")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
 }
 
 fn now_ms() -> i64 {
@@ -187,10 +212,6 @@ impl Lms {
             .route(&format!("{REC_PATH}/files/{{n}}"), put(lms_file))
             .route(&format!("{REC_PATH}/complete"), post(lms_complete))
             .route(&format!("{REC_PATH}/fail"), post(lms_fail))
-            .route(
-                &format!("/api/v4/lms/live/sessions/{SESS_ID}/whiteboard"),
-                get(lms_board),
-            )
             .route(&format!("/api/v4/calls/channels/{CHAN_ID}"), get(lms_call))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -332,15 +353,6 @@ async fn lms_fail(State(s): S, body: Bytes) -> impl IntoResponse {
     s.lock().unwrap().complete =
         Some(serde_json::json!({"failed": String::from_utf8_lossy(&body)}));
     StatusCode::OK
-}
-
-async fn lms_board(State(s): S) -> impl IntoResponse {
-    note(
-        &s,
-        "GET",
-        &format!("/api/v4/lms/live/sessions/{SESS_ID}/whiteboard"),
-    );
-    axum::Json(serde_json::json!({"locked": false, "elements": [{"id": "e0"}]}))
 }
 
 async fn lms_call(State(s): S) -> impl IntoResponse {

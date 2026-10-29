@@ -5,9 +5,6 @@ use std::time::Duration;
 /// The disk kept free when the recording stops on its disk limit: what is still in flight, and
 /// finishing the files.
 pub const DATA_HEADROOM: u64 = 512 << 20;
-/// How often one person's pointer is logged while it only moves: smooth enough to watch, half the
-/// rate the room relays. Updates that draw are all logged.
-pub const PRESENCE_EVERY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {

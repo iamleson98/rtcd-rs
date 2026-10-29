@@ -54,6 +54,8 @@ pub(crate) struct Source {
     pub layer: Layer,
     pub codec: RTCRtpCodec,
     pub track_id: MediaStreamTrackId,
+    /// When the stream was first received.
+    pub since: Instant,
     pub receiver: RTCRtpReceiverId,
     /// The id receivers see this stream under; layers of one camera share it.
     pub out_track_id: String,

@@ -147,6 +147,9 @@ pub struct World {
     pub blackhole: bool,
     /// Time spent inside the engine (datagrams in, timeouts), for the cost tests.
     pub engine_spent: Duration,
+    /// Called just before the world calls into the engine, with `"datagram"` or `"timeout"` and
+    /// `true`, and just after with `false`: for tests that measure the engine alone.
+    pub around_engine: fn(&'static str, bool),
 }
 
 pub fn engine_config() -> EngineConfig {
@@ -209,6 +212,7 @@ impl World {
             group: "group".into(),
             blackhole: false,
             engine_spent: Duration::ZERO,
+            around_engine: |_, _| {},
         }
     }
 
@@ -615,8 +619,10 @@ impl World {
             moved = true;
             if w.transport.peer_addr == self.server && !self.blackhole && !b.unreachable {
                 let started = Instant::now();
+                (self.around_engine)("datagram", true);
                 self.engine
                     .handle_datagram(now, Proto::Udp, self.server, b.addr, w.message);
+                (self.around_engine)("datagram", false);
                 self.engine_spent += started.elapsed();
             }
         }
@@ -729,7 +735,9 @@ impl World {
 
     fn tick_engine(&mut self) {
         let started = Instant::now();
+        (self.around_engine)("timeout", true);
         self.engine.handle_timeout(self.now);
+        (self.around_engine)("timeout", false);
         self.engine_spent += started.elapsed();
     }
 

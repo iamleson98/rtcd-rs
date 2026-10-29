@@ -40,6 +40,7 @@ pub struct Config {
     pub api: ApiConfig,
     pub rtc: RtcConfig,
     pub store: StoreConfig,
+    pub record: RecordConfig,
     pub logger: LoggerConfig,
 }
 
@@ -224,6 +225,31 @@ pub struct StoreConfig {
     pub data_source: String,
 }
 
+/// Recording calls in rtcd itself, without a recorder participant.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct RecordConfig {
+    /// Whether this node records calls when asked to. Off by default.
+    pub enabled: bool,
+    /// Where the files of a recording are written, in a directory of its own, until they are
+    /// uploaded: a volume with room for the lessons that run at once.
+    pub data_dir: String,
+    /// The most one recording may write, in bytes, files already closed included. A recording that
+    /// reaches it ends cleanly (`disk_full`) with what it has. Leave room under the volume's size
+    /// for the files being written and the recordings that run side by side.
+    pub max_bytes: i64,
+    /// The most bytes of closed files this node holds waiting to be uploaded, all recordings
+    /// together. Above it recordings drop packets (each drop is a gap in the recording and is
+    /// counted) until uploads catch up, rather than ending. Files still being written are on top
+    /// of this.
+    pub max_pending_bytes: i64,
+    /// The rate, in megabits per second, at which this node uploads recordings, all of them
+    /// together: uploads must not compete with the media the node sends, and must keep up with
+    /// what is written (175 recorded lessons write ~113 Mbit/s on average), or the closed files
+    /// pile up to `max_pending_bytes` and recordings drop packets.
+    pub upload_mbps: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct LoggerConfig {
@@ -309,6 +335,18 @@ impl Default for StoreConfig {
     fn default() -> Self {
         Self {
             data_source: "/tmp/rtcd_db".into(),
+        }
+    }
+}
+
+impl Default for RecordConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            data_dir: "/data/recordings".into(),
+            max_bytes: 2 << 30,
+            max_pending_bytes: 4 << 30,
+            upload_mbps: 200,
         }
     }
 }
@@ -432,6 +470,11 @@ impl Config {
         boolean!("RTC_REFUSEWHENSATURATED", self.rtc.refuse_when_saturated);
         integer!("RTC_DRAINTIMEOUTSECONDS", self.rtc.drain_timeout_seconds);
         text!("STORE_DATASOURCE", self.store.data_source);
+        boolean!("RECORD_ENABLED", self.record.enabled);
+        text!("RECORD_DATADIR", self.record.data_dir);
+        integer!("RECORD_MAXBYTES", self.record.max_bytes);
+        integer!("RECORD_MAXPENDINGBYTES", self.record.max_pending_bytes);
+        integer!("RECORD_UPLOADMBPS", self.record.upload_mbps);
         boolean!("LOGGER_ENABLECONSOLE", self.logger.enable_console);
         boolean!("LOGGER_CONSOLEJSON", self.logger.console_json);
         text!("LOGGER_CONSOLELEVEL", self.logger.console_level);
@@ -554,6 +597,23 @@ impl Config {
         }
         if self.store.data_source.is_empty() {
             return Err(invalid("DataSource", "should not be empty"));
+        }
+        if self.record.enabled {
+            if self.record.data_dir.is_empty() {
+                return Err(invalid("RecordDataDir", "should not be empty"));
+            }
+            if self.record.max_bytes <= 0 {
+                return Err(invalid("RecordMaxBytes", "should be a positive number"));
+            }
+            if self.record.max_pending_bytes <= 0 {
+                return Err(invalid(
+                    "RecordMaxPendingBytes",
+                    "should be a positive number",
+                ));
+            }
+            if self.record.upload_mbps <= 0 {
+                return Err(invalid("RecordUploadMbps", "should be a positive number"));
+            }
         }
         let lg = &self.logger;
         if !lg.enable_console && !lg.enable_file {
@@ -714,6 +774,11 @@ mod tests {
         );
         assert_eq!(c.store.data_source, "/tmp/rtcd_db");
         assert_eq!(c.api.security.session_cache.expiration_minutes, 1440);
+        assert!(!c.record.enabled, "recording is off unless asked for");
+        assert_eq!(
+            (c.record.max_pending_bytes, c.record.upload_mbps),
+            (4 << 30, 200)
+        );
         c.validate().unwrap();
     }
 
@@ -833,6 +898,33 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
     }
 
     #[test]
+    fn recording_is_set_in_the_file_or_the_environment() {
+        let mut c = Config::from_toml(
+            "[record]\nenabled = true\ndata_dir = \"/v/rec\"\nmax_bytes = 1000\nmax_pending_bytes = 2000\nupload_mbps = 8\n",
+        )
+        .unwrap();
+        let seen = |c: &Config| {
+            (
+                c.record.enabled,
+                c.record.data_dir.clone(),
+                c.record.max_bytes,
+                c.record.max_pending_bytes,
+                c.record.upload_mbps,
+            )
+        };
+        assert_eq!(seen(&c), (true, "/v/rec".into(), 1000, 2000, 8));
+        c.apply_env(&env(&[
+            ("RTCD_RECORD_ENABLED", "false"),
+            ("RTCD_RECORD_DATADIR", "/other"),
+            ("RTCD_RECORD_MAXBYTES", "5000"),
+            ("RTCD_RECORD_MAXPENDINGBYTES", "6000"),
+            ("RTCD_RECORD_UPLOADMBPS", "20"),
+        ]))
+        .unwrap();
+        assert_eq!(seen(&c), (false, "/other".into(), 5000, 6000, 20));
+    }
+
+    #[test]
     fn ice_servers_in_the_environment_may_be_objects() {
         let mut c = Config::default();
         c.apply_env(&env(&[(
@@ -908,6 +1000,37 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
             .contains("at least one logging target")
         );
         assert!(bad(&|c| c.store.data_source.clear()).contains("DataSource"));
+        assert!(
+            bad(&|c| {
+                c.record.enabled = true;
+                c.record.data_dir.clear();
+            })
+            .contains("RecordDataDir")
+        );
+        assert!(
+            bad(&|c| {
+                c.record.enabled = true;
+                c.record.max_bytes = 0;
+            })
+            .contains("RecordMaxBytes")
+        );
+        assert!(
+            bad(&|c| {
+                c.record.enabled = true;
+                c.record.max_pending_bytes = 0;
+            })
+            .contains("RecordMaxPendingBytes")
+        );
+        assert!(
+            bad(&|c| {
+                c.record.enabled = true;
+                c.record.upload_mbps = 0;
+            })
+            .contains("RecordUploadMbps")
+        );
+        let mut off = Config::default();
+        off.record.max_bytes = 0;
+        off.validate().expect("a disabled recorder is not checked");
     }
 
     #[test]

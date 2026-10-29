@@ -97,6 +97,15 @@ pub trait Metrics: Send + Sync + 'static {
     fn keyframe_request(&self, sent: bool) {
         let _ = sent;
     }
+    /// Packets of a recording left out because its queue was full (or an event had to stay ahead
+    /// of them), since the last report.
+    fn record_dropped(&self, packets: u64) {
+        let _ = packets;
+    }
+    /// How many items a recording's queue held (sampled once a second per recording).
+    fn record_queue_depth(&self, depth: u64) {
+        let _ = depth;
+    }
     /// How long writing one packet to one receiver took. Reported for a sample of the packets: the
     /// clock reads would cost more than they tell if every write were timed.
     fn rtp_write_time(&self, group: &str, kind: TrackType, took: Duration) {

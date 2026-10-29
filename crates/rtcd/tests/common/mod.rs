@@ -108,6 +108,7 @@ impl TestServer {
             stream,
             conn_id: String::new(),
             client_id: String::new(),
+            reports: Vec::new(),
         };
         let ClientMessage::Hello(h) = client.next_message().await else {
             panic!("the first message is a hello")
@@ -137,6 +138,9 @@ pub struct WsClient {
     >,
     pub conn_id: String,
     pub client_id: String,
+    /// The recording reports (`record_file`, `record_ended`) a participant's pass read past, in
+    /// the order they came.
+    pub reports: Vec<ClientMessage>,
 }
 
 impl WsClient {
@@ -268,6 +272,9 @@ impl Participant {
                     self.voice.push(m.kind == MessageType::VoiceOn)
                 }
                 ClientMessage::Close(r) if r.session_id == self.session => self.closed = true,
+                m @ (ClientMessage::RecordFile(_) | ClientMessage::RecordEnded(_)) => {
+                    ws.reports.push(m)
+                }
                 _ => {}
             }
         }

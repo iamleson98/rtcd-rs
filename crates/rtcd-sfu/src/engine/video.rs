@@ -256,6 +256,9 @@ impl Engine {
             .update(now, self.cfg.egress_budget_bps, self.cfg.egress_budget_pps);
         self.follow_budget(key, now);
         self.follow_voice_limit(key);
+        if !self.recordings.is_empty() {
+            self.record_upkeep(key, now);
+        }
         // What is left looks at video: a class without a camera has nothing in it to look at, and
         // reading a session's statistics is not free on the thread that forwards the voices.
         if self.has_video(key) {
@@ -343,6 +346,7 @@ impl Engine {
         let (high, low) = (last(Layer::High), last(Layer::Low));
         if s.up.camera_stall.update(now, high, low) {
             debug!(session = %s.cfg.session_id, stalled = s.up.camera_stall.stalled(), "camera large layer changed");
+            self.record_sync(key, TrackType::Video, now);
             self.sync_call_stream(key, TrackType::Video, now);
         }
     }
