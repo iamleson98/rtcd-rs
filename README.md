@@ -165,6 +165,24 @@ and 12 Mbit/s for a class of 30 with 24 cameras, measured with `lms-sim`).
 `RTCD_RTC_REFUSEWHENSATURATED=false` turns the refusal off.
 `GET /system` reports `shards_pressured` and `shards_saturated`.
 
+## Upgrading from the previous release
+
+With no setting changed, a node that takes this release behaves differently in four ways:
+
+- It forwards the three loudest voices of a call, not all of them (`RTCD_RTC_AUDIOLOUDEST=0` forwards
+  all, as before).
+- It starts two shards where there are cores for two, not one (`RTCD_RTC_SHARDS` pins the number).
+- It refuses a join to a shard that has been at 95 % busy for three seconds, except the call's host
+  and recorder and a participant already in the call or just gone from it
+  (`RTCD_RTC_REFUSEWHENSATURATED=false` turns that off).
+- Under load (90 % busy for two seconds, or a send budget reached) it holds receivers to the small
+  video layers and forwards two voices.
+
+Off unless set: the send budgets (`RTCD_RTC_EGRESSBUDGETMBPS`, `RTCD_RTC_EGRESSBUDGETPPS`) and the
+packet time (`RTCD_RTC_AUDIOPTIMEMS`). `GET /system` gains `shards_pressured`, `shards_saturated`,
+`egress_pps` and `kernel_send_drops`. The recorder reads the length of each Opus packet from the
+packet, so recordings are right whatever the packet time is.
+
 ## Using it from class-management
 
 - Bring it in as a submodule: `git submodule add https://github.com/iamleson98/rtcd-rs.git rtcd-rust`
