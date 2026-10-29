@@ -28,10 +28,10 @@ impl Default for VadConfig {
     }
 }
 
-/// One 20 ms Opus frame on the 48 kHz RTP clock: what a gap too long for a packet is counted in.
-const OPUS_FRAME_SAMPLES: i32 = 960;
-/// The longest packet an Opus sender makes (120 ms); a larger step is a gap, not a packet.
-const MAX_PACKET_SAMPLES: i32 = 5760;
+/// One 20 ms Opus frame on the 48 kHz RTP clock: the unit the sample is kept in.
+const FRAME_SAMPLES: i32 = 960;
+/// The longest packet an Opus sender makes (120 ms), in frames; a longer step is a gap, not a packet.
+const MAX_PACKET_FRAMES: i32 = 6;
 /// The audio level of digital silence.
 const SILENCE_LEVEL: u8 = 127;
 
@@ -44,10 +44,11 @@ pub struct Monitor {
     voice: bool,
     activated_at: Option<Instant>,
     last_timestamp: Option<u32>,
-    /// The RTP timestamp step of the last packet that followed another closely: browsers asked for
-    /// a longer packet time (`a=ptime`) send 40 or 60 ms of voice per packet, not 20. Unknown until
-    /// two packets have been seen.
-    packet_samples: Option<i32>,
+    /// The last step between two packets that was short enough to be a packet, in frames.
+    last_step: Option<i32>,
+    /// How many frames a packet holds: browsers asked for a longer packet time (`a=ptime`) send 40 or
+    /// 60 ms of voice per packet, not 20. Unknown until two packets have been seen.
+    packet_frames: Option<i32>,
 }
 
 impl Monitor {
@@ -63,7 +64,8 @@ impl Monitor {
             voice: false,
             activated_at: None,
             last_timestamp: None,
-            packet_samples: None,
+            last_step: None,
+            packet_frames: None,
         }
     }
 
@@ -72,38 +74,39 @@ impl Monitor {
         self.voice
     }
 
-    /// Records the level of a packet. A sender using discontinuous transmission leaves silent
-    /// frames out, sending one packet every 400 ms instead of every 20 ms, so the frames missing
-    /// before this packet (by its RTP timestamp) count as silence; without them the sample would
-    /// stretch over seconds of silence and keep voice on. The frame is as long as the packets the
-    /// sender is making (the step between two close packets), 20 ms unless it was asked for more.
-    /// Returns the new state when it changed.
+    /// Records the level of a packet, once for each 20 ms frame it holds, so that the sample covers
+    /// the same time whatever the packet time is. A sender using discontinuous transmission leaves
+    /// silent frames out, sending one packet every 400 ms instead of every 20 ms, so the frames
+    /// between the end of the last packet and the start of this one (by the RTP timestamps) count as
+    /// silence; without them the sample would stretch over seconds of silence and keep voice on. A
+    /// packet is as long as the step between packets has been twice in a row, so that one lost
+    /// packet is not taken for a longer one. Returns the new state when it changed.
     pub fn push_packet(&mut self, level: u8, timestamp: u32, now: Instant) -> Option<bool> {
         let mut change = None;
+        let mut frames = 1;
         if let Some(last) = self.last_timestamp {
             let diff = timestamp.wrapping_sub(last) as i32;
             // A repeated or reordered packet leaves no frames missing.
             if diff > 0 {
-                // The first step shows the packet length; a gap too long to be one packet is
-                // counted in 20 ms frames.
-                let packet = self
-                    .packet_samples
-                    .unwrap_or(if diff <= MAX_PACKET_SAMPLES {
-                        diff
-                    } else {
-                        OPUS_FRAME_SAMPLES
-                    });
-                let missing = ((diff / packet) - 1).clamp(0, self.cfg.sample_size as i32);
+                let step = ((diff + FRAME_SAMPLES / 2) / FRAME_SAMPLES).max(1);
+                if step <= MAX_PACKET_FRAMES {
+                    if self.packet_frames.is_none() || self.last_step == Some(step) {
+                        self.packet_frames = Some(step);
+                    }
+                    self.last_step = Some(step);
+                }
+                frames = self.packet_frames.unwrap_or(1);
+                let missing = (step - frames).clamp(0, self.cfg.sample_size as i32);
                 for _ in 0..missing {
                     change = self.push_level(SILENCE_LEVEL, now).or(change);
-                }
-                if diff <= MAX_PACKET_SAMPLES {
-                    self.packet_samples = Some(diff);
                 }
             }
         }
         self.last_timestamp = Some(timestamp);
-        self.push_level(level, now).or(change)
+        for _ in 0..frames {
+            change = self.push_level(level, now).or(change);
+        }
+        change
     }
 
     /// Records one level. Returns the new state when it changed.
@@ -146,7 +149,8 @@ impl Monitor {
         self.voice = false;
         self.activated_at = None;
         self.last_timestamp = None;
-        self.packet_samples = None;
+        self.last_step = None;
+        self.packet_frames = None;
         was_on
     }
 }
@@ -288,14 +292,66 @@ mod tests {
     }
 
     #[test]
-    fn a_lost_packet_is_still_counted_once_at_forty_milliseconds() {
+    fn a_lost_packet_is_still_counted_at_forty_milliseconds() {
         let mut m = Monitor::new(VadConfig::default());
         let t = Instant::now();
         m.push_packet(30, 0, t);
         m.push_packet(30, 1920, t);
-        // One 40 ms packet lost: the step is two frames, one frame is missing.
+        // One 40 ms packet lost: the step is four frames, two of them missing.
         m.push_packet(30, 1920 * 3, t);
-        assert_eq!(m.levels.len(), 4);
+        assert_eq!(m.levels.len(), 1 + 2 + 2 + 2);
+    }
+
+    #[test]
+    fn a_lost_packet_does_not_change_how_long_a_packet_is() {
+        let cfg = VadConfig {
+            sample_size: 200,
+            ..VadConfig::default()
+        };
+        let mut m = Monitor::new(cfg);
+        let t = Instant::now();
+        let mut ts = 0u32;
+        for _ in 0..5 {
+            m.push_packet(30, ts, t);
+            ts += 960;
+        }
+        // The last packet before a pause is lost: a step of two frames, not a longer packet.
+        ts += 960;
+        m.push_packet(30, ts, t);
+        // The pause: a packet every 400 ms, each leaving 19 silent frames before it.
+        for _ in 0..3 {
+            ts += 960 * 20;
+            m.push_packet(127, ts, t);
+        }
+        assert_eq!(m.levels.len(), 5 + 2 + 3 * 20);
+    }
+
+    #[test]
+    fn a_sender_that_changes_its_packet_time_is_followed() {
+        let cfg = VadConfig {
+            sample_size: 200,
+            ..VadConfig::default()
+        };
+        let mut m = Monitor::new(cfg);
+        let t = Instant::now();
+        let mut ts = 0u32;
+        for _ in 0..5 {
+            m.push_packet(30, ts, t);
+            ts += 960;
+        }
+        // From 20 to 40 ms: the first long step looks like a loss, the second shows the new length.
+        for _ in 0..6 {
+            ts += 1920;
+            m.push_packet(30, ts, t);
+        }
+        let before = m.levels.len();
+        ts += 1920;
+        m.push_packet(30, ts, t);
+        assert_eq!(
+            m.levels.len(),
+            before + 2,
+            "a 40 ms packet holds two frames"
+        );
     }
 
     #[test]
