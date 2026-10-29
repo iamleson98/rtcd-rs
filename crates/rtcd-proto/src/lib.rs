@@ -17,7 +17,9 @@ mod pack;
 mod session;
 pub mod turn;
 
-pub use client_message::{ClientMessage, Hello, JoinRequest, SessionRef};
+pub use client_message::{
+    ClientMessage, Hello, JoinRequest, RecordEnded, RecordFile, RecordStart, RecordStop, SessionRef,
+};
 pub use error::ProtoError;
 pub use message::{Message, MessageType};
 pub use session::{SessionConfig, SessionProps};

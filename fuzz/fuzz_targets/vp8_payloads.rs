@@ -22,10 +22,13 @@ fuzz_target!(|data: &[u8]| {
     while let Some((&n, tail)) = rest.split_first() {
         let n = (n as usize).min(tail.len());
         let (payload, tail) = tail.split_at(n);
-        let mut p = rtc::rtp::packet::Packet::default();
-        p.header.sequence_number = seq;
-        p.header.marker = n % 3 == 0;
-        p.payload = payload.to_vec().into();
+        let p = recorder::tap::TapPacket {
+            seq,
+            ts: 0,
+            marker: n % 3 == 0,
+            payload: payload.to_vec().into(),
+            arrived: now,
+        };
         asm.push(now, &p);
         while let Some((_, f)) = asm.frame() {
             asm.recycle(f);

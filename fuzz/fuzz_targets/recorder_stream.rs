@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use recorder::media::{Recording, StreamInfo, StreamRecorder, Users};
+use recorder::tap::TapPacket;
 
 #[derive(Arbitrary, Debug)]
 struct Input {
@@ -34,12 +35,13 @@ fuzz_target!(|input: Input| {
     let mut now = start;
     for (seq, ts, wait_ms, marker, payload) in input.packets.into_iter().take(512) {
         now += Duration::from_millis(u64::from(wait_ms) * 4);
-        let mut p = rtc::rtp::packet::Packet::default();
-        p.header.sequence_number = seq;
-        p.header.timestamp = ts;
-        p.header.marker = marker;
-        p.payload = payload.into();
-        s.packet(now, p);
+        s.packet(TapPacket {
+            seq,
+            ts,
+            marker,
+            payload: payload.into(),
+            arrived: now,
+        });
         s.tick(now);
     }
     s.finish(now, "fuzz");

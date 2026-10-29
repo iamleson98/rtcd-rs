@@ -67,6 +67,12 @@ fn client_messages_decode_whatever_map_order_go_used() {
                     "{name}"
                 );
             }
+            ClientMessage::RecordStart(_)
+            | ClientMessage::RecordStop(_)
+            | ClientMessage::RecordFile(_)
+            | ClientMessage::RecordEnded(_) => {
+                panic!("{name}: the Go service has no recording messages")
+            }
         }
         seen += 1;
     }

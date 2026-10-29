@@ -13,12 +13,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rtc::rtp::packet::Packet;
 use serde::Serialize;
 use tracing::{error, info, warn};
 
 use crate::disk::Disk;
 use crate::reorder::{Item, Reorder};
+use crate::tap::TapPacket;
 use crate::vp8;
 use crate::webm::{Track, WebmWriter};
 
@@ -258,10 +258,12 @@ impl StreamRecorder {
         &self.info
     }
 
-    /// Takes a packet that arrived now. Returns whether the sender should be asked for a keyframe.
-    pub fn packet(&mut self, now: Instant, p: Packet) -> bool {
+    /// Takes a packet, which arrived when it says. Returns whether the sender should be asked for
+    /// a keyframe.
+    pub fn packet(&mut self, p: TapPacket) -> bool {
+        let now = p.arrived;
         self.last_packet = Some(now);
-        self.reorder.push(now, p);
+        self.reorder.push(p);
         self.drain(now, now);
         self.want_keyframe(now)
     }
@@ -334,7 +336,7 @@ impl StreamRecorder {
                             self.assembler.recycle(data);
                         }
                     } else {
-                        self.audio_frame(now, p.header.timestamp, &p.payload);
+                        self.audio_frame(now, p.ts, &p.payload);
                     }
                 }
                 Item::Lost(n) => {
@@ -602,14 +604,14 @@ mod tests {
         (Arc::new(Recording::new(&tmp(tag), start, limit)), start)
     }
 
-    fn opus(seq: u16, ts: u32, payload: &[u8]) -> Packet {
-        let mut p = Packet::default();
-        p.header.sequence_number = seq;
-        p.header.timestamp = ts;
-        p.header.payload_type = 111;
-        p.header.ssrc = 1;
-        p.payload = payload.to_vec().into();
-        p
+    fn opus(arrived: Instant, seq: u16, ts: u32, payload: &[u8]) -> TapPacket {
+        TapPacket {
+            seq,
+            ts,
+            marker: false,
+            payload: payload.to_vec().into(),
+            arrived,
+        }
     }
 
     fn voice(rec: &Arc<Recording>) -> StreamRecorder {
@@ -641,10 +643,12 @@ mod tests {
     /// Feeds `count` 20 ms Opus packets, the first arriving at `at`.
     fn speak(s: &mut StreamRecorder, at: Instant, seq: u16, ts: u32, count: usize) {
         for i in 0..count {
-            s.packet(
+            s.packet(opus(
                 at + Duration::from_millis(20 * i as u64),
-                opus(seq + i as u16, ts + 960 * i as u32, &[0xfc, 1, 2]),
-            );
+                seq + i as u16,
+                ts + 960 * i as u32,
+                &[0xfc, 1, 2],
+            ));
         }
     }
 
@@ -736,10 +740,12 @@ mod tests {
         let mut s = voice(&rec);
         // Packet 2 never came; 3 waits behind the gap when the stream ends.
         for (i, seq) in [0u16, 1, 3].iter().enumerate() {
-            s.packet(
+            s.packet(opus(
                 start + Duration::from_millis(20 * i as u64),
-                opus(*seq, u32::from(*seq) * 960, &[0xfc, 1, 2]),
-            );
+                *seq,
+                u32::from(*seq) * 960,
+                &[0xfc, 1, 2],
+            ));
         }
         s.finish(start + Duration::from_millis(100), "test");
         let files = rec.files();
@@ -762,10 +768,12 @@ mod tests {
         let mut s = voice(&rec);
         // 0xfd: two 20 ms frames in a packet, as a browser asked for 40 ms packets sends them.
         for i in 0..100u32 {
-            s.packet(
+            s.packet(opus(
                 start + Duration::from_millis(40 * u64::from(i)),
-                opus(i as u16, 1920 * i, &[0xfd, 1, 2]),
-            );
+                i as u16,
+                1920 * i,
+                &[0xfd, 1, 2],
+            ));
         }
         s.finish(start + Duration::from_secs(4), "test");
         let files = rec.files();
@@ -815,10 +823,12 @@ mod tests {
         speak(&mut s, start, 100, 0, 50);
         // Five seconds of DTX: one packet every 400 ms.
         for i in 0..13u32 {
-            s.packet(
+            s.packet(opus(
                 start + Duration::from_millis(1000 + 400 * u64::from(i)),
-                opus(150 + i as u16, 50 * 960 + i * 20 * 960, &[0xf8]),
-            );
+                150 + i as u16,
+                50 * 960 + i * 20 * 960,
+                &[0xf8],
+            ));
             s.tick(start + Duration::from_millis(1000 + 400 * u64::from(i)));
         }
         speak(&mut s, start + Duration::from_secs(6), 163, 6 * 48_000, 50);
@@ -856,10 +866,12 @@ mod tests {
         let mut s = voice(&rec);
         let order = [0u16, 2, 1, 3, 5, 4, 6];
         for (n, i) in order.iter().enumerate() {
-            s.packet(
+            s.packet(opus(
                 start + Duration::from_millis(20 * n as u64),
-                opus(10 + i, u32::from(*i) * 960, &[0xfc, 1]),
-            );
+                10 + i,
+                u32::from(*i) * 960,
+                &[0xfc, 1],
+            ));
         }
         s.finish(start + Duration::from_secs(1), "test");
         let times = block_times(&rec.files()[0].path);
@@ -867,17 +879,11 @@ mod tests {
     }
 
     /// A one-packet VP8 frame; keyframes carry their size (640x360 here).
-    fn vp8_frame(seq: u16, ts: u32, key: bool) -> Packet {
-        vp8_sized(seq, ts, key, 640, 360)
+    fn vp8_frame(arrived: Instant, seq: u16, ts: u32, key: bool) -> TapPacket {
+        vp8_sized(arrived, seq, ts, key, 640, 360)
     }
 
-    fn vp8_sized(seq: u16, ts: u32, key: bool, w: u16, h: u16) -> Packet {
-        let mut p = Packet::default();
-        p.header.sequence_number = seq;
-        p.header.timestamp = ts;
-        p.header.marker = true;
-        p.header.payload_type = 96;
-        p.header.ssrc = 7;
+    fn vp8_sized(arrived: Instant, seq: u16, ts: u32, key: bool, w: u16, h: u16) -> TapPacket {
         let frame: &[u8] = if key {
             &[
                 0x10,
@@ -896,8 +902,13 @@ mod tests {
         } else {
             &[0x10, 0x01, 0x00, 0x00, 0x00]
         };
-        p.payload = frame.to_vec().into();
-        p
+        TapPacket {
+            seq,
+            ts,
+            marker: true,
+            payload: frame.to_vec().into(),
+            arrived,
+        }
     }
 
     #[test]
@@ -908,7 +919,7 @@ mod tests {
         for i in 0..40u32 {
             let key = i == 10 || i == 30;
             let now = start + Duration::from_millis(66 * u64::from(i));
-            asked += usize::from(s.packet(now, vp8_frame(i as u16, i * 6000, key)));
+            asked += usize::from(s.packet(vp8_frame(now, i as u16, i * 6000, key)));
         }
         s.finish(start + Duration::from_secs(4), "test");
         assert!(asked >= 1, "no keyframe was asked for while waiting");
@@ -942,7 +953,7 @@ mod tests {
                 continue;
             }
             let now = start + Duration::from_millis(33 * u64::from(i));
-            if s.packet(now, vp8_frame(i as u16, i * 3000, i % 40 == 0)) {
+            if s.packet(vp8_frame(now, i as u16, i * 3000, i % 40 == 0)) {
                 asked.push(i);
             }
             s.tick(now);
@@ -976,10 +987,12 @@ mod tests {
         // Frames 1 and 2 swap places.
         let seqs = [0u16, 2, 1, 3, 4];
         for (n, i) in seqs.iter().enumerate() {
-            s.packet(
+            s.packet(vp8_frame(
                 start + Duration::from_millis(10 * n as u64),
-                vp8_frame(*i, u32::from(*i) * 3000, *i == 0),
-            );
+                *i,
+                u32::from(*i) * 3000,
+                *i == 0,
+            ));
         }
         s.finish(start + Duration::from_secs(1), "test");
         let files = rec.files();
@@ -1056,7 +1069,7 @@ mod tests {
         // A frame a second, then nothing for 6 s (more than the voice gap), then frames again.
         for i in 0..4u32 {
             let now = start + Duration::from_secs(u64::from(i));
-            s.packet(now, vp8_frame(i as u16, i * 90_000, i == 0));
+            s.packet(vp8_frame(now, i as u16, i * 90_000, i == 0));
             s.tick(now);
         }
         for t in 4..10u64 {
@@ -1064,7 +1077,7 @@ mod tests {
         }
         for i in 10..13u32 {
             let now = start + Duration::from_secs(u64::from(i));
-            s.packet(now, vp8_frame(i as u16 - 6, i * 90_000, false));
+            s.packet(vp8_frame(now, i as u16 - 6, i * 90_000, false));
             s.tick(now);
         }
         // The share ends at 14 s: the last picture stays up until then.
@@ -1083,7 +1096,7 @@ mod tests {
     fn a_screen_that_never_says_it_ended_is_closed_after_the_hold() {
         let (rec, start) = setup("hold", u64::MAX);
         let mut s = screen(&rec);
-        s.packet(start, vp8_frame(0, 0, true));
+        s.packet(vp8_frame(start, 0, 0, true));
         s.tick(start + VIDEO_HOLD - Duration::from_secs(1));
         assert!(rec.files().is_empty());
         s.tick(start + VIDEO_HOLD + Duration::from_secs(1));
@@ -1101,14 +1114,14 @@ mod tests {
         let mut s = screen(&rec);
         for i in 0..10u32 {
             let now = start + Duration::from_millis(100 * u64::from(i));
-            s.packet(now, vp8_sized(i as u16, i * 9000, i == 0, 1791, 1120));
+            s.packet(vp8_sized(now, i as u16, i * 9000, i == 0, 1791, 1120));
         }
         // 2.1 s with no frame (the SFU switching layers), then keyframes of the other size: the
         // first is left out until the size lasts, the second starts the file.
         let at = start + Duration::from_millis(3000);
-        s.packet(at, vp8_sized(10, 30 * 9000, true, 3584, 1952));
+        s.packet(vp8_sized(at, 10, 30 * 9000, true, 3584, 1952));
         let settled = at + SIZE_SETTLE;
-        s.packet(settled, vp8_sized(11, 40 * 9000, true, 3584, 1952));
+        s.packet(vp8_sized(settled, 11, 40 * 9000, true, 3584, 1952));
         s.finish(start + Duration::from_secs(6), "test");
         let files = rec.files();
         assert_eq!(files.len(), 2, "{files:?}");
@@ -1136,7 +1149,7 @@ mod tests {
                 11 => (true, 1600, 900),
                 _ => (false, 1920, 1080),
             };
-            asked |= s.packet(now, vp8_sized(i as u16, i * 9000, key, w, h)) && i == 10;
+            asked |= s.packet(vp8_sized(now, i as u16, i * 9000, key, w, h)) && i == 10;
             s.tick(now);
         }
         s.finish(start + Duration::from_secs(5), "test");
@@ -1160,10 +1173,12 @@ mod tests {
         let (rec, start) = setup("tail", u64::MAX);
         let mut s = camera(&rec);
         for i in 0..10u32 {
-            s.packet(
+            s.packet(vp8_frame(
                 start + Duration::from_millis(33 * u64::from(i)),
-                vp8_frame(i as u16, i * 3000, i == 0),
-            );
+                i as u16,
+                i * 3000,
+                i == 0,
+            ));
         }
         // Turned off at 400 ms; a keyframe and more frames were already on their way.
         s.stop(
@@ -1171,10 +1186,12 @@ mod tests {
             "the sender turned it off",
         );
         for i in 10..20u32 {
-            s.packet(
+            s.packet(vp8_frame(
                 start + Duration::from_millis(400 + 33 * u64::from(i - 10)),
-                vp8_frame(i as u16, i * 3000, i == 10),
-            );
+                i as u16,
+                i * 3000,
+                i == 10,
+            ));
         }
         s.tick(start + Duration::from_secs(20));
         s.finish(start + Duration::from_secs(20), "test");
@@ -1186,12 +1203,84 @@ mod tests {
         );
         // And it can be turned on again.
         for i in 20..30u32 {
-            s.packet(
+            s.packet(vp8_frame(
                 start + Duration::from_secs(5) + Duration::from_millis(33 * u64::from(i - 20)),
-                vp8_frame(i as u16, i * 3000, i == 20),
-            );
+                i as u16,
+                i * 3000,
+                i == 20,
+            ));
         }
         s.finish(start + Duration::from_secs(6), "test");
         assert_eq!(rec.files().len(), 2);
+    }
+
+    const GOLDEN: [&str; 2] = [
+        "voice 1000-2040 0x0 757 66a7051f49b46422",
+        "camera 0-3000 640x360 658 2ecb611bfd328cce",
+    ];
+
+    /// FNV-1a: a stable fingerprint of a file's bytes, with no dependency.
+    fn fingerprint(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+            (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    /// The files a fixed feed leaves, as `kind start-end WxH length fingerprint`. The expected
+    /// lines were recorded before the muxing was made to take any packet source, so a change in
+    /// the bytes written (not only in their meaning) fails this test.
+    #[test]
+    fn a_fixed_feed_writes_the_same_files_byte_for_byte() {
+        let (rec, start) = setup("golden", u64::MAX);
+        let mut voice = voice(&rec);
+        // 25 packets of 20 ms, a 40 ms packet, a lost packet with a 300 ms hole, then 10 more.
+        speak(&mut voice, start + Duration::from_secs(1), 100, 0, 25);
+        voice.packet(opus(
+            start + Duration::from_millis(1500),
+            125,
+            25 * 960,
+            &[0x10, 7, 7, 7],
+        ));
+        speak(
+            &mut voice,
+            start + Duration::from_millis(1840),
+            127,
+            27 * 960 + 15 * 960,
+            10,
+        );
+        voice.finish(start + Duration::from_millis(2200), "golden");
+        let mut camera = camera(&rec);
+        for i in 0..40u32 {
+            // Frame 15 never arrives: the picture is broken until the keyframe at 20.
+            if i == 15 {
+                continue;
+            }
+            camera.packet(vp8_frame(
+                start + Duration::from_millis(66 * u64::from(i)),
+                i as u16,
+                i * 6000,
+                i % 20 == 0,
+            ));
+            camera.tick(start + Duration::from_millis(66 * u64::from(i)));
+        }
+        camera.finish(start + Duration::from_secs(3), "golden");
+        let got: Vec<String> = rec
+            .files()
+            .iter()
+            .map(|e| {
+                let bytes = std::fs::read(&e.path).unwrap();
+                format!(
+                    "{} {}-{} {}x{} {} {:016x}",
+                    e.kind,
+                    e.start_ms,
+                    e.end_ms,
+                    e.width,
+                    e.height,
+                    bytes.len(),
+                    fingerprint(&bytes)
+                )
+            })
+            .collect();
+        assert_eq!(got, GOLDEN, "{got:#?}");
     }
 }

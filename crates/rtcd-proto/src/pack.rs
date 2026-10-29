@@ -70,6 +70,25 @@ pub(crate) fn lookup_string(map: &[(Value, Value)], key: &str) -> String {
         .unwrap_or_default()
 }
 
+/// An unsigned integer under `key` that fits 32 bits, or zero when the key is absent, not an
+/// integer, negative or too large.
+pub(crate) fn lookup_u32(map: &[(Value, Value)], key: &str) -> u32 {
+    lookup(map, key)
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0)
+}
+
+/// An unsigned integer under `key`, or zero when the key is absent, not an integer or negative.
+pub(crate) fn lookup_u64(map: &[(Value, Value)], key: &str) -> u64 {
+    lookup(map, key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// A signed integer under `key`, or zero when the key is absent or not an integer.
+pub(crate) fn lookup_i64(map: &[(Value, Value)], key: &str) -> i64 {
+    lookup(map, key).and_then(Value::as_i64).unwrap_or(0)
+}
+
 pub(crate) fn lookup_bool(map: &[(Value, Value)], key: &str) -> bool {
     lookup(map, key).and_then(Value::as_bool).unwrap_or(false)
 }

@@ -6,7 +6,9 @@ mod common;
 use std::time::Duration;
 
 use common::{KEY, Participant, TestServer};
-use rtcd_proto::{ClientMessage, Message, MessageType, SessionConfig, SessionRef};
+use rtcd_proto::{
+    ClientMessage, Message, MessageType, RecordStart, RecordStop, SessionConfig, SessionRef,
+};
 use serde_json::Value;
 
 async fn sessions(s: &TestServer, client: &str, call: &str) -> (u16, Value) {
@@ -307,6 +309,43 @@ async fn garbage_on_the_websocket_does_not_end_the_connection() {
     let mut a = Participant::join(&mut ws, s.media, "alice", "call1", 7001).await;
     a.speak(&mut ws, 5).await;
     assert_eq!(sessions(&s, "mm", "call1").await.0, 200);
+    s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recording_messages_are_counted_and_otherwise_ignored_for_now() {
+    let s = TestServer::start().await;
+    s.register("mm").await;
+    let mut ws = s.connect("mm").await;
+    ws.send(&ClientMessage::RecordStart(RecordStart {
+        recording_id: "rec1".into(),
+        call_id: "call1".into(),
+        token: "not-for-logs".into(),
+        ..RecordStart::default()
+    }))
+    .await;
+    ws.send(&ClientMessage::RecordStop(RecordStop {
+        recording_id: "rec1".into(),
+    }))
+    .await;
+    // The connection and the call machinery are untouched.
+    let mut a = Participant::join(&mut ws, s.media, "alice", "call1", 7001).await;
+    a.speak(&mut ws, 5).await;
+    assert_eq!(sessions(&s, "mm", "call1").await.0, 200);
+    let metrics = s
+        .http
+        .get(s.url("/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for kind in ["record_start", "record_stop"] {
+        let line =
+            format!("rtcd_ws_messages_total{{clientID=\"mm\",direction=\"in\",type=\"{kind}\"}} 1");
+        assert!(metrics.contains(&line), "{line} not in {metrics}");
+    }
     s.shutdown().await;
 }
 
