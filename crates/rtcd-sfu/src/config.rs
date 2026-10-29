@@ -79,11 +79,12 @@ pub struct EngineConfig {
     pub audio_ptime_ms: u32,
     /// The most this node should send, in bits per second. Near it (see `egress`) every receiver's
     /// cameras and screen shares fall back to their small layer instead of the node losing packets
-    /// for everyone. 0 sets no budget.
+    /// for everyone. 0 sets no budget: the node learns its own ceiling from the kernel refusing
+    /// datagrams.
     pub egress_budget_bps: u64,
     /// The most packets per second this node should send. The same fall back as the byte budget,
     /// for the other ceiling: a virtual network card takes a limited number of packets however
-    /// small, and voice is small. 0 sets no budget.
+    /// small, and voice is small. 0 sets no budget (the learned ceiling stands in).
     pub egress_budget_pps: u64,
     /// What the node's shards have sent, shared by all of them.
     pub egress: Arc<crate::egress::Gauge>,

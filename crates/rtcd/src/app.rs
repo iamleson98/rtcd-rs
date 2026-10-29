@@ -90,14 +90,16 @@ pub fn sfu_config(cfg: &Config, addresses: Vec<LocalAddress>) -> SfuConfig {
     // saturates (measured: a single shard dropped 3 % of the voice packets at 600 participants on
     // four cores, and lost two thirds at 900, where two shards lost 7 %). Another is not free
     // either: its sockets batch less and datagrams are passed between threads. So by default the
-    // SFU starts with one and adds a shard when all of them have been busy for a few seconds, up to
-    // one fewer than the cores (the rest serve the API, the kernel's network work and the
-    // recorder), and stops one that has been empty for a while. An operator can pin the number.
+    // SFU starts with two and adds a shard when all of them have been busy for a few seconds and
+    // the machine has a core to give it, up to every CPU the process may use, and stops one that
+    // has been empty for a while. The machine decides how many: with cores to spare it grows, and
+    // where every core is spoken for (the kernel's network work, the API and the recorders need
+    // theirs) it stops by itself. An operator can pin the number.
     let (shards, max_shards) = if rtc.shards > 0 {
         (rtc.shards as usize, 0)
     } else {
         let cores = std::thread::available_parallelism().map_or(1, usize::from);
-        let max = cores.saturating_sub(1).clamp(1, 32);
+        let max = cores.clamp(1, 32);
         // Two from the start where there are cores for two: a class that begins at the bell is
         // placed call by call before its participants arrive, so with one shard they all land on it
         // (three lectures of 130 to 180 people filled one thread to 96 to 100 % while a second sat

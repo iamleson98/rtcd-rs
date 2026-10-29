@@ -59,7 +59,10 @@ lighter instance. Calls stay on the instance they start on.
 
 Within an instance, threads called shards serve the calls, and a call lives on one of them. With
 `RTCD_RTC_SHARDS=0` (the default) the number follows the load, from two shards (one where there
-are fewer than three cores) up to one fewer than the cores. Two from the start because a class
+are fewer than two cores) up to every CPU the process may use, as long as the machine has most of a
+core idle to give the next one (a shard is added only while the CPUs have 0.8 of a core spare, so
+the kernel's network work, the API and the recorders keep theirs: the node grows into the room it
+has and stops by itself where there is none; the pod needs no CPU limit to be safe). Two from the start because a class
 that begins at the bell is placed call by call before its participants arrive: with one shard,
 three lectures of 130 to 180 people landed on it together and ran it at 96 to 100 % while a
 second sat idle, then refused people; on two shards the threads ran at 51 and 70 %. A new call that finds every shard holding 300 sessions' worth (each call counts for at
@@ -119,9 +122,15 @@ everyone past about 320 Mbit/s). With `RTCD_RTC_EGRESSBUDGETMBPS=N` (`rtc.egress
 shards add what they send to one gauge, and when its smoothed rate reaches 85 % of `N` every
 receiver's cameras and screen shares fall back to their small layer (no renegotiation, the same
 switch a receiver's own request makes); they go back up only after the rate has stayed under 65 %
-for twenty seconds, so the drop itself does not release it. 0 (the default) sets no budget.
-`GET /system` reports `egress_bps` and `egress_squeezed` either way, for whatever places new calls
-(`src/egress.rs`).
+for twenty seconds, so the drop itself does not release it. 0 (the default) sets no budget, and the
+node finds its own ceiling instead: the first time the kernel refuses datagrams (50 or more a
+second, `SndbufErrors`) the rate it was sending becomes the ceiling, at 90 % of that rate, the
+squeeze starts at once, and the ceiling is lifted by a tenth after every five quiet minutes, so a
+node is held to what its network can carry now and not to its worst moment. A refusal at the
+ceiling teaches a lower one; one while squeezed well below it does not. A budget that is set
+still applies, whichever is lower. `GET /system` reports `egress_bps`, `egress_squeezed` and the
+learned `egress_ceiling_bps` and `egress_ceiling_pps` (0 until the kernel has refused something),
+for whatever places new calls (`src/egress.rs`).
 
 The card has a second ceiling, in packets: `RTCD_RTC_EGRESSBUDGETPPS=N` (`rtc.egress_budget_pps`)
 is the same rule for packets per second, and either budget squeezes. Voice packets are about 100
@@ -178,8 +187,8 @@ With no setting changed, a node that takes this release behaves differently in f
 - Under load (90 % busy for two seconds, or a send budget reached) it holds receivers to the small
   video layers and forwards two voices.
 
-Off unless set: the send budgets (`RTCD_RTC_EGRESSBUDGETMBPS`, `RTCD_RTC_EGRESSBUDGETPPS`) and the
-packet time (`RTCD_RTC_AUDIOPTIMEMS`). `GET /system` gains `shards_pressured`, `shards_saturated`,
+Off unless set: the send budgets (`RTCD_RTC_EGRESSBUDGETMBPS`, `RTCD_RTC_EGRESSBUDGETPPS`; without
+them the node learns its ceiling from the kernel refusing datagrams) and the packet time (`RTCD_RTC_AUDIOPTIMEMS`). `GET /system` gains `shards_pressured`, `shards_saturated`,
 `egress_pps` and `kernel_send_drops`. The recorder reads the length of each Opus packet from the
 packet, so recordings are right whatever the packet time is.
 

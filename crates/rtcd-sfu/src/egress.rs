@@ -16,6 +16,13 @@
 //! full and the kernel dropped what it could not queue, at 400 Mbit/s, half what the same card
 //! sends in large packets). Either budget squeezes.
 //!
+//! The budgets are optional. With none set the node learns its own ceiling from the one signal
+//! that cannot be wrong: the kernel refusing datagrams. The first time it does, the rate it was
+//! sending becomes the ceiling (a little under it, so the node stays clear of the edge), the
+//! squeeze starts, and the ceiling is lifted a notch every few quiet minutes so that a node whose
+//! network got better, or whose neighbour went quiet, is not held to its worst moment. A budget
+//! that is set still applies, whichever of the two is lower.
+//!
 //! The rate is also what a placement decision wants to know, so it is readable whether or not a
 //! budget is set. The kernel's own count of datagrams it refused to queue is kept too: UDP
 //! reports those to nobody, so without it a node that drops half its packets sees none of them.
@@ -32,6 +39,17 @@ const RELEASE_BELOW: f64 = 0.65;
 const RELEASE_AFTER: Duration = Duration::from_secs(20);
 /// The rate is measured over windows of at least this long and smoothed over two of them.
 const WINDOW: Duration = Duration::from_secs(1);
+/// A window in which the kernel refused at least this many datagrams a second taught the node
+/// where its ceiling is (one stray refusal is not a ceiling).
+const DROPS_PER_SEC: f64 = 50.0;
+/// The learned ceiling is this share of the rate the node was sending when the kernel refused.
+const LEARNED_SHARE: f64 = 0.9;
+/// A refusal at a rate this close to the learned ceiling, or above it, teaches a lower one; below
+/// it the ceiling was not what was refused, and the squeeze alone answers.
+const RELEARN_NEAR: f64 = 0.95;
+/// A learned ceiling is lifted by [`GROW_BY`] after this long without a refusal.
+const GROW_AFTER: Duration = Duration::from_secs(300);
+const GROW_BY: f64 = 1.1;
 /// The gauge is updated by the sessions' upkeep, so while no session exists it is not. A gap this
 /// long between two updates was a quiet node: what it held before says nothing about now.
 const IDLE_GAP: Duration = Duration::from_secs(10);
@@ -45,6 +63,13 @@ struct State {
     rate_pps: f64,
     squeezed: bool,
     calm_since: Option<Instant>,
+    /// What the kernel's refusals taught: the ceilings in bits and packets per second (0: none yet).
+    learned_bps: f64,
+    learned_pps: f64,
+    /// The kernel's count at the last window, to tell what it refused during this one.
+    last_drops: Option<u64>,
+    /// When the ceiling was last taught or lifted.
+    ceiling_at: Option<Instant>,
 }
 
 /// What the shards of one node have sent, shared by all of them.
@@ -59,6 +84,9 @@ pub struct Gauge {
     squeezed: AtomicBool,
     /// Datagrams the kernel refused to queue since the node started (UDP `SndbufErrors`).
     kernel_drops: AtomicU64,
+    /// The ceilings the node learned (0 until the kernel has refused something).
+    ceiling: AtomicU64,
+    ceiling_packets: AtomicU64,
 }
 
 impl Gauge {
@@ -84,14 +112,31 @@ impl Gauge {
         self.kernel_drops.load(Ordering::Relaxed)
     }
 
+    /// The send rate in bits per second at which the kernel started refusing datagrams, as the node
+    /// learned it (0 until it has).
+    pub fn ceiling_bps(&self) -> u64 {
+        self.ceiling.load(Ordering::Relaxed)
+    }
+
+    /// The same in packets per second.
+    pub fn ceiling_pps(&self) -> u64 {
+        self.ceiling_packets.load(Ordering::Relaxed)
+    }
+
     /// Whether receivers are being held to the small layers.
     pub fn squeezed(&self) -> bool {
         self.squeezed.load(Ordering::Relaxed)
     }
 
     /// Recomputes the rates and the decision; cheap to call often, it works at most once a window.
-    /// A budget of 0 is not enforced: with both at 0 the gauge only measures.
+    /// A budget of 0 is not set: the node's learned ceiling stands in for it.
     pub fn update(&self, now: Instant, budget_bps: u64, budget_pps: u64) {
+        self.update_with(now, budget_bps, budget_pps, udp_send_errors());
+    }
+
+    /// [`Gauge::update`] with the kernel's count of refused datagrams given (`None` where the
+    /// system does not say).
+    fn update_with(&self, now: Instant, budget_bps: u64, budget_pps: u64, drops: Option<u64>) {
         let Ok(mut st) = self.state.try_lock() else {
             return;
         };
@@ -130,16 +175,26 @@ impl Gauge {
         self.rate.store(st.rate_bps as u64, Ordering::Relaxed);
         self.rate_packets
             .store(st.rate_pps as u64, Ordering::Relaxed);
-        if let Some(drops) = udp_send_errors() {
-            self.kernel_drops.store(drops, Ordering::Relaxed);
-        }
+        let refused = drops.map_or(0, |d| {
+            self.kernel_drops.store(d, Ordering::Relaxed);
+            let before = st.last_drops.replace(d).unwrap_or(d);
+            d.saturating_sub(before)
+        });
 
         if idle {
             // The quiet was the calm spell: a class that starts now does not begin held to the
             // small layers because the last one ended squeezed.
             st.calm_since = Some(at);
         }
-        let squeezed = decide(&mut st, now, budget_bps, budget_pps);
+        learn(&mut st, now, refused as f64 / secs);
+        self.ceiling.store(st.learned_bps as u64, Ordering::Relaxed);
+        self.ceiling_packets
+            .store(st.learned_pps as u64, Ordering::Relaxed);
+        let (limit_bps, limit_pps) = (
+            lower_of(budget_bps, st.learned_bps),
+            lower_of(budget_pps, st.learned_pps),
+        );
+        let squeezed = decide(&mut st, now, limit_bps, limit_pps);
         self.squeezed.store(squeezed, Ordering::Relaxed);
     }
 }
@@ -159,6 +214,38 @@ fn udp_send_errors() -> Option<u64> {
     #[cfg(not(target_os = "linux"))]
     {
         None
+    }
+}
+
+/// The lower of a configured budget (0: none) and a learned ceiling (0: none yet); 0 if neither.
+fn lower_of(budget: u64, learned: f64) -> u64 {
+    match (budget, learned as u64) {
+        (0, l) => l,
+        (b, 0) => b,
+        (b, l) => b.min(l),
+    }
+}
+
+/// What the kernel's refusals teach, given how many it made a second during the window just
+/// measured: a ceiling where there was none or a lower one, the squeeze at once, and a notch
+/// back up after a long quiet.
+fn learn(st: &mut State, now: Instant, refused_per_sec: f64) {
+    if refused_per_sec >= DROPS_PER_SEC {
+        let near = |rate: f64, learned: f64| learned == 0.0 || rate >= learned * RELEARN_NEAR;
+        if near(st.rate_bps, st.learned_bps) || near(st.rate_pps, st.learned_pps) {
+            st.learned_bps = LEARNED_SHARE * st.rate_bps;
+            st.learned_pps = LEARNED_SHARE * st.rate_pps;
+        }
+        st.squeezed = true;
+        st.calm_since = None;
+        st.ceiling_at = Some(now);
+    } else if st.learned_bps > 0.0 || st.learned_pps > 0.0 {
+        let since = *st.ceiling_at.get_or_insert(now);
+        if now.saturating_duration_since(since) >= GROW_AFTER {
+            st.learned_bps *= GROW_BY;
+            st.learned_pps *= GROW_BY;
+            st.ceiling_at = Some(now);
+        }
     }
 }
 
@@ -227,7 +314,7 @@ mod tests {
         for _ in 0..secs {
             g.add(bytes, packets);
             *now += Duration::from_secs(1);
-            g.update(*now, budget_mbps * 1_000_000, budget_pps);
+            g.update_with(*now, budget_mbps * 1_000_000, budget_pps, None);
         }
     }
 
@@ -235,7 +322,7 @@ mod tests {
     fn the_rate_is_measured_whether_or_not_there_is_a_budget() {
         let g = Gauge::default();
         let mut now = Instant::now();
-        g.update(now, 0, 0);
+        g.update_with(now, 0, 0, None);
         run(&g, &mut now, 5, 100, 0);
         let rate = g.rate_bps() / 1_000_000;
         assert!((95..=105).contains(&rate), "rate {rate} Mbit/s");
@@ -246,7 +333,7 @@ mod tests {
     fn video_is_squeezed_near_the_budget_and_released_after_a_calm_spell() {
         let g = Gauge::default();
         let mut now = Instant::now();
-        g.update(now, 300_000_000, 0);
+        g.update_with(now, 300_000_000, 0, None);
         run(&g, &mut now, 5, 100, 300);
         assert!(!g.squeezed(), "a third of the budget");
         run(&g, &mut now, 5, 280, 300);
@@ -261,7 +348,7 @@ mod tests {
     fn a_rate_hovering_between_the_marks_does_not_release() {
         let g = Gauge::default();
         let mut now = Instant::now();
-        g.update(now, 300_000_000, 0);
+        g.update_with(now, 300_000_000, 0, None);
         run(&g, &mut now, 6, 290, 300);
         assert!(g.squeezed());
         // 75 % is under the squeeze mark but over the release mark.
@@ -273,7 +360,7 @@ mod tests {
     fn no_budget_never_squeezes() {
         let g = Gauge::default();
         let mut now = Instant::now();
-        g.update(now, 0, 0);
+        g.update_with(now, 0, 0, None);
         run(&g, &mut now, 10, 900, 0);
         assert!(!g.squeezed());
     }
@@ -284,7 +371,7 @@ mod tests {
         // and the whole of a 110,000-packet budget.
         let g = Gauge::default();
         let mut now = Instant::now();
-        g.update(now, 600_000_000, 110_000);
+        g.update_with(now, 600_000_000, 110_000, None);
         run_packets(&g, &mut now, 5, 100_000 * 100, 100_000, 600, 110_000);
         assert!(
             g.squeezed(),
@@ -299,7 +386,7 @@ mod tests {
     fn a_budget_of_zero_is_not_enforced() {
         let g = Gauge::default();
         let mut now = Instant::now();
-        g.update(now, 0, 0);
+        g.update_with(now, 0, 0, None);
         // Only the byte budget is set: a packet rate far beyond any sensible budget does not matter.
         run_packets(&g, &mut now, 10, 10 * MBIT, 900_000, 600, 0);
         assert!(!g.squeezed());
@@ -310,18 +397,156 @@ mod tests {
     fn a_node_that_was_squeezed_and_then_idle_starts_the_next_call_released() {
         let g = Gauge::default();
         let mut now = Instant::now();
-        g.update(now, 300_000_000, 0);
+        g.update_with(now, 300_000_000, 0, None);
         run(&g, &mut now, 6, 290, 300);
         assert!(g.squeezed());
         // The last session leaves: nothing updates the gauge for ten minutes.
         now += Duration::from_secs(600);
         g.add(5 * MBIT, 100);
-        g.update(now, 300_000_000, 0);
+        g.update_with(now, 300_000_000, 0, None);
         assert!(!g.squeezed(), "the idle spell released it");
         assert!(
             g.rate_bps() < 1_000_000,
             "the rate is the idle one, not the old {}",
             g.rate_bps()
         );
+    }
+
+    /// Runs the gauge for `secs` seconds at `mbps`, the kernel refusing `refused` datagrams a second.
+    fn run_refusing(
+        g: &Gauge,
+        now: &mut Instant,
+        secs: u64,
+        mbps: u64,
+        refused: &mut u64,
+        per_sec: u64,
+    ) {
+        for _ in 0..secs {
+            g.add(mbps * MBIT, (mbps * MBIT).div_ceil(1_200));
+            *now += Duration::from_secs(1);
+            *refused += per_sec;
+            g.update_with(*now, 0, 0, Some(*refused));
+        }
+    }
+
+    #[test]
+    fn a_node_with_no_budget_learns_its_ceiling_from_the_kernel_refusing_datagrams() {
+        let g = Gauge::default();
+        let mut now = Instant::now();
+        let mut refused = 1_000_000;
+        g.update_with(now, 0, 0, Some(refused));
+        run_refusing(&g, &mut now, 20, 700, &mut refused, 0);
+        assert!(
+            !g.squeezed(),
+            "700 Mbit/s and nothing refused: no reason to hold back"
+        );
+        assert_eq!(g.ceiling_bps(), 0);
+
+        run_refusing(&g, &mut now, 3, 700, &mut refused, 5_000);
+        assert!(g.squeezed(), "the kernel refused 5,000 datagrams a second");
+        let ceiling = g.ceiling_bps() / 1_000_000;
+        assert!(
+            (600..=640).contains(&ceiling),
+            "a little under the 700 Mbit/s it sent: {ceiling}"
+        );
+        assert!(g.ceiling_pps() > 0);
+        assert_eq!(g.kernel_send_drops(), refused);
+    }
+
+    #[test]
+    fn a_few_stray_refusals_are_not_a_ceiling() {
+        let g = Gauge::default();
+        let mut now = Instant::now();
+        let mut refused = 0;
+        g.update_with(now, 0, 0, Some(refused));
+        run_refusing(&g, &mut now, 10, 700, &mut refused, 10);
+        assert!(!g.squeezed());
+        assert_eq!(g.ceiling_bps(), 0);
+    }
+
+    #[test]
+    fn the_squeeze_that_follows_a_refusal_is_released_when_the_rate_falls() {
+        let g = Gauge::default();
+        let mut now = Instant::now();
+        let mut refused = 0;
+        g.update_with(now, 0, 0, Some(refused));
+        run_refusing(&g, &mut now, 4, 700, &mut refused, 5_000);
+        assert!(g.squeezed());
+        run_refusing(&g, &mut now, 10, 300, &mut refused, 0);
+        assert!(g.squeezed(), "the calm spell is not over");
+        run_refusing(&g, &mut now, 30, 300, &mut refused, 0);
+        assert!(
+            !g.squeezed(),
+            "under two thirds of the ceiling for long enough"
+        );
+    }
+
+    #[test]
+    fn refusals_while_squeezed_below_the_ceiling_do_not_lower_it() {
+        let g = Gauge::default();
+        let mut now = Instant::now();
+        let mut refused = 0;
+        g.update_with(now, 0, 0, Some(refused));
+        run_refusing(&g, &mut now, 4, 700, &mut refused, 5_000);
+        let learned = g.ceiling_bps();
+        // The squeeze takes the rate down, with the last queued datagrams still being refused.
+        run_refusing(&g, &mut now, 10, 300, &mut refused, 5_000);
+        assert_eq!(g.ceiling_bps(), learned);
+        assert!(g.squeezed());
+    }
+
+    #[test]
+    fn a_refusal_at_the_ceiling_teaches_a_lower_one() {
+        let g = Gauge::default();
+        let mut now = Instant::now();
+        let mut refused = 0;
+        g.update_with(now, 0, 0, Some(refused));
+        run_refusing(&g, &mut now, 4, 700, &mut refused, 5_000);
+        let first = g.ceiling_bps();
+        run_refusing(&g, &mut now, 40, 300, &mut refused, 0);
+        assert!(!g.squeezed());
+        // It climbs back to the ceiling and is refused there again: the first was too high.
+        run_refusing(&g, &mut now, 8, 650, &mut refused, 5_000);
+        assert!(g.ceiling_bps() < first, "{} < {first}", g.ceiling_bps());
+    }
+
+    #[test]
+    fn a_learned_ceiling_is_lifted_after_a_long_quiet() {
+        let g = Gauge::default();
+        let mut now = Instant::now();
+        let mut refused = 0;
+        g.update_with(now, 0, 0, Some(refused));
+        run_refusing(&g, &mut now, 4, 700, &mut refused, 5_000);
+        let learned = g.ceiling_bps();
+        run_refusing(&g, &mut now, 290, 100, &mut refused, 0);
+        assert_eq!(g.ceiling_bps(), learned, "not yet");
+        run_refusing(&g, &mut now, 20, 100, &mut refused, 0);
+        assert!(g.ceiling_bps() > learned, "{} > {learned}", g.ceiling_bps());
+    }
+
+    #[test]
+    fn a_configured_budget_below_the_learned_ceiling_wins() {
+        let g = Gauge::default();
+        let mut now = Instant::now();
+        let mut refused = 0;
+        g.update_with(now, 300_000_000, 0, Some(refused));
+        for _ in 0..4 {
+            g.add(700 * MBIT, 700 * MBIT / 1_200);
+            now += Duration::from_secs(1);
+            refused += 5_000;
+            g.update_with(now, 300_000_000, 0, Some(refused));
+        }
+        // 300 Mbit/s is under the 630 learned: the node is squeezed at 85 % of the budget.
+        run_packets_refused(&g, &mut now, &mut refused, 270);
+        assert!(g.squeezed());
+        assert_eq!(lower_of(300_000_000, g.ceiling_bps() as f64), 300_000_000);
+    }
+
+    fn run_packets_refused(g: &Gauge, now: &mut Instant, refused: &mut u64, mbps: u64) {
+        for _ in 0..30 {
+            g.add(mbps * MBIT, mbps * MBIT / 1_200);
+            *now += Duration::from_secs(1);
+            g.update_with(*now, 300_000_000, 0, Some(*refused));
+        }
     }
 }

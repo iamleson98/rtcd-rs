@@ -273,12 +273,14 @@ fn scale(core: Arc<Core>, stop: Arc<std::sync::atomic::AtomicBool>) {
     let max = core.cfg.shard_slots();
     let policy = core.cfg.scaling;
     let mut scaler = Scaler::new(max, policy);
+    let mut cpu = crate::hostcpu::Sampler::default();
     while !stop.load(Ordering::Acquire) {
         std::thread::park_timeout(policy.tick);
         if stop.load(Ordering::Acquire) {
             return;
         }
-        match scaler.step(Instant::now(), &core.loads(), max) {
+        let spare = cpu.sample().map(|r| r.spare_cores());
+        match scaler.step(Instant::now(), &core.loads(), max, spare) {
             Step::Hold => {}
             Step::Add => {
                 if let Err(err) = core.add_shard() {
@@ -670,6 +672,17 @@ impl Sfu {
     /// socket and never left, which UDP reports to nobody else.
     pub fn kernel_send_drops(&self) -> u64 {
         self.core.cfg.engine.egress.kernel_send_drops()
+    }
+
+    /// The send rate in bits per second at which the kernel started refusing datagrams, as the
+    /// node learned it (0 until it has).
+    pub fn egress_ceiling_bps(&self) -> u64 {
+        self.core.cfg.engine.egress.ceiling_bps()
+    }
+
+    /// The same in packets per second.
+    pub fn egress_ceiling_pps(&self) -> u64 {
+        self.core.cfg.engine.egress.ceiling_pps()
     }
 
     /// Whether receivers are held to the small video layers because a send budget is reached.

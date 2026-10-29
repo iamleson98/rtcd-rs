@@ -3,6 +3,7 @@ pub mod bwe;
 pub mod config;
 pub mod egress;
 pub mod engine;
+pub mod hostcpu;
 pub mod ids;
 pub mod layers;
 pub mod loudest;

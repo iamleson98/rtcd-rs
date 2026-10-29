@@ -50,6 +50,12 @@ pub struct ScalingPolicy {
     /// starts at the bell lands entirely on the only shard (calls are placed before the first
     /// participant arrives, and a call cannot move), where two share it.
     pub min_shards: usize,
+    /// A shard is added only while the machine has this much idle CPU, in cores: a new thread
+    /// needs a core to run on, and the kernel's network work, the API and the recorders need the
+    /// rest. A machine with cores to spare never meets it; one where every core is spoken for
+    /// stops growing instead of taking them from each other. Unknown (a system that does not say)
+    /// counts as room.
+    pub spare_cores: f32,
 }
 
 impl Default for ScalingPolicy {
@@ -62,6 +68,7 @@ impl Default for ScalingPolicy {
             sessions_per_shard: SESSIONS_PER_SHARD,
             expected_call_size: EXPECTED_CALL_SIZE,
             min_shards: 1,
+            spare_cores: SPARE_CORES,
         }
     }
 }
@@ -71,6 +78,8 @@ const HOT_TICKS: u32 = 3;
 const EMPTY_FOR: Duration = Duration::from_secs(120);
 const SESSIONS_PER_SHARD: usize = 300;
 const EXPECTED_CALL_SIZE: usize = 20;
+/// Most of a core: a shard at its busiest takes one, and what is idle is never exactly a whole one.
+const SPARE_CORES: f32 = 0.8;
 
 /// What one shard reports.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -106,12 +115,20 @@ impl Scaler {
         }
     }
 
-    /// What to do given the running shards, at most `max` of them.
+    /// What to do given the running shards, at most `max` of them, and how busy the machine's CPUs
+    /// are (`spare_cores` idle, if known).
     ///
     /// A shard is added only when all of them are hot: one that has room takes the next call, and
     /// a hot shard whose calls are long cannot hand them over anyway, so more shards than the
-    /// busy ones need would only be threads that pass datagrams to each other.
-    pub fn step(&mut self, now: Instant, shards: &[ShardLoad], max: usize) -> Step {
+    /// busy ones need would only be threads that pass datagrams to each other. And only while the
+    /// machine has CPU to give it (`spare_cores`).
+    pub fn step(
+        &mut self,
+        now: Instant,
+        shards: &[ShardLoad],
+        max: usize,
+        spare_cores: Option<f64>,
+    ) -> Step {
         for (slot, since) in self.empty_since.iter_mut().enumerate() {
             let empty = shards.iter().any(|s| s.slot == slot && s.sessions == 0);
             if empty {
@@ -123,7 +140,8 @@ impl Scaler {
 
         let all_hot = !shards.is_empty() && shards.iter().all(|s| s.busy >= self.policy.hot);
         self.hot = if all_hot { self.hot + 1 } else { 0 };
-        if self.hot >= self.policy.hot_ticks && shards.len() < max {
+        let room = spare_cores.is_none_or(|c| c >= f64::from(self.policy.spare_cores));
+        if self.hot >= self.policy.hot_ticks && shards.len() < max && room {
             self.hot = 0;
             return Step::Add;
         }
@@ -252,7 +270,7 @@ mod tests {
         max: usize,
     ) -> Vec<Step> {
         (from..from + n)
-            .map(|i| scaler.step(start + TICK * i, shards, max))
+            .map(|i| scaler.step(start + TICK * i, shards, max, None))
             .collect()
     }
 
@@ -325,12 +343,12 @@ mod tests {
         let t = Instant::now();
         let mut s = Scaler::new(4, ScalingPolicy::default());
         let shards = [load(0, 0.1, 30), load(1, 0.0, 0)];
-        assert_eq!(s.step(t, &shards, 3), Step::Hold);
-        assert_eq!(s.step(t + EMPTY_FOR / 2, &shards, 3), Step::Hold);
-        assert_eq!(s.step(t + EMPTY_FOR, &shards, 3), Step::Retire(1));
+        assert_eq!(s.step(t, &shards, 3, None), Step::Hold);
+        assert_eq!(s.step(t + EMPTY_FOR / 2, &shards, 3, None), Step::Hold);
+        assert_eq!(s.step(t + EMPTY_FOR, &shards, 3, None), Step::Retire(1));
 
         let alone = [load(0, 0.0, 0)];
-        assert_eq!(s.step(t + EMPTY_FOR * 4, &alone, 3), Step::Hold);
+        assert_eq!(s.step(t + EMPTY_FOR * 4, &alone, 3, None), Step::Hold);
     }
 
     #[test]
@@ -339,11 +357,11 @@ mod tests {
         let mut s = Scaler::new(4, ScalingPolicy::default());
         let empty = [load(0, 0.1, 30), load(1, 0.0, 0)];
         let used = [load(0, 0.1, 30), load(1, 0.1, 5)];
-        s.step(t, &empty, 3);
-        s.step(t + EMPTY_FOR / 2, &used, 3);
-        assert_eq!(s.step(t + EMPTY_FOR, &empty, 3), Step::Hold);
+        s.step(t, &empty, 3, None);
+        s.step(t + EMPTY_FOR / 2, &used, 3, None);
+        assert_eq!(s.step(t + EMPTY_FOR, &empty, 3, None), Step::Hold);
         assert_eq!(
-            s.step(t + EMPTY_FOR + EMPTY_FOR, &empty, 3),
+            s.step(t + EMPTY_FOR + EMPTY_FOR, &empty, 3, None),
             Step::Retire(1)
         );
     }
@@ -353,8 +371,8 @@ mod tests {
         let t = Instant::now();
         let mut s = Scaler::new(4, ScalingPolicy::default());
         let shards = [load(0, 0.9, 300), load(1, 0.0, 0)];
-        s.step(t, &shards, 3);
-        assert_eq!(s.step(t + EMPTY_FOR * 2, &shards, 3), Step::Hold);
+        s.step(t, &shards, 3, None);
+        assert_eq!(s.step(t + EMPTY_FOR * 2, &shards, 3, None), Step::Hold);
     }
 
     #[test]
@@ -432,5 +450,47 @@ mod tests {
             steps.contains(&Step::Retire(2)),
             "the one above the floor goes"
         );
+    }
+
+    #[test]
+    fn a_shard_is_added_only_while_the_machine_has_a_core_to_give() {
+        let t = Instant::now();
+        let hot = [load(0, 0.9, 100), load(1, 0.9, 100)];
+        let spare = |cores: f64| {
+            let mut s = Scaler::new(4, ScalingPolicy::default());
+            (0..10)
+                .map(|i| s.step(t + TICK * i, &hot, 4, Some(cores)))
+                .any(|step| step == Step::Add)
+        };
+        assert!(spare(1.2), "a core and more idle");
+        assert!(spare(0.85), "most of a core is enough");
+        assert!(!spare(0.3), "every core is spoken for");
+        let mut s = Scaler::new(4, ScalingPolicy::default());
+        let unknown = (0..10).any(|i| s.step(t + TICK * i, &hot, 4, None) == Step::Add);
+        assert!(unknown, "a system that does not say counts as room");
+    }
+
+    #[test]
+    fn a_shard_waits_for_room_and_is_added_when_it_comes() {
+        let t = Instant::now();
+        let hot = [load(0, 0.9, 100), load(1, 0.9, 100)];
+        let mut s = Scaler::new(4, ScalingPolicy::default());
+        let crowded = ticks_spare(&mut s, t, 0, 20, &hot, 0.2);
+        assert!(crowded.iter().all(|s| *s == Step::Hold));
+        let freed = ticks_spare(&mut s, t, 20, 2, &hot, 1.5);
+        assert_eq!(freed[0], Step::Add, "hot for long enough already");
+    }
+
+    fn ticks_spare(
+        scaler: &mut Scaler,
+        start: Instant,
+        from: u32,
+        n: u32,
+        shards: &[ShardLoad],
+        spare: f64,
+    ) -> Vec<Step> {
+        (from..from + n)
+            .map(|i| scaler.step(start + TICK * i, shards, 4, Some(spare)))
+            .collect()
     }
 }
