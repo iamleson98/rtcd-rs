@@ -490,6 +490,43 @@ fn only_the_loudest_voices_are_forwarded_beyond_the_limit() {
 }
 
 #[test]
+fn a_muted_voice_gives_up_its_slot_at_once() {
+    let mut w = World::with_config(EngineConfig {
+        audio_loudest: 1,
+        ..engine_config()
+    });
+    let teacher = w.join("teacher", "call1");
+    let student = w.join("student", "call1");
+    let listener = w.join("listener", "call1");
+    wait_tracks(&mut w, listener, 0);
+    // The teacher is loud and holds the only slot.
+    for _ in 0..100 {
+        w.send_audio(teacher, 25);
+        w.send_audio(student, 90);
+        w.run_for(Duration::from_millis(20));
+    }
+    let student_before = w.browsers[listener].received_on("voice_session-student");
+    assert!(
+        student_before < 20,
+        "the student was heard {student_before} times"
+    );
+
+    // The teacher mutes, and the student answers straight away: not half a second of the answer
+    // is lost to a slot the muted voice still holds.
+    w.signal(teacher, MessageType::Mute, vec![]);
+    w.run_for(Duration::from_millis(20));
+    for _ in 0..25 {
+        w.send_audio(student, 90);
+        w.run_for(Duration::from_millis(20));
+    }
+    let heard = w.browsers[listener].received_on("voice_session-student") - student_before;
+    assert!(
+        heard >= 22,
+        "the student's first half second reached {heard} of 25 packets"
+    );
+}
+
+#[test]
 fn a_call_within_the_voice_limit_forwards_everyone() {
     let heard = crowd(3, &[25, 90, 100]);
     for (i, n) in heard.iter().enumerate() {

@@ -692,10 +692,16 @@ impl Engine {
             return;
         };
         s.up.muted = muted;
+        let voice_ended = muted && s.up.vad.as_mut().is_some_and(Monitor::reset);
         if muted
-            && let Some(vad) = s.up.vad.as_mut()
-            && vad.reset()
+            && let Some(id) = self.call_id_of(key)
+            && let Some(call) = self.calls.get_mut(&id)
         {
+            // Its slot among the loudest voices is free for whoever answers, not held until the
+            // last loudness it had has aged out.
+            call.voices.remove(key);
+        }
+        if voice_ended {
             self.emit(key, MessageType::VoiceOff, Vec::new());
         }
         debug!(session = %self.session_id(key), muted, "microphone state");
