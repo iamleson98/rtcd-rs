@@ -11,6 +11,7 @@ pub mod peer;
 pub mod reorder;
 pub mod session;
 pub mod socket;
+pub mod tap;
 pub mod upload;
 pub mod vp8;
 pub mod webm;

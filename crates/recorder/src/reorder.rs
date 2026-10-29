@@ -7,19 +7,19 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use rtc::rtp::packet::Packet;
+use crate::tap::TapPacket;
 
 /// What leaves the buffer.
 #[derive(Debug)]
 pub enum Item {
-    Packet(Packet),
+    Packet(TapPacket),
     /// This many packets will not come.
     Lost(u32),
 }
 
 #[derive(Debug)]
 pub struct Reorder {
-    slots: Vec<Option<(Instant, Packet)>>,
+    slots: Vec<Option<TapPacket>>,
     /// The ring's size, the most packets that can be held at once.
     size: u64,
     /// Items already decided, ahead of the slots (made when a jump forced gaps to be given up).
@@ -66,8 +66,9 @@ impl Reorder {
         }
     }
 
-    pub fn push(&mut self, now: Instant, p: Packet) {
-        let seq = p.header.sequence_number;
+    pub fn push(&mut self, p: TapPacket) {
+        let now = p.arrived;
+        let seq = p.seq;
         let ext = if self.next.is_none() {
             // Start in the middle of the number space so that early packets before the first
             // one are never mistaken for wrapped ones.
@@ -102,7 +103,7 @@ impl Reorder {
             self.dropped += 1; // duplicate
             return;
         }
-        *slot = Some((now, p));
+        *slot = Some(p);
         self.held += 1;
         self.highest = self.highest.max(ext);
         if self.next != Some(ext) && self.gap_since.is_none() {
@@ -125,14 +126,14 @@ impl Reorder {
             .find_map(|e| {
                 self.slots[(e % self.size) as usize]
                     .as_ref()
-                    .map(|(t, _)| *t)
+                    .map(|p| p.arrived)
             })
     }
 
     fn take(&mut self, now: Instant, force: bool) -> Option<Item> {
         let next = self.next?;
         let idx = (next % self.size) as usize;
-        if let Some((_, p)) = self.slots[idx].take() {
+        if let Some(p) = self.slots[idx].take() {
             self.held -= 1;
             self.next = Some(next + 1);
             self.gap_since =
@@ -180,18 +181,23 @@ impl Reorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
-    fn pkt(seq: u16) -> Packet {
-        let mut p = Packet::default();
-        p.header.sequence_number = seq;
-        p
+    fn pkt(arrived: Instant, seq: u16) -> TapPacket {
+        TapPacket {
+            seq,
+            ts: 0,
+            marker: false,
+            payload: Bytes::new(),
+            arrived,
+        }
     }
 
     fn drain(r: &mut Reorder, now: Instant) -> Vec<String> {
         let mut out = Vec::new();
         while let Some(i) = r.pop(now) {
             out.push(match i {
-                Item::Packet(p) => p.header.sequence_number.to_string(),
+                Item::Packet(p) => p.seq.to_string(),
                 Item::Lost(n) => format!("lost{n}"),
             });
         }
@@ -203,7 +209,7 @@ mod tests {
         let now = Instant::now();
         let mut r = Reorder::new(Duration::from_millis(100), 512);
         for s in [10, 11, 12] {
-            r.push(now, pkt(s));
+            r.push(pkt(now, s));
         }
         assert_eq!(drain(&mut r, now), ["10", "11", "12"]);
     }
@@ -213,7 +219,7 @@ mod tests {
         let now = Instant::now();
         let mut r = Reorder::new(Duration::from_millis(100), 512);
         for s in [10, 12, 11, 14, 13] {
-            r.push(now, pkt(s));
+            r.push(pkt(now, s));
         }
         assert_eq!(drain(&mut r, now), ["10", "11", "12", "13", "14"]);
     }
@@ -223,7 +229,7 @@ mod tests {
         let t0 = Instant::now();
         let mut r = Reorder::new(Duration::from_millis(100), 512);
         for s in [10, 11, 14, 15] {
-            r.push(t0, pkt(s));
+            r.push(pkt(t0, s));
         }
         assert_eq!(drain(&mut r, t0), ["10", "11"]);
         assert_eq!(r.deadline(), Some(t0 + Duration::from_millis(100)));
@@ -242,10 +248,10 @@ mod tests {
         let t0 = Instant::now();
         let mut r = Reorder::new(Duration::from_millis(100), 512);
         for s in [10, 12, 13] {
-            r.push(t0, pkt(s));
+            r.push(pkt(t0, s));
         }
         assert_eq!(drain(&mut r, t0), ["10"]);
-        r.push(t0 + Duration::from_millis(20), pkt(11));
+        r.push(pkt(t0 + Duration::from_millis(20), 11));
         assert_eq!(
             drain(&mut r, t0 + Duration::from_millis(20)),
             ["11", "12", "13"]
@@ -258,14 +264,14 @@ mod tests {
         let t0 = Instant::now();
         let mut r = Reorder::new(Duration::from_millis(10), 512);
         for s in [10, 12] {
-            r.push(t0, pkt(s));
+            r.push(pkt(t0, s));
         }
         assert_eq!(
             drain(&mut r, t0 + Duration::from_millis(10)),
             ["10", "lost1", "12"]
         );
-        r.push(t0, pkt(11));
-        r.push(t0, pkt(12));
+        r.push(pkt(t0, 11));
+        r.push(pkt(t0, 12));
         assert_eq!(r.dropped, 2);
         assert!(drain(&mut r, t0).is_empty());
     }
@@ -275,7 +281,7 @@ mod tests {
         let now = Instant::now();
         let mut r = Reorder::new(Duration::from_millis(100), 512);
         for s in [65534, 65535, 1, 0, 2] {
-            r.push(now, pkt(s));
+            r.push(pkt(now, s));
         }
         assert_eq!(drain(&mut r, now), ["65534", "65535", "0", "1", "2"]);
     }
@@ -284,9 +290,9 @@ mod tests {
     fn a_far_jump_gives_up_the_gap_at_once() {
         let now = Instant::now();
         let mut r = Reorder::new(Duration::from_secs(60), 512);
-        r.push(now, pkt(1));
-        r.push(now, pkt(3));
-        r.push(now, pkt(2000));
+        r.push(pkt(now, 1));
+        r.push(pkt(now, 3));
+        r.push(pkt(now, 2000));
         assert_eq!(drain(&mut r, now), ["1", "lost1", "3", "lost1996", "2000"]);
     }
 }

@@ -38,6 +38,7 @@ use tracing::{debug, info, warn};
 
 pub use crate::media::Users;
 use crate::media::{Recording, StreamInfo, StreamRecorder, track_kind};
+use crate::tap::TapPacket;
 
 /// Whether the environment asks for the screen at whatever size rtcd's estimate allows
 /// (`SCREEN_QUALITY=auto`) instead of the sharp layer.
@@ -491,7 +492,14 @@ impl Task {
         let Some(s) = self.streams.get_mut(track) else {
             return;
         };
-        if s.rec.packet(now, packet) {
+        let tap = TapPacket {
+            seq: packet.header.sequence_number,
+            ts: packet.header.timestamp,
+            marker: packet.header.marker,
+            payload: packet.payload,
+            arrived: now,
+        };
+        if s.rec.packet(tap) {
             Self::keyframe(&mut self.pc, s, now);
         }
     }

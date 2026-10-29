@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use rtc::rtp::packet::Packet;
+use crate::tap::TapPacket;
 
 /// A frame is a keyframe when the frame tag's inverse keyframe bit is clear.
 pub fn is_keyframe(frame: &[u8]) -> bool {
@@ -86,7 +86,7 @@ impl Assembler {
     }
 
     /// Takes the next packet in order. A finished frame is available from [`Self::frame`].
-    pub fn push(&mut self, arrived: Instant, p: &Packet) {
+    pub fn push(&mut self, arrived: Instant, p: &TapPacket) {
         let Some((at, start)) = descriptor(&p.payload) else {
             return;
         };
@@ -94,13 +94,13 @@ impl Assembler {
             // A frame that never finished is dropped by its successor.
             self.buf.clear();
             self.in_frame = true;
-            self.timestamp = p.header.timestamp;
+            self.timestamp = p.ts;
             self.arrived = arrived;
-        } else if !self.in_frame || p.header.timestamp != self.timestamp {
+        } else if !self.in_frame || p.ts != self.timestamp {
             return; // the rest of a frame whose start is gone
         }
         self.buf.extend_from_slice(&p.payload[at..]);
-        if p.header.marker {
+        if p.marker {
             self.in_frame = false;
             if !self.buf.is_empty() {
                 self.ready = Some(Frame {
@@ -138,15 +138,16 @@ impl Assembler {
 mod tests {
     use super::*;
 
-    fn pkt(seq: u16, ts: u32, marker: bool, desc: &[u8], data: &[u8]) -> Packet {
-        let mut p = Packet::default();
-        p.header.sequence_number = seq;
-        p.header.timestamp = ts;
-        p.header.marker = marker;
+    fn pkt(seq: u16, ts: u32, marker: bool, desc: &[u8], data: &[u8]) -> TapPacket {
         let mut v = desc.to_vec();
         v.extend_from_slice(data);
-        p.payload = v.into();
-        p
+        TapPacket {
+            seq,
+            ts,
+            marker,
+            payload: v.into(),
+            arrived: Instant::now(),
+        }
     }
 
     #[test]
