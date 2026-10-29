@@ -256,10 +256,22 @@ impl Engine {
             .update(now, self.cfg.egress_budget_bps, self.cfg.egress_budget_pps);
         self.follow_budget(key, now);
         self.follow_voice_limit(key);
-        self.watch_camera(key, now);
-        self.retry_keyframes(key, now);
-        self.review_screen_level(key, now);
-        self.report_quality(key, now);
+        // What is left looks at video: a class without a camera has nothing in it to look at, and
+        // reading a session's statistics is not free on the thread that forwards the voices.
+        if self.has_video(key) {
+            self.watch_camera(key, now);
+            self.retry_keyframes(key, now);
+            self.review_screen_level(key, now);
+            self.report_quality(key, now);
+        }
+    }
+
+    /// Whether the session sends or receives any video.
+    fn has_video(&self, key: SessionKey) -> bool {
+        self.sessions.get(key).is_some_and(|s| {
+            s.up.sources.iter().any(|x| x.ty.is_video())
+                || s.down.iter().any(|(_, d)| d.ty.is_video())
+        })
     }
 
     /// Whether the node is asked for more than it can send, or the shard for more than it can do:

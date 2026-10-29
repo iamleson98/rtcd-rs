@@ -38,7 +38,7 @@ use rtcd_proto::{Message, MessageType, SessionConfig};
 use rtcd_sfu::config::{EngineConfig, LocalAddress};
 use rtcd_sfu::engine::{CloseReason, Command, Engine, Event, Proto};
 use rtcd_sfu::ids::Rng;
-use rtcd_sfu::metrics::NoMetrics;
+use rtcd_sfu::metrics::{Metrics, NoMetrics};
 
 pub const AUDIO_LEVEL_URI: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
 pub const SERVER: &str = "10.0.0.1:8443";
@@ -186,6 +186,10 @@ impl World {
     }
 
     pub fn with_config(cfg: EngineConfig) -> World {
+        World::with_metrics(cfg, Arc::new(NoMetrics))
+    }
+
+    pub fn with_metrics(cfg: EngineConfig, metrics: Arc<dyn Metrics>) -> World {
         // `RUST_LOG=rtcd_sfu=debug cargo test -- --nocapture` shows what the engine decides.
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -195,7 +199,7 @@ impl World {
         let cfg_server = cfg.addresses[0].advertised_udp();
         World {
             now: Instant::now(),
-            engine: Engine::new(Arc::new(cfg), Arc::new(NoMetrics), Rng::seeded(7)),
+            engine: Engine::new(Arc::new(cfg), metrics, Rng::seeded(7)),
             server: cfg_server,
             browsers: Vec::new(),
             closed: Vec::new(),

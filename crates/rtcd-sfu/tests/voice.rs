@@ -2,6 +2,8 @@
 
 mod support;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rtcd_proto::MessageType;
@@ -9,6 +11,7 @@ use rtcd_proto::dc::DcMessage;
 use rtcd_sfu::config::EngineConfig;
 use rtcd_sfu::engine::{CloseReason, Load};
 use rtcd_sfu::ids::{TrackType, parse_track_id};
+use rtcd_sfu::metrics::{Metrics, ReceiverQuality};
 use support::{World, engine_config};
 
 /// Waits until browser `i` has received `n` tracks.
@@ -524,6 +527,29 @@ fn a_muted_voice_gives_up_its_slot_at_once() {
         heard >= 22,
         "the student's first half second reached {heard} of 25 packets"
     );
+}
+
+/// Counts the receiver quality reports, each of which costs a full statistics snapshot.
+#[derive(Default)]
+struct QualityReports(AtomicUsize);
+
+impl Metrics for QualityReports {
+    fn receiver_quality(&self, _: ReceiverQuality) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn a_voice_only_call_pays_for_no_video_statistics() {
+    let reports = Arc::new(QualityReports::default());
+    let mut w = World::with_metrics(engine_config(), reports.clone());
+    let a = w.join("alice", "call1");
+    w.join("bob", "call1");
+    talk(&mut w, a);
+    // The upkeep that applies shedding runs every second for voice, and so would a read of the
+    // statistics every five seconds if it were not left to calls with video.
+    w.run_for(Duration::from_secs(12));
+    assert_eq!(reports.0.load(Ordering::Relaxed), 0);
 }
 
 #[test]
