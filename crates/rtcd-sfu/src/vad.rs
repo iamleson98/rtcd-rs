@@ -28,8 +28,10 @@ impl Default for VadConfig {
     }
 }
 
-/// One Opus frame on the 48 kHz RTP clock.
+/// One 20 ms Opus frame on the 48 kHz RTP clock: what a gap too long for a packet is counted in.
 const OPUS_FRAME_SAMPLES: i32 = 960;
+/// The longest packet an Opus sender makes (120 ms); a larger step is a gap, not a packet.
+const MAX_PACKET_SAMPLES: i32 = 5760;
 /// The audio level of digital silence.
 const SILENCE_LEVEL: u8 = 127;
 
@@ -42,6 +44,10 @@ pub struct Monitor {
     voice: bool,
     activated_at: Option<Instant>,
     last_timestamp: Option<u32>,
+    /// The RTP timestamp step of the last packet that followed another closely: browsers asked for
+    /// a longer packet time (`a=ptime`) send 40 or 60 ms of voice per packet, not 20. Unknown until
+    /// two packets have been seen.
+    packet_samples: Option<i32>,
 }
 
 impl Monitor {
@@ -57,6 +63,7 @@ impl Monitor {
             voice: false,
             activated_at: None,
             last_timestamp: None,
+            packet_samples: None,
         }
     }
 
@@ -68,17 +75,30 @@ impl Monitor {
     /// Records the level of a packet. A sender using discontinuous transmission leaves silent
     /// frames out, sending one packet every 400 ms instead of every 20 ms, so the frames missing
     /// before this packet (by its RTP timestamp) count as silence; without them the sample would
-    /// stretch over seconds of silence and keep voice on. Returns the new state when it changed.
+    /// stretch over seconds of silence and keep voice on. The frame is as long as the packets the
+    /// sender is making (the step between two close packets), 20 ms unless it was asked for more.
+    /// Returns the new state when it changed.
     pub fn push_packet(&mut self, level: u8, timestamp: u32, now: Instant) -> Option<bool> {
         let mut change = None;
         if let Some(last) = self.last_timestamp {
             let diff = timestamp.wrapping_sub(last) as i32;
             // A repeated or reordered packet leaves no frames missing.
             if diff > 0 {
-                let missing =
-                    ((diff / OPUS_FRAME_SAMPLES) - 1).clamp(0, self.cfg.sample_size as i32);
+                // The first step shows the packet length; a gap too long to be one packet is
+                // counted in 20 ms frames.
+                let packet = self
+                    .packet_samples
+                    .unwrap_or(if diff <= MAX_PACKET_SAMPLES {
+                        diff
+                    } else {
+                        OPUS_FRAME_SAMPLES
+                    });
+                let missing = ((diff / packet) - 1).clamp(0, self.cfg.sample_size as i32);
                 for _ in 0..missing {
                     change = self.push_level(SILENCE_LEVEL, now).or(change);
+                }
+                if diff <= MAX_PACKET_SAMPLES {
+                    self.packet_samples = Some(diff);
                 }
             }
         }
@@ -126,6 +146,7 @@ impl Monitor {
         self.voice = false;
         self.activated_at = None;
         self.last_timestamp = None;
+        self.packet_samples = None;
         was_on
     }
 }
@@ -219,6 +240,62 @@ mod tests {
             Some(false),
             "ten seconds of DTX silence turn voice off"
         );
+    }
+
+    #[test]
+    fn packets_of_forty_milliseconds_are_not_taken_for_lost_ones() {
+        // A sender asked for 40 ms packets steps the timestamp by 1920. A microphone with a steady
+        // background hum (levels 68-72) must not look like speech because a silent frame of 127 is
+        // invented after every packet.
+        let mut m = Monitor::new(VadConfig::default());
+        let t = Instant::now();
+        let mut ts = 0u32;
+        for i in 0..200 {
+            m.push_packet(
+                70 + (i % 3) as u8 - 1,
+                ts,
+                t + Duration::from_millis(40 * i),
+            );
+            ts += 1920;
+        }
+        assert!(!m.voice(), "a steady hum is not voice at 40 ms either");
+        assert!(
+            m.levels.iter().all(|&l| l < 100),
+            "no silent frame was invented between the packets"
+        );
+    }
+
+    #[test]
+    fn speech_at_forty_milliseconds_starts_and_stops_voice() {
+        let mut m = Monitor::new(VadConfig::default());
+        let t = Instant::now();
+        let mut ts = 0u32;
+        let mut changed = None;
+        for i in 0..100 {
+            changed = m
+                .push_packet(if i % 2 == 0 { 20 } else { 70 }, ts, t)
+                .or(changed);
+            ts += 1920;
+        }
+        assert_eq!(changed, Some(true));
+        for i in 0..100 {
+            changed = m
+                .push_packet(60, ts, t + Duration::from_secs(3 + i))
+                .or(changed);
+            ts += 1920;
+        }
+        assert_eq!(changed, Some(false), "a steady level ends voice");
+    }
+
+    #[test]
+    fn a_lost_packet_is_still_counted_once_at_forty_milliseconds() {
+        let mut m = Monitor::new(VadConfig::default());
+        let t = Instant::now();
+        m.push_packet(30, 0, t);
+        m.push_packet(30, 1920, t);
+        // One 40 ms packet lost: the step is two frames, one frame is missing.
+        m.push_packet(30, 1920 * 3, t);
+        assert_eq!(m.levels.len(), 4);
     }
 
     #[test]
