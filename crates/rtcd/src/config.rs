@@ -40,6 +40,7 @@ pub struct Config {
     pub api: ApiConfig,
     pub rtc: RtcConfig,
     pub store: StoreConfig,
+    pub record: RecordConfig,
     pub logger: LoggerConfig,
 }
 
@@ -224,6 +225,21 @@ pub struct StoreConfig {
     pub data_source: String,
 }
 
+/// Recording calls in rtcd itself, without a recorder participant.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct RecordConfig {
+    /// Whether this node records calls when asked to. Off by default.
+    pub enabled: bool,
+    /// Where the files of a recording are written, in a directory of its own, until they are
+    /// uploaded: a volume with room for the lessons that run at once.
+    pub data_dir: String,
+    /// The most one recording may write, in bytes, files already closed included. A recording that
+    /// reaches it ends cleanly (`disk_full`) with what it has. Leave room under the volume's size
+    /// for the files being written and the recordings that run side by side.
+    pub max_bytes: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct LoggerConfig {
@@ -309,6 +325,16 @@ impl Default for StoreConfig {
     fn default() -> Self {
         Self {
             data_source: "/tmp/rtcd_db".into(),
+        }
+    }
+}
+
+impl Default for RecordConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            data_dir: "/data/recordings".into(),
+            max_bytes: 2 << 30,
         }
     }
 }
@@ -432,6 +458,9 @@ impl Config {
         boolean!("RTC_REFUSEWHENSATURATED", self.rtc.refuse_when_saturated);
         integer!("RTC_DRAINTIMEOUTSECONDS", self.rtc.drain_timeout_seconds);
         text!("STORE_DATASOURCE", self.store.data_source);
+        boolean!("RECORD_ENABLED", self.record.enabled);
+        text!("RECORD_DATADIR", self.record.data_dir);
+        integer!("RECORD_MAXBYTES", self.record.max_bytes);
         boolean!("LOGGER_ENABLECONSOLE", self.logger.enable_console);
         boolean!("LOGGER_CONSOLEJSON", self.logger.console_json);
         text!("LOGGER_CONSOLELEVEL", self.logger.console_level);
@@ -554,6 +583,14 @@ impl Config {
         }
         if self.store.data_source.is_empty() {
             return Err(invalid("DataSource", "should not be empty"));
+        }
+        if self.record.enabled {
+            if self.record.data_dir.is_empty() {
+                return Err(invalid("RecordDataDir", "should not be empty"));
+            }
+            if self.record.max_bytes <= 0 {
+                return Err(invalid("RecordMaxBytes", "should be a positive number"));
+            }
         }
         let lg = &self.logger;
         if !lg.enable_console && !lg.enable_file {
@@ -714,6 +751,7 @@ mod tests {
         );
         assert_eq!(c.store.data_source, "/tmp/rtcd_db");
         assert_eq!(c.api.security.session_cache.expiration_minutes, 1440);
+        assert!(!c.record.enabled, "recording is off unless asked for");
         c.validate().unwrap();
     }
 
@@ -833,6 +871,36 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
     }
 
     #[test]
+    fn recording_is_set_in_the_file_or_the_environment() {
+        let mut c = Config::from_toml(
+            "[record]\nenabled = true\ndata_dir = \"/v/rec\"\nmax_bytes = 1000\n",
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                c.record.enabled,
+                c.record.data_dir.as_str(),
+                c.record.max_bytes
+            ),
+            (true, "/v/rec", 1000)
+        );
+        c.apply_env(&env(&[
+            ("RTCD_RECORD_ENABLED", "false"),
+            ("RTCD_RECORD_DATADIR", "/other"),
+            ("RTCD_RECORD_MAXBYTES", "5000"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            (
+                c.record.enabled,
+                c.record.data_dir.as_str(),
+                c.record.max_bytes
+            ),
+            (false, "/other", 5000)
+        );
+    }
+
+    #[test]
     fn ice_servers_in_the_environment_may_be_objects() {
         let mut c = Config::default();
         c.apply_env(&env(&[(
@@ -908,6 +976,23 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
             .contains("at least one logging target")
         );
         assert!(bad(&|c| c.store.data_source.clear()).contains("DataSource"));
+        assert!(
+            bad(&|c| {
+                c.record.enabled = true;
+                c.record.data_dir.clear();
+            })
+            .contains("RecordDataDir")
+        );
+        assert!(
+            bad(&|c| {
+                c.record.enabled = true;
+                c.record.max_bytes = 0;
+            })
+            .contains("RecordMaxBytes")
+        );
+        let mut off = Config::default();
+        off.record.max_bytes = 0;
+        off.validate().expect("a disabled recorder is not checked");
     }
 
     #[test]
