@@ -99,8 +99,16 @@ pub struct RecordFile {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RecordEnded {
     pub recording_id: String,
-    /// Why: `stopped`, `call_ended`, `disk_full` or `failed`.
+    /// Why: `stopped`, `call_ended`, `disk_full`, `failed` or `refused`.
     pub reason: String,
+    /// The index the first file was numbered from (the `file_base` of the start).
+    pub file_base: u32,
+    /// How many indexes the files took, counting from `file_base`: the highest index used, plus
+    /// one, minus `file_base`. A file that could not be uploaded leaves a hole in the numbering.
+    pub files: u32,
+    /// How long the capture lasted, from the recording's start (`t0`) to the moment it ended,
+    /// in milliseconds.
+    pub duration_ms: i64,
     /// Packets that were not recorded because the writer could not keep up.
     pub dropped: u64,
 }
@@ -209,9 +217,12 @@ impl ClientMessage {
                 write_uint_entry(&mut out, "size", r.size);
             }
             Self::RecordEnded(r) => {
-                rmp::encode::write_map_len(&mut out, 3).expect("vec write");
+                rmp::encode::write_map_len(&mut out, 6).expect("vec write");
                 write_str_entry(&mut out, "recordingID", &r.recording_id);
                 write_str_entry(&mut out, "reason", &r.reason);
+                write_uint_entry(&mut out, "fileBase", r.file_base.into());
+                write_uint_entry(&mut out, "files", r.files.into());
+                write_int_entry(&mut out, "durationMs", r.duration_ms);
                 write_uint_entry(&mut out, "dropped", r.dropped);
             }
         }
@@ -288,6 +299,9 @@ impl ClientMessage {
                 Self::RecordEnded(RecordEnded {
                     recording_id: lookup_string(map, "recordingID"),
                     reason: lookup_string(map, "reason"),
+                    file_base: lookup_u32(map, "fileBase"),
+                    files: lookup_u32(map, "files"),
+                    duration_ms: lookup_i64(map, "durationMs"),
                     dropped: lookup_u64(map, "dropped"),
                 })
             }
@@ -396,6 +410,9 @@ mod tests {
             ClientMessage::RecordEnded(RecordEnded {
                 recording_id: "rec1".into(),
                 reason: "call_ended".into(),
+                file_base: 100,
+                files: 12,
+                duration_ms: 3_600_000,
                 dropped: 42,
             }),
         ];
