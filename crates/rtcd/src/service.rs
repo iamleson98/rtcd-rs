@@ -20,6 +20,7 @@ use crate::auth::AuthService;
 use crate::config::Config;
 use crate::info::SystemMonitor;
 use crate::metrics::Metrics;
+use crate::recording::{Recordings, Reports};
 
 /// Messages queued for one connection before it is considered too slow to serve.
 pub const CONN_QUEUE: usize = 5000;
@@ -62,6 +63,10 @@ pub struct Service {
     pub sfu: Arc<Sfu>,
     pub metrics: Arc<Metrics>,
     pub system: SystemMonitor,
+    /// Recording calls on this node.
+    pub recordings: Recordings,
+    /// What is told to the server about recordings, on whichever of its connections is up.
+    reports: Arc<Reports>,
     conns: Mutex<HashMap<String, ConnHandle>>,
     /// The connection each session's messages go to.
     session_conn: Mutex<HashMap<String, String>>,
@@ -88,12 +93,16 @@ impl Service {
         sfu: Arc<Sfu>,
         metrics: Arc<Metrics>,
     ) -> Arc<Self> {
+        let reports = Arc::new(Reports::new(metrics.clone()));
+        let recordings = Recordings::new(&cfg.record, reports.clone(), metrics.clone());
         Arc::new(Self {
             cfg,
             auth,
             sfu,
             metrics,
             system: SystemMonitor::default(),
+            recordings,
+            reports,
             conns: Mutex::new(HashMap::new()),
             session_conn: Mutex::new(HashMap::new()),
             closed: Mutex::new(HashMap::new()),
@@ -122,11 +131,14 @@ impl Service {
         if handle.send(&hello) {
             self.metrics.ws_message(&handle.client_id, "hello", "out");
         }
-        self.conns.lock().insert(conn_id.to_owned(), handle);
+        self.conns.lock().insert(conn_id.to_owned(), handle.clone());
+        // Reports that waited for a connection of this client go out now.
+        self.reports.attach(conn_id, handle);
     }
 
     /// Forgets a connection. Its sessions stay: the client is expected to reconnect and say so.
     pub fn disconnected(&self, conn_id: &str) {
+        self.reports.detach(conn_id);
         if let Some(h) = self.conns.lock().remove(conn_id) {
             self.metrics.ws_disconnected(&h.client_id);
             warn!(conn = conn_id, client = %h.client_id, "client disconnected");
@@ -183,10 +195,10 @@ impl Service {
                 }
             }
             ClientMessage::Rtc(m) => self.signal(client_id, m),
-            // Recording is not implemented in the service yet. The message carries a token, so
-            // only its type is logged.
-            ClientMessage::RecordStart(_) | ClientMessage::RecordStop(_) => {
-                debug!(conn = conn_id, kind, "recording message ignored");
+            // The start carries a token: only its type and the recording are ever logged.
+            ClientMessage::RecordStart(r) => self.recordings.start(&self.sfu, client_id, r),
+            ClientMessage::RecordStop(r) => {
+                self.recordings.stop(&self.sfu, client_id, &r.recording_id);
             }
             ClientMessage::Hello(_)
             | ClientMessage::Close(_)

@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use prometheus::{
-    Counter, CounterVec, Encoder, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry,
+    Counter, CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry,
     TextEncoder,
 };
 use rtcd_sfu::ids::TrackType;
@@ -71,6 +71,15 @@ pub struct Metrics {
     keyframe_requests: [Counter; 2],
     record_dropped: Counter,
     record_queue_depth: prometheus::Histogram,
+    /// Recordings being captured on this node.
+    record_recordings: Gauge,
+    record_files_written: Counter,
+    /// Packets the writer left out because uploads were behind (see `max_pending_bytes`).
+    record_writer_dropped: Counter,
+    /// Bytes of closed files waiting to be uploaded.
+    record_pending_bytes: Gauge,
+    record_uploaded_bytes: Counter,
+    record_upload_failures: Counter,
 }
 
 impl std::fmt::Debug for Metrics {
@@ -121,6 +130,30 @@ fn histogram(
     .expect("valid metric");
     r.register(Box::new(h.clone())).expect("unique metric");
     h
+}
+
+/// A counter of the `record` subsystem.
+fn record_counter(r: &Registry, name: &str, help: &str) -> Counter {
+    let c = Counter::with_opts(
+        Opts::new(name, help)
+            .namespace(NAMESPACE)
+            .subsystem("record"),
+    )
+    .expect("valid metric");
+    r.register(Box::new(c.clone())).expect("unique metric");
+    c
+}
+
+/// A gauge of the `record` subsystem.
+fn record_gauge(r: &Registry, name: &str, help: &str) -> Gauge {
+    let g = Gauge::with_opts(
+        Opts::new(name, help)
+            .namespace(NAMESPACE)
+            .subsystem("record"),
+    )
+    .expect("valid metric");
+    r.register(Box::new(g.clone())).expect("unique metric");
+    g
 }
 
 fn plain_counter(r: &Registry, name: &str, help: &str) -> Counter {
@@ -416,8 +449,63 @@ impl Metrics {
                 r.register(Box::new(h.clone())).expect("unique metric");
                 h
             },
+            record_recordings: record_gauge(
+                r,
+                "recordings",
+                "Recordings being captured on this node",
+            ),
+            record_files_written: record_counter(
+                r,
+                "files_written_total",
+                "Files of recordings finished on this node",
+            ),
+            record_writer_dropped: record_counter(
+                r,
+                "writer_dropped_packets_total",
+                "Packets of a recording left out because uploads were behind",
+            ),
+            record_pending_bytes: record_gauge(
+                r,
+                "pending_bytes",
+                "Bytes of finished recording files waiting to be uploaded",
+            ),
+            record_uploaded_bytes: record_counter(
+                r,
+                "uploaded_bytes_total",
+                "Bytes of recording files uploaded",
+            ),
+            record_upload_failures: record_counter(
+                r,
+                "upload_failures_total",
+                "Recording files given up on after their uploads kept failing",
+            ),
             registry,
         }
+    }
+
+    /// A recording started or stopped being captured here.
+    pub fn record_capture(&self, delta: i64) {
+        self.record_recordings.add(delta as f64);
+    }
+
+    pub fn record_file_written(&self) {
+        self.record_files_written.inc();
+    }
+
+    pub fn record_writer_dropped(&self, packets: u64) {
+        self.record_writer_dropped.inc_by(packets as f64);
+    }
+
+    pub fn record_pending(&self, bytes: u64) {
+        self.record_pending_bytes.set(bytes as f64);
+    }
+
+    pub fn record_uploaded(&self, bytes: u64) {
+        self.record_uploaded_bytes.inc_by(bytes as f64);
+    }
+
+    pub fn record_upload_failed(&self) {
+        self.record_upload_failures.inc();
     }
 
     pub fn ws_connected(&self, client: &str) {
@@ -637,6 +725,12 @@ mod tests {
         m.keyframe_request(false);
         m.record_dropped(5);
         m.record_queue_depth(12);
+        m.record_capture(1);
+        m.record_file_written();
+        m.record_writer_dropped(2);
+        m.record_pending(4096);
+        m.record_uploaded(1000);
+        m.record_upload_failed();
         m.ws_connected("client");
         m.ws_message("client", "join", "in");
         let text = m.render();
@@ -664,6 +758,12 @@ mod tests {
             "rtcd_rtc_keyframe_requests_total{result=\"held_back\"} 1",
             "rtcd_record_dropped_packets_total 5",
             "rtcd_record_queue_depth_count 1",
+            "rtcd_record_recordings 1",
+            "rtcd_record_files_written_total 1",
+            "rtcd_record_writer_dropped_packets_total 2",
+            "rtcd_record_pending_bytes 4096",
+            "rtcd_record_uploaded_bytes_total 1000",
+            "rtcd_record_upload_failures_total 1",
             "rtcd_ws_connections_total{clientID=\"client\"} 1",
             "rtcd_ws_messages_total{clientID=\"client\",direction=\"in\",type=\"join\"} 1",
         ] {

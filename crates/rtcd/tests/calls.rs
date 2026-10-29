@@ -313,17 +313,30 @@ async fn garbage_on_the_websocket_does_not_end_the_connection() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn recording_messages_are_counted_and_otherwise_ignored_for_now() {
+async fn a_node_that_does_not_record_refuses_to_and_says_so() {
     let s = TestServer::start().await;
     s.register("mm").await;
     let mut ws = s.connect("mm").await;
     ws.send(&ClientMessage::RecordStart(RecordStart {
         recording_id: "rec1".into(),
         call_id: "call1".into(),
+        file_base: 7,
         token: "not-for-logs".into(),
         ..RecordStart::default()
     }))
     .await;
+    let ClientMessage::RecordEnded(ended) = ws.next_message().await else {
+        panic!("the server is told the recording will not happen")
+    };
+    assert_eq!(
+        (
+            ended.recording_id.as_str(),
+            ended.reason.as_str(),
+            ended.file_base,
+            ended.files
+        ),
+        ("rec1", "refused", 7, 0)
+    );
     ws.send(&ClientMessage::RecordStop(RecordStop {
         recording_id: "rec1".into(),
     }))

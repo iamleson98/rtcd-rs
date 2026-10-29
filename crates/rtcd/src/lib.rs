@@ -9,6 +9,7 @@ pub mod legacy;
 pub mod logging;
 pub mod metrics;
 pub mod network;
+pub mod recording;
 pub mod service;
 pub mod store;
 pub mod tls;
