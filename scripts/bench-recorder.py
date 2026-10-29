@@ -85,7 +85,7 @@ def main():
             for r in rs:
                 if r["exit"] != 0 or r["failed"] or not r["recorder_joined"]:
                     sys.exit(f"{label} {sc[0]}: {json.dumps({k: r[k] for k in ('exit', 'failed', 'recorder_joined')})}")
-            media = [f for f in rs[0]["files"] if f["kind"] != "board"]
+            media = rs[0]["files"]
             results[label] = {
                 "cpu": statistics.median(r["cpu_s"] for r in rs),
                 "rss": statistics.median(r["max_rss_mib"] for r in rs),

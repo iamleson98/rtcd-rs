@@ -276,7 +276,6 @@ async fn a_class_is_recorded_whole() {
     rec.await.unwrap().expect("the recording completes");
 
     let m = c.manifest();
-    assert_eq!(of_kind(&m, "board").len(), 1);
     assert_eq!(of_kind(&m, "voice").len(), 3, "a voice per person: {m:#?}");
     assert_eq!(of_kind(&m, "camera").len(), 2);
     assert_eq!(of_kind(&m, "screen").len(), 1);
@@ -286,7 +285,7 @@ async fn a_class_is_recorded_whole() {
             .unwrap()
     });
     assert!((9_000..30_000).contains(&duration), "{duration}");
-    for e in m.iter().filter(|e| e.kind != "board") {
+    for e in &m {
         assert!(
             e.start_ms >= 0 && e.end_ms > e.start_ms && e.end_ms <= duration + 500,
             "{e:?} within the recording ({duration} ms)"
@@ -333,9 +332,6 @@ async fn a_class_is_recorded_whole() {
             _ => unreachable!(),
         }
     }
-    // The board is the whole timeline.
-    let board = of_kind(&m, "board")[0];
-    assert_eq!((board.start_ms, board.end_ms), (0, duration));
     assert!(
         c.lms
             .has(&format!("POST {}/started", lms_sim::lms::REC_PATH))
@@ -525,7 +521,7 @@ async fn a_bad_network_costs_the_recording_nothing_it_can_get_back() {
     rec.await.unwrap().expect("the recording completes");
 
     let m = c.manifest();
-    for e in m.iter().filter(|e| e.kind != "board") {
+    for e in &m {
         let p = probe(e);
         let seconds = (e.end_ms - e.start_ms) as f64 / 1000.0;
         let (fps, floor) = match e.kind.as_str() {

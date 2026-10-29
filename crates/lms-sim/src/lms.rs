@@ -1,4 +1,4 @@
-//! A stand-in for the LMS server, for one recording: the recorder endpoints, the whiteboard, the
+//! A stand-in for the LMS server, for one recording: the recorder endpoints, the
 //! calls API and the app's websocket, which relays the recorder's call signaling to a real rtcd
 //! the way the server's calls plugin does.
 
@@ -119,10 +119,6 @@ impl Lms {
             .route(&format!("{REC_PATH}/files/{{n}}"), put(file))
             .route(&format!("{REC_PATH}/complete"), post(complete))
             .route(&format!("{REC_PATH}/fail"), post(fail))
-            .route(
-                &format!("/api/v4/lms/live/sessions/{SESS_ID}/whiteboard"),
-                get(board),
-            )
             .route(&format!("/api/v4/calls/channels/{CHAN_ID}"), get(call))
             .with_state(inner.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -276,15 +272,6 @@ async fn fail(State(s): S, body: axum::body::Bytes) -> impl IntoResponse {
     note(&s, "POST", &format!("{REC_PATH}/fail"));
     s.state.lock().unwrap().failed = Some(String::from_utf8_lossy(&body).into_owned());
     StatusCode::OK
-}
-
-async fn board(State(s): S) -> impl IntoResponse {
-    note(
-        &s,
-        "GET",
-        &format!("/api/v4/lms/live/sessions/{SESS_ID}/whiteboard"),
-    );
-    axum::Json(json!({"locked": false, "elements": [{"id": "e0"}]}))
 }
 
 async fn call(State(s): S) -> impl IntoResponse {

@@ -1,7 +1,6 @@
 //! The session recorder.
 
 pub mod api;
-pub mod board;
 pub mod call;
 pub mod config;
 pub mod disk;

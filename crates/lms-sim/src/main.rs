@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use lms_sim::assets::Assets;
 use lms_sim::class::{self, Spec};
 use lms_sim::host::Rtcd;
-use lms_sim::lms::{CHAN_ID, Lms, REC_ID, SESS_ID};
+use lms_sim::lms::{CHAN_ID, Lms, REC_ID};
 use serde_json::{Value, json};
 use tokio::process::Command;
 
@@ -27,7 +27,6 @@ struct Args {
     assets: PathBuf,
     out: PathBuf,
     data_env: String,
-    board_hz: u64,
     loss: f64,
     blackout: u64,
 }
@@ -43,13 +42,12 @@ fn parse() -> Result<Args, String> {
         assets: std::env::temp_dir().join("lms-sim-assets"),
         out: std::env::temp_dir().join("lms-sim-out"),
         data_env: "RECORDER_DATA_DIR".into(),
-        board_hz: 10,
         loss: 0.0,
         blackout: 0,
     };
     let mut it = std::env::args().skip(1);
     if it.next().as_deref() != Some("run") {
-        return Err("usage: lms-sim run --recorder PATH [--label NAME] [--duration S] [--people N] [--cameras N] [--screens N] [--assets DIR] [--out DIR] [--data-env NAME] [--board-hz N] [--loss PERCENT] [--blackout-ms MS]".into());
+        return Err("usage: lms-sim run --recorder PATH [--label NAME] [--duration S] [--people N] [--cameras N] [--screens N] [--assets DIR] [--out DIR] [--data-env NAME] [--loss PERCENT] [--blackout-ms MS]".into());
     }
     while let Some(k) = it.next() {
         let v = it.next().ok_or_else(|| format!("{k} needs a value"))?;
@@ -67,7 +65,6 @@ fn parse() -> Result<Args, String> {
             "--assets" => a.assets = v.into(),
             "--out" => a.out = v.into(),
             "--data-env" => a.data_env = v,
-            "--board-hz" => a.board_hz = n(&v)?,
             "--blackout-ms" => a.blackout = n(&v)?,
             "--loss" => {
                 a.loss = v
@@ -223,23 +220,8 @@ async fn run(a: Args) -> Value {
     }
     let joined = rtcd.sessions() > a.people as usize;
 
-    // Let the class run; the teacher draws on the board.
-    let run_start = Instant::now();
-    let mut n = 0u64;
-    while run_start.elapsed() < Duration::from_secs(a.duration) {
-        n += 1;
-        if a.board_hz > 0 {
-            lms.emit(
-                "custom_lms_wb_presence",
-                "",
-                json!({"session_id": SESS_ID, "updates": [{"user_id": "user-p0", "presence": {"cursor": [n % 500, n % 300], "preview": {"from": n, "points": [n % 500, n % 300, 0.5]}}}]}),
-            );
-            if n.is_multiple_of(a.board_hz * 2) {
-                lms.emit("custom_lms_wb_elements", "", json!({"session_id": SESS_ID, "user_id": "user-p0", "elements": [{"id": format!("e{n}"), "points": [1, 2, 3]}]}));
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(1000 / a.board_hz.max(1))).await;
-    }
+    // Let the class run.
+    tokio::time::sleep(Duration::from_secs(a.duration)).await;
     lms.emit(
         "custom_lms_recording_stop",
         "",
@@ -275,15 +257,13 @@ async fn run(a: Args) -> Value {
             if let Some(p) = path {
                 entry["uploaded_bytes"] =
                     std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0).into();
-                if f["kind"] != "board" {
-                    let mut named = a
-                        .out
-                        .join(format!("{i:03}-{}.webm", f["kind"].as_str().unwrap_or("x")));
-                    if std::fs::copy(&p, &named).is_err() {
-                        named = p.clone();
-                    }
-                    entry["probe"] = ffprobe(&named);
+                let mut named = a
+                    .out
+                    .join(format!("{i:03}-{}.webm", f["kind"].as_str().unwrap_or("x")));
+                if std::fs::copy(&p, &named).is_err() {
+                    named = p.clone();
                 }
+                entry["probe"] = ffprobe(&named);
             }
             files.push(entry);
         }

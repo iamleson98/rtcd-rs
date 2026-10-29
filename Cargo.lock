@@ -1878,7 +1878,6 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
- "flate2",
  "futures-util",
  "lms-sim",
  "rand 0.10.3",

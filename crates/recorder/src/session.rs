@@ -1,25 +1,23 @@
-//! One recording in progress: the event loop that keeps the recorder in the call and the board log
-//! current until the recording ends, and the run around it (sign in, record, upload, complete).
+//! One recording in progress: the event loop that keeps the recorder in the call until the
+//! recording ends, and the run around it (sign in, record, upload, complete).
 
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
-use serde_json::value::RawValue;
 use tokio::time::{interval_at, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::api::Api;
-use crate::board::BoardLog;
 use crate::call::{Call, Phase, REJOIN_AFTER};
 use crate::config::Config;
-use crate::media::{BOARD, Entry, Recording};
-use crate::socket::{EVENT_RECONNECTED, EVENT_RESYNC, Event, Sender, Socket};
+use crate::media::Recording;
+use crate::socket::{EVENT_RESYNC, Event, Socket};
 use crate::upload::manifest_files;
 
-/// Bounds getting into the room (sign-in, board).
+/// Bounds getting into the room (sign-in).
 pub const READY_TIMEOUT: Duration = Duration::from_secs(90);
 /// A call nobody but the recorder is in ends the recording after this long.
 pub const EMPTY_ROOM_AFTER: Duration = Duration::from_secs(120);
@@ -74,8 +72,6 @@ pub async fn run(
 
     let start = Instant::now();
     let rec = Arc::new(Recording::new(&work, start, cfg.capture_limit()));
-    let board = BoardLog::create(&work.join("board.ndjson.gz"), start, rec.disk.clone())
-        .map_err(|e| RunError::Failed(e.to_string()))?;
     let call = Call::new(
         &room.chat_channel_id,
         socket.sender.clone(),
@@ -86,17 +82,12 @@ pub async fn run(
         cfg: cfg.clone(),
         api: api.clone(),
         room,
-        sender: socket.sender.clone(),
         rec: rec.clone(),
-        board,
         call,
         call_running: false,
         was_in_call: false,
         alone_since: None,
     };
-    // The board as it was when the recording began opens the log at 0.
-    s.join_board();
-    s.load_board(start).await;
 
     let reason = s.event_loop(&cancel, &mut socket).await;
     let end = Instant::now();
@@ -112,26 +103,16 @@ pub async fn run(
         bytes = rec.disk.written(),
         "recording ended"
     );
-    s.board
-        .close()
-        .map_err(|e| failed("finish the board log", e))?;
     let duration = end.saturating_duration_since(start);
-    let mut files = files;
-    files.push(Entry {
-        kind: BOARD.into(),
-        session_id: String::new(),
-        user_id: String::new(),
-        start_ms: 0,
-        end_ms: duration.as_millis() as i64,
-        width: 0,
-        height: 0,
-        size: 0,
-        path: s.board.path().to_owned(),
-    });
     let files = manifest_files(files).map_err(|e| RunError::Failed(e.to_string()))?;
-    let multipart = tokio::select! {
-        r = api.upload(&files) => r.map_err(|e| failed("upload", e))?,
-        () = cancel.cancelled() => return Err(RunError::Stopped),
+    // A lesson in which no one spoke or filmed has nothing to upload; the server adds the board.
+    let multipart = if files.is_empty() {
+        Vec::new()
+    } else {
+        tokio::select! {
+            r = api.upload(&files) => r.map_err(|e| failed("upload", e))?,
+            () = cancel.cancelled() => return Err(RunError::Stopped),
+        }
     };
     tokio::select! {
         r = api.complete(duration, &files, &multipart) => r.map_err(|e| failed("complete", e))?,
@@ -155,9 +136,7 @@ pub struct Session {
     pub cfg: Config,
     pub api: Api,
     pub room: crate::api::Room,
-    pub sender: Sender,
     pub rec: Arc<Recording>,
-    pub board: BoardLog,
     pub call: Call,
     pub call_running: bool,
     /// The recorder joined the call at least once, so the end of the call ends the recording
@@ -252,9 +231,7 @@ impl Session {
         let now = Instant::now();
         let in_room = ev.broadcast.channel_id == self.room.chat_channel_id;
         match ev.event.as_str() {
-            EVENT_RECONNECTED => self.join_board(),
             EVENT_RESYNC => {
-                self.load_board(now).await;
                 self.call.reconnected();
                 self.check_call(now).await;
                 if self.stopped_on_server().await {
@@ -333,7 +310,7 @@ impl Session {
             | "custom_calls_call_end"
             | "custom_calls_user_joined"
             | "custom_calls_user_left" => {}
-            _ => self.board_event(&ev, now),
+            _ => {}
         }
         ""
     }
@@ -368,81 +345,14 @@ impl Session {
             _ => false,
         }
     }
-
-    /// Asks for the board's events (they go to the connections that joined it).
-    pub fn join_board(&self) {
-        if let Err(e) = self.sender.send(
-            "custom_lms_wb_join",
-            serde_json::json!({ "session_id": self.room.session_id }),
-        ) {
-            warn!(error = %e, "cannot join the board yet");
-        }
-    }
-
-    /// Logs the whole board (at the start, and after events may have been missed), at the given
-    /// moment.
-    pub async fn load_board(&mut self, at: Instant) {
-        match timeout(CALL_TIMEOUT, self.api.board(&self.room.session_id)).await {
-            Ok(Ok(b)) => self.board.snapshot(at, &b.elements, b.locked),
-            Ok(Err(e)) => warn!(error = %e, "cannot read the board"),
-            Err(_) => warn!("cannot read the board: timed out"),
-        }
-    }
-
-    pub fn board_event(&mut self, ev: &Event, now: Instant) {
-        #[derive(Deserialize)]
-        struct Data {
-            #[serde(default)]
-            session_id: String,
-            #[serde(default)]
-            user_id: String,
-            #[serde(default)]
-            elements: Option<Box<RawValue>>,
-            #[serde(default)]
-            locked: bool,
-            #[serde(default)]
-            updates: Vec<Update>,
-        }
-        #[derive(Deserialize)]
-        struct Update {
-            #[serde(default)]
-            user_id: String,
-            #[serde(default)]
-            presence: Option<Box<RawValue>>,
-        }
-        let Ok(d) = serde_json::from_str::<Data>(ev.data()) else {
-            return;
-        };
-        if d.session_id != self.room.session_id {
-            return;
-        }
-        match ev.event.as_str() {
-            "custom_lms_wb_elements" => {
-                if let Some(e) = &d.elements {
-                    self.board.elements(now, &d.user_id, e);
-                }
-            }
-            "custom_lms_wb_clear" => self.board.clear(now),
-            "custom_lms_wb_lock" => self.board.lock(now, d.locked),
-            "custom_lms_wb_presence" => {
-                for u in &d.updates {
-                    if let Some(p) = &u.presence {
-                        self.board.pointer(now, &u.user_id, p);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
     use std::time::Duration;
 
-    use flate2::read::GzDecoder;
-    use serde_json::{Value, json};
+    use serde_json::json;
+    use serde_json::value::RawValue;
 
     use super::*;
     use crate::socket::Broadcast;
@@ -457,21 +367,8 @@ mod tests {
         d
     }
 
-    fn board_kinds(gz: &[u8]) -> Vec<String> {
-        let mut text = String::new();
-        GzDecoder::new(gz).read_to_string(&mut text).unwrap();
-        text.lines()
-            .map(|l| {
-                serde_json::from_str::<Value>(l).unwrap()["k"]
-                    .as_str()
-                    .unwrap()
-                    .to_owned()
-            })
-            .collect()
-    }
-
     #[tokio::test]
-    async fn it_records_the_board_and_completes() {
+    async fn it_records_and_completes() {
         let lms = Lms::start().await;
         let stop = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -479,19 +376,8 @@ mod tests {
             .as_millis() as i64
             + 1500;
         lms.set(|s| s.stop_at_ms = stop);
-        lms.on_socket(|tx| async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            for ev in [
-                json!({"event": "custom_lms_wb_elements", "seq": 1, "data": {"session_id": SESS_ID, "user_id": "u1", "elements": [{"id": "e1"}]}}),
-                json!({"event": "custom_lms_wb_elements", "seq": 2, "data": {"session_id": "another-session-0000000000", "elements": []}}),
-                json!({"event": "custom_lms_wb_lock", "seq": 3, "data": {"session_id": SESS_ID, "locked": true}}),
-                json!({"event": "custom_lms_wb_clear", "seq": 4, "data": {"session_id": SESS_ID}}),
-            ] {
-                let _ = tx.send(ev);
-            }
-        });
         let cfg = lms.config();
-        run(CancellationToken::new(), cfg, lms.api(), &work_dir("board"))
+        run(CancellationToken::new(), cfg, lms.api(), &work_dir("run"))
             .await
             .unwrap();
 
@@ -501,25 +387,20 @@ mod tests {
             "{:?}",
             lms.paths()
         );
+        assert!(
+            !lms.paths().iter().any(|p| p.contains("whiteboard")),
+            "the server logs the board; the recorder does not read it"
+        );
         let st = lms.state.lock().unwrap();
         let done = st.complete.clone().unwrap();
-        let files = done["files"].as_array().unwrap();
-        assert_eq!(
-            files.len(),
-            1,
-            "no one spoke or filmed: the board is the only file"
+        assert!(
+            done["files"].as_array().unwrap().is_empty(),
+            "no one spoke or filmed: nothing to upload"
         );
-        assert_eq!(files[0]["kind"], "board");
         let d = done["duration_ms"].as_i64().unwrap();
         assert!(
             (1000..4000).contains(&d),
             "duration {d} ms for a recording that ran about 1.5 s"
-        );
-        let kinds = board_kinds(&st.uploads["0"]);
-        assert_eq!(
-            kinds,
-            ["snapshot", "elements", "lock", "clear"],
-            "events of another session are not this board"
         );
     }
 
@@ -616,8 +497,6 @@ mod tests {
         }
         let now = Instant::now();
         let rec = Arc::new(Recording::new(&work_dir("unit"), now, u64::MAX));
-        let board =
-            BoardLog::create(&rec.dir().join("board.ndjson.gz"), now, rec.disk.clone()).unwrap();
         let call = Call::new(CHAN_ID, socket.sender.clone(), rec.clone(), now);
         let room = crate::api::Room {
             session_id: SESS_ID.into(),
@@ -629,9 +508,7 @@ mod tests {
             api: lms.api(),
             cfg,
             room,
-            sender: socket.sender.clone(),
             rec,
-            board,
             call,
             call_running: false,
             was_in_call: false,
@@ -839,19 +716,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_resync_reads_everything_again() {
+    async fn a_resync_reads_the_call_and_the_status_again() {
         let (mut s, lms, cancel, _sock) = test_session().await;
         lms.set(|l| l.call_up = true);
         assert_eq!(
             s.handle(Event::named(EVENT_RESYNC)).await,
             "",
             "a resync with the recording still going"
-        );
-        assert!(
-            lms.has(&format!(
-                "GET /api/v4/lms/live/sessions/{SESS_ID}/whiteboard"
-            )),
-            "the whole board is read again"
         );
         assert!(
             s.call_running && s.call.phase == Phase::Joining,
@@ -864,14 +735,6 @@ mod tests {
             s.handle(Event::named(EVENT_RESYNC)).await,
             "stopped",
             "a resync that finds the recording over"
-        );
-
-        // A new connection must join the board again.
-        s.handle(Event::named(EVENT_RECONNECTED)).await;
-        assert!(
-            actions_after(&lms, 2)
-                .await
-                .contains(&"custom_lms_wb_join".to_owned())
         );
         cancel.cancel();
     }
@@ -910,7 +773,6 @@ mod tests {
             s.call_running,
             "an unreadable call state must not change what we know"
         );
-        s.load_board(Instant::now()).await; // logs, does not panic
         cancel.cancel();
     }
 
@@ -1010,45 +872,6 @@ mod tests {
             u64::MAX,
         ));
         assert_eq!(s.event_loop(&stop, &mut sock).await, "terminated");
-        cancel.cancel();
-    }
-
-    #[tokio::test]
-    async fn board_events_are_logged_with_their_people() {
-        let (mut s, _lms, cancel, _sock) = test_session().await;
-        let now = Instant::now();
-        let ev = |name: &str, data: &str| evt(name, "", data);
-        s.board_event(&ev("custom_lms_wb_presence", &format!(r#"{{"session_id":"{SESS_ID}","updates":[{{"user_id":"u1","presence":{{"cursor":[1,2]}}}},{{"user_id":"u2","presence":{{"cursor":[3,4]}}}}]}}"#)), now);
-        s.board_event(&ev("custom_lms_wb_presence", r#"{"session_id":"other","updates":[{"user_id":"u3","presence":{"cursor":[1,2]}}]}"#), now);
-        s.board_event(&ev("custom_lms_wb_presence", "\"nope\""), now);
-        s.board_event(
-            &ev(
-                "custom_lms_wb_unknown",
-                &format!(r#"{{"session_id":"{SESS_ID}"}}"#),
-            ),
-            now,
-        );
-        s.board.close().unwrap();
-        let mut text = String::new();
-        GzDecoder::new(std::fs::File::open(s.board.path()).unwrap())
-            .read_to_string(&mut text)
-            .unwrap();
-        let users: Vec<String> = text
-            .lines()
-            .map(|l| {
-                let v: Value = serde_json::from_str(l).unwrap();
-                format!(
-                    "{}:{}",
-                    v["k"].as_str().unwrap(),
-                    v["u"].as_str().unwrap_or("")
-                )
-            })
-            .collect();
-        assert_eq!(
-            users,
-            ["presence:u1", "presence:u2"],
-            "only this board's pointers, one per person"
-        );
         cancel.cancel();
     }
 }

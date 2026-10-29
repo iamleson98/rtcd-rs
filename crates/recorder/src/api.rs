@@ -7,7 +7,6 @@ use std::time::Duration;
 use reqwest::{Client, Method, RequestBuilder, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::value::RawValue;
 use tracing::error;
 
 use crate::config::Config;
@@ -85,14 +84,6 @@ pub struct Room {
     pub status: String,
 }
 
-/// The session's whiteboard as it is now.
-#[derive(Debug, serde::Deserialize)]
-pub struct Whiteboard {
-    #[serde(default)]
-    pub locked: bool,
-    pub elements: Box<RawValue>,
-}
-
 impl Api {
     pub fn new(cfg: &Config) -> Self {
         install_tls_provider();
@@ -144,14 +135,6 @@ impl Api {
 
     pub async fn room(&self) -> Result<Room, ApiError> {
         Self::json(self.authed(Method::GET, &self.base)).await
-    }
-
-    pub async fn board(&self, session_id: &str) -> Result<Whiteboard, ApiError> {
-        let url = format!(
-            "{}/api/v4/lms/live/sessions/{session_id}/whiteboard",
-            self.site
-        );
-        Self::json(self.authed(Method::GET, &url)).await
     }
 
     /// Whether the channel has a call in progress (the server answers 404 when it has none).
@@ -249,13 +232,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_room_and_board_are_read_with_the_bot_token() {
-        let fake = Fake::start(|r, _, _| {
-            if r.path.ends_with("/whiteboard") {
-                (200, Some(serde_json::json!({"locked": true, "elements": [{"id": "a"}]})))
-            } else {
-                (200, Some(serde_json::json!({"session_id": "s1", "chat_channel_id": "c1", "stop_at": 5, "status": "RECORDING"})))
-            }
+    async fn the_room_is_read_with_the_bot_token() {
+        let fake = Fake::start(|_, _, _| {
+            (200, Some(serde_json::json!({"session_id": "s1", "chat_channel_id": "c1", "stop_at": 5, "status": "RECORDING"})))
         })
         .await;
         let api = fake.api();
@@ -269,12 +248,8 @@ mod tests {
             ),
             ("s1", "c1", 5, "RECORDING")
         );
-        let board = api.board("s1").await.unwrap();
-        assert!(board.locked);
-        assert_eq!(board.elements.get(), r#"[{"id":"a"}]"#);
         let seen = fake.seen();
         assert_eq!(seen[0].path, REC_PATH);
-        assert_eq!(seen[1].path, "/api/v4/lms/live/sessions/s1/whiteboard");
         assert!(seen.iter().all(|r| r.auth == "Bearer bot-token"));
     }
 }

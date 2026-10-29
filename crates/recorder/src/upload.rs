@@ -629,7 +629,7 @@ mod tests {
             path,
         };
         let got = manifest_files(vec![
-            entry("board", 0, write("board", "BOARD")),
+            entry("screen", 0, write("screen", "SCREEN")),
             entry("camera", 500, write("cam", "CAMERA")),
             entry("voice", 100, write("voice", "VO")),
         ])
@@ -638,7 +638,7 @@ mod tests {
             .iter()
             .map(|f| format!("{}:{}", f.kind, f.size))
             .collect();
-        assert_eq!(got, ["board:5", "voice:2", "camera:6"]);
-        assert!(manifest_files(vec![entry("board", 0, dir.join("gone"))]).is_err());
+        assert_eq!(got, ["screen:6", "voice:2", "camera:6"]);
+        assert!(manifest_files(vec![entry("screen", 0, dir.join("gone"))]).is_err());
     }
 }

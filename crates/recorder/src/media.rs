@@ -58,7 +58,6 @@ pub const VOICE: &str = "voice";
 pub const CAMERA: &str = "camera";
 pub const SCREEN: &str = "screen";
 pub const SCREEN_AUDIO: &str = "screen_audio";
-pub const BOARD: &str = "board";
 
 /// Maps the SFU's track ids (`<type>_<session>_<random>`) to a kind.
 pub fn track_kind(track_id: &str) -> Option<&'static str> {

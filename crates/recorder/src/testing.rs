@@ -118,7 +118,7 @@ async fn handle(
     }
 }
 
-// ─── A whole fake app: the recorder endpoints, the board, the calls API and the websocket ───────
+// ─── A whole fake app: the recorder endpoints, the calls API and the websocket ───────
 
 use std::future::Future;
 use std::pin::Pin;
@@ -187,10 +187,6 @@ impl Lms {
             .route(&format!("{REC_PATH}/files/{{n}}"), put(lms_file))
             .route(&format!("{REC_PATH}/complete"), post(lms_complete))
             .route(&format!("{REC_PATH}/fail"), post(lms_fail))
-            .route(
-                &format!("/api/v4/lms/live/sessions/{SESS_ID}/whiteboard"),
-                get(lms_board),
-            )
             .route(&format!("/api/v4/calls/channels/{CHAN_ID}"), get(lms_call))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -332,15 +328,6 @@ async fn lms_fail(State(s): S, body: Bytes) -> impl IntoResponse {
     s.lock().unwrap().complete =
         Some(serde_json::json!({"failed": String::from_utf8_lossy(&body)}));
     StatusCode::OK
-}
-
-async fn lms_board(State(s): S) -> impl IntoResponse {
-    note(
-        &s,
-        "GET",
-        &format!("/api/v4/lms/live/sessions/{SESS_ID}/whiteboard"),
-    );
-    axum::Json(serde_json::json!({"locked": false, "elements": [{"id": "e0"}]}))
 }
 
 async fn lms_call(State(s): S) -> impl IntoResponse {

@@ -29,9 +29,6 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Made by the socket itself: the connection was replaced or events were missed.
 pub const EVENT_RESYNC: &str = "recorder_resync";
-/// Follows every new connection after the first, resumed or not: what the server keeps per
-/// connection (the board joined) may be on another server now.
-pub const EVENT_RECONNECTED: &str = "recorder_reconnected";
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Broadcast {
@@ -295,7 +292,6 @@ impl Task {
             self.ready.notify_waiters();
             self.ready.notify_one();
         } else {
-            self.deliver(Event::named(EVENT_RECONNECTED)).await;
             if !resumed {
                 self.deliver(Event::named(EVENT_RESYNC)).await;
             }
@@ -485,10 +481,7 @@ mod tests {
         .await;
         let cancel = CancellationToken::new();
         let mut s = Socket::start(&config(&url), cancel.clone());
-        assert_eq!(
-            names(&mut s, 5).await,
-            ["a", EVENT_RECONNECTED, "b", EVENT_RECONNECTED, EVENT_RESYNC]
-        );
+        assert_eq!(names(&mut s, 3).await, ["a", "b", EVENT_RESYNC]);
         let q = queries.lock().unwrap().clone();
         assert_eq!(q[0], "", "the first connection asks to resume nothing");
         assert_eq!(
@@ -601,15 +594,7 @@ mod tests {
         .await;
         let cancel = CancellationToken::new();
         let mut s = Socket::start(&config(&url), cancel.clone());
-        assert_eq!(
-            names(&mut s, 4).await,
-            [
-                EVENT_RECONNECTED,
-                EVENT_RESYNC,
-                EVENT_RECONNECTED,
-                EVENT_RESYNC
-            ]
-        );
+        assert_eq!(names(&mut s, 2).await, [EVENT_RESYNC, EVENT_RESYNC]);
         cancel.cancel();
     }
 }

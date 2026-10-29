@@ -1,8 +1,8 @@
 //! Command recorder records one live session of the LMS. It runs as a short-lived job (a
 //! Kubernetes Job or a Docker container, launched by the server's recorderjob package) and joins
 //! the class call as the recorder bot, listen-only. Every voice, camera and shared screen the SFU
-//! (rtcd) forwards is written as it arrives, without re-encoding, and every change to the
-//! whiteboard is logged with its time. Each file is uploaded on its own (straight to storage when
+//! (rtcd) forwards is written as it arrives, without re-encoding (the whiteboard is logged by the
+//! app server, not here). Each file is uploaded on its own (straight to storage when
 //! the server allows it), with a manifest that places each on the timeline; the web app's player
 //! puts the session back together.
 //!
