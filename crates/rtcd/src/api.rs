@@ -344,8 +344,13 @@ async fn system(State(svc): State<Arc<Service>>, method: axum::http::Method) -> 
         egress_pps: u64,
         /// Datagrams the kernel refused to queue since the instance started.
         kernel_send_drops: u64,
-        /// Receivers are held to the small video layers: a send budget is reached.
+        /// Receivers are held to the small video layers: a send budget or the node's own learned
+        /// ceiling is reached.
         egress_squeezed: bool,
+        /// The send rate at which the kernel started refusing datagrams, as the node learned it,
+        /// in bits and in packets per second (0 until it has).
+        egress_ceiling_bps: u64,
+        egress_ceiling_pps: u64,
     }
     json_response(&Body {
         cpu_load: svc.system.info().cpu_load,
@@ -357,5 +362,7 @@ async fn system(State(svc): State<Arc<Service>>, method: axum::http::Method) -> 
         egress_pps: svc.sfu.egress_pps(),
         kernel_send_drops: svc.sfu.kernel_send_drops(),
         egress_squeezed: svc.sfu.egress_squeezed(),
+        egress_ceiling_bps: svc.sfu.egress_ceiling_bps(),
+        egress_ceiling_pps: svc.sfu.egress_ceiling_pps(),
     })
 }

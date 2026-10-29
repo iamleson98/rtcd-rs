@@ -331,6 +331,7 @@ fn shards_are_added_on_their_own_when_all_are_busy() {
         sessions_per_shard: 0,
         expected_call_size: 0,
         min_shards: 1,
+        spare_cores: 0.0,
     };
     let mut live = Live::start_up_to(1, 3, scaling);
     let a = live.join("alice", "call1");
@@ -359,6 +360,7 @@ fn an_empty_shard_is_stopped_on_its_own_after_a_while() {
         sessions_per_shard: 0,
         expected_call_size: 0,
         min_shards: 1,
+        spare_cores: 0.0,
     };
     let mut live = Live::start_up_to(1, 3, scaling);
     let a = live.join("alice", "call1");

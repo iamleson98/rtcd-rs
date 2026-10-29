@@ -182,8 +182,9 @@ pub struct RtcConfig {
     pub nack_disable_copy: bool,
     /// Threads serving calls. 0 lets the SFU choose: it starts with two where there are cores for
     /// two (a class that begins at the bell is placed call by call before its participants arrive),
-    /// adds another when every shard has been busy for a few seconds (up to one fewer than the
-    /// cores) and stops one that has been empty for two minutes. A positive number pins it.
+    /// adds another when every shard has been busy for a few seconds and the machine has most of a
+    /// core idle (up to every CPU the process may use) and stops one that has been empty for two
+    /// minutes. A positive number pins it.
     pub shards: i64,
     /// How many voices of a call are forwarded once more microphones than that are open: the
     /// loudest ones, as Meet and Jitsi do. A listener follows two or three speakers, and every open
@@ -198,14 +199,14 @@ pub struct RtcConfig {
     pub audio_ptime_ms: i64,
     /// The most this node should send, in megabits per second. Near it every receiver's cameras
     /// and screen shares fall back to their small layer, so the node slows down evenly instead of
-    /// losing packets for everyone. 0 (the default) sets no budget; the rate is reported on
-    /// `GET /system` either way.
+    /// losing packets for everyone. 0 (the default) sets no budget: the node learns its own ceiling
+    /// from the kernel refusing datagrams. The rate is reported on `GET /system` either way.
     pub egress_budget_mbps: i64,
     /// The most this node should send, in packets per second: the same fall back for the other
     /// ceiling. A virtual network card takes a limited number of packets however small they are,
     /// and voice packets are small: the OVH video VPS sends 150 to 200 thousand a second and then
     /// its transmit ring stays full. Set it to about 80 % of what the card was measured to take.
-    /// 0 (the default) sets no budget.
+    /// 0 (the default) sets no budget, and the node learns its own ceiling.
     pub egress_budget_pps: i64,
     /// Whether a join is refused while the shard that would serve it is at its limit (a thread
     /// busy for three seconds at 95 % or more, after shedding what it can): the participants it
