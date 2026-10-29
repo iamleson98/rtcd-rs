@@ -16,6 +16,7 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use super::Engine;
+use super::record::Tap;
 use super::session::SessionKey;
 use super::session::{DownPhase, DownStream, Lifecycle, Session, Source, SourceKey, SubRef};
 use super::types::CloseReason;
@@ -40,6 +41,8 @@ pub(crate) struct Fan {
     /// The next packet follows a stretch that was left out: receivers carry on their sequence
     /// numbers from where they were.
     pub resume: bool,
+    /// Where a copy of every packet goes, if the stream is being recorded.
+    pub tap: Option<Tap>,
 }
 
 #[derive(Deserialize)]
@@ -253,7 +256,7 @@ impl Engine {
                 return;
             }
             let stale = known.id;
-            self.remove_source(key, stale);
+            self.remove_source(key, stale, now);
         }
         let Some(s) = self.sessions.get_mut(key) else {
             return;
@@ -324,6 +327,7 @@ impl Engine {
             layer,
             codec: codec.clone(),
             track_id: init.track_id.clone(),
+            since: now,
             receiver: init.receiver_id,
             out_track_id,
             rate: RateMonitor::new(window),
@@ -345,9 +349,11 @@ impl Engine {
                 vp8: is_vp8,
                 ty,
                 resume: false,
+                tap: None,
             },
         );
 
+        self.record_sync(key, ty, now);
         self.sync_call_stream(key, ty, now);
     }
 
@@ -364,7 +370,7 @@ impl Engine {
                 .collect();
         let mut types = HashSet::new();
         for id in ended {
-            if let Some(ty) = self.remove_source(key, id) {
+            if let Some(ty) = self.remove_source(key, id, now) {
                 types.insert(ty);
             }
         }
@@ -383,7 +389,12 @@ impl Engine {
     }
 
     /// Forgets a source; returns its type. Receivers it fed are left to the caller to re-sync.
-    pub(super) fn remove_source(&mut self, key: SessionKey, source: u32) -> Option<TrackType> {
+    pub(super) fn remove_source(
+        &mut self,
+        key: SessionKey,
+        source: u32,
+        now: Instant,
+    ) -> Option<TrackType> {
         let s = self.sessions.get_mut(key)?;
         let pos = s.up.sources.iter().position(|x| x.id == source)?;
         let src = s.up.sources.remove(pos);
@@ -396,6 +407,10 @@ impl Engine {
         }) {
             for sub in fan.serving.into_iter().chain(fan.waiting) {
                 self.source_gone(sub, source);
+            }
+            // Another layer of it takes its place in the recording at the next upkeep.
+            if let Some(tap) = fan.tap {
+                self.record_closed(tap, now);
             }
         }
         Some(src.ty)
@@ -590,6 +605,10 @@ impl Engine {
             // The uplink counts whether or not anyone receives the stream.
             let size = packet.marshal_size() as u64;
             self.metrics.rtp_bytes_received(fan.ty, size);
+            // A recorded stream is copied before anything decides whether anyone watches it.
+            if let Some(tap) = fan.tap {
+                self.recordings.packet(tap, &packet, now);
+            }
             if fan.serving.is_empty() && fan.waiting.is_empty() {
                 continue;
             }
@@ -750,7 +769,7 @@ impl Engine {
                 .map(|x| x.id)
                 .collect();
         for id in ended {
-            self.remove_source(key, id);
+            self.remove_source(key, id, now);
         }
         if let Some(s) = self.sessions.get_mut(key) {
             s.up.out_ids.remove(&TrackType::Screen);

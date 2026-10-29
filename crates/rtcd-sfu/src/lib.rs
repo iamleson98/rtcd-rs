@@ -9,6 +9,7 @@ pub mod loudest;
 pub mod metrics;
 mod peer;
 pub mod rate;
+pub mod record;
 pub mod rewrite;
 pub mod runtime;
 pub mod vad;

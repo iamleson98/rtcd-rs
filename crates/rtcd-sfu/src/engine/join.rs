@@ -178,6 +178,7 @@ impl Engine {
             group: s.cfg.group_id.clone(),
             call: s.cfg.call_id.clone(),
         };
+        let mut recording_over = None;
         if let Some(call) = self.calls.get_mut(&call_id) {
             call.members.retain(|&m| m != key);
             call.voices.remove(key);
@@ -185,6 +186,7 @@ impl Engine {
                 call.screen = None;
             }
             if call.members.is_empty() {
+                recording_over = call.record;
                 self.calls.remove(&call_id);
             }
         }
@@ -197,6 +199,9 @@ impl Engine {
                 session: key,
                 source: src.id,
             }) {
+                if let Some(tap) = fan.tap {
+                    self.record_closed(tap, now);
+                }
                 for sub in fan.serving.into_iter().chain(fan.waiting) {
                     if let Some(r) = self.sessions.get_mut(sub.session) {
                         r.down.drop_stream(sub.stream);
@@ -204,6 +209,10 @@ impl Engine {
                     self.mark_dirty(sub.session);
                 }
             }
+        }
+        // The last one out ends the call's recording, after the streams it ended.
+        if let Some(rec) = recording_over {
+            self.finish_recording(rec, crate::record::RecordEnd::CallEnded, now);
         }
         // Senders to this session: no longer fed.
         for (id, ds) in s.down.iter() {
@@ -242,7 +251,6 @@ impl Engine {
             session_id: s.cfg.session_id.clone(),
             reason,
         });
-        let _ = now;
     }
 
     /// The members of the call a session belongs to, in join order.
