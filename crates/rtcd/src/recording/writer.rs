@@ -368,15 +368,15 @@ pub struct WriterPool {
 }
 
 impl WriterPool {
-    pub fn start(threads: usize) -> Self {
+    pub fn start(threads: usize, metrics: &Arc<Metrics>) -> Self {
         let workers = (0..threads.max(1))
             .map(|n| {
                 let (tx, rx) = channel();
                 let load = Arc::new(AtomicUsize::new(0));
-                let l = load.clone();
+                let (l, m) = (load.clone(), metrics.clone());
                 thread::Builder::new()
                     .name(format!("rtcd-record-{n}"))
-                    .spawn(move || serve(rx, l))
+                    .spawn(move || serve(rx, l, m))
                     .expect("a thread to write recordings");
                 Worker { jobs: tx, load }
             })
@@ -400,7 +400,7 @@ impl WriterPool {
 }
 
 /// A writer thread: pumps its jobs until the pool is dropped and none is left.
-fn serve(rx: Receiver<Job>, load: Arc<AtomicUsize>) {
+fn serve(rx: Receiver<Job>, load: Arc<AtomicUsize>, metrics: Arc<Metrics>) {
     let mut jobs: Vec<Job> = Vec::new();
     let mut closed = false;
     loop {
@@ -435,6 +435,7 @@ fn serve(rx: Receiver<Job>, load: Arc<AtomicUsize>) {
             }
             state != Pump::Done
         });
+        metrics.record_writer_busy(clock.elapsed());
         if !busy {
             thread::sleep(IDLE_SLEEP);
         }
@@ -1007,7 +1008,7 @@ mod tests {
         }
         rig.end(RecordEnd::Stopped, t0 + Duration::from_secs(2));
         let Rig { job, mut cmds, .. } = rig;
-        let pool = WriterPool::start(2);
+        let pool = WriterPool::start(2, &Arc::new(Metrics::new()));
         pool.add(job);
         let deadline = Instant::now() + Duration::from_secs(10);
         let (mut files, mut ended) = (0, None);

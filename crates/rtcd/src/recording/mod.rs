@@ -272,7 +272,7 @@ impl Recordings {
         info!(dir = %data_dir.display(), "recording is enabled on this node");
         Self {
             live: Some(Live {
-                writers: WriterPool::start((cores / 2).clamp(1, 4)),
+                writers: WriterPool::start((cores / 2).clamp(1, 4), &metrics),
                 uploads,
                 pending,
                 registry: Arc::new(Registry::default()),

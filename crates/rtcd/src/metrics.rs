@@ -80,6 +80,8 @@ pub struct Metrics {
     record_pending_bytes: Gauge,
     record_uploaded_bytes: Counter,
     record_upload_failures: Counter,
+    /// Seconds the writer threads spent writing (not sleeping).
+    record_writer_busy: Counter,
 }
 
 impl std::fmt::Debug for Metrics {
@@ -479,8 +481,17 @@ impl Metrics {
                 "upload_failures_total",
                 "Recording files given up on after their uploads kept failing",
             ),
+            record_writer_busy: record_counter(
+                r,
+                "writer_busy_seconds_total",
+                "Seconds the recording writer threads spent writing rather than waiting",
+            ),
             registry,
         }
+    }
+
+    pub fn record_writer_busy(&self, spent: Duration) {
+        self.record_writer_busy.inc_by(spent.as_secs_f64());
     }
 
     /// A recording started or stopped being captured here.
@@ -731,6 +742,7 @@ mod tests {
         m.record_pending(4096);
         m.record_uploaded(1000);
         m.record_upload_failed();
+        m.record_writer_busy(Duration::from_millis(1500));
         m.ws_connected("client");
         m.ws_message("client", "join", "in");
         let text = m.render();
@@ -764,6 +776,7 @@ mod tests {
             "rtcd_record_pending_bytes 4096",
             "rtcd_record_uploaded_bytes_total 1000",
             "rtcd_record_upload_failures_total 1",
+            "rtcd_record_writer_busy_seconds_total 1.5",
             "rtcd_ws_connections_total{clientID=\"client\"} 1",
             "rtcd_ws_messages_total{clientID=\"client\",direction=\"in\",type=\"join\"} 1",
         ] {
