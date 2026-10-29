@@ -244,7 +244,9 @@ pub struct RecordConfig {
     /// of this.
     pub max_pending_bytes: i64,
     /// The rate, in megabits per second, at which this node uploads recordings, all of them
-    /// together: uploads must not compete with the media the node sends.
+    /// together: uploads must not compete with the media the node sends, and must keep up with
+    /// what is written (175 recorded lessons write ~113 Mbit/s on average), or the closed files
+    /// pile up to `max_pending_bytes` and recordings drop packets.
     pub upload_mbps: i64,
 }
 
@@ -343,8 +345,8 @@ impl Default for RecordConfig {
             enabled: false,
             data_dir: "/data/recordings".into(),
             max_bytes: 2 << 30,
-            max_pending_bytes: 1 << 30,
-            upload_mbps: 50,
+            max_pending_bytes: 4 << 30,
+            upload_mbps: 200,
         }
     }
 }
@@ -775,7 +777,7 @@ mod tests {
         assert!(!c.record.enabled, "recording is off unless asked for");
         assert_eq!(
             (c.record.max_pending_bytes, c.record.upload_mbps),
-            (1 << 30, 50)
+            (4 << 30, 200)
         );
         c.validate().unwrap();
     }

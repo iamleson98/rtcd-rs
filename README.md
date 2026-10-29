@@ -257,8 +257,8 @@ memory; see [crates/recorder/README.md](crates/recorder/README.md) for the numbe
 
 With `[record] enabled = true` (`RTCD_RECORD_ENABLED`) a node records calls itself, without a recorder
 participant: the server sends `record_start` over the websocket, each published stream is copied once
-to a writer thread (`rtcd_sfu::record`), the files are the recorder crate's, rotated every ten minutes
-and numbered from the start's `fileBase` in the order they close, and each is uploaded as it closes
+to a writer thread (`rtcd_sfu::record`), the files are the recorder crate's, rotated every two minutes
+(bounding what a node shutting down still holds) and numbered from the start's `fileBase` in the order they close, and each is uploaded as it closes
 through the endpoints the bot uses, then reported (`record_file`) and deleted. `record_ended` follows
 once every file is stored. Settings: `RTCD_RECORD_DATADIR`, `_MAXBYTES` (one recording's total),
 `_MAXPENDINGBYTES` (closed files waiting for upload, all recordings; above it packets are left out and

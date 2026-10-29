@@ -3,7 +3,7 @@
 //! Every app node of the server connects with the same client id, and a report is useful to any of
 //! them: the server keeps what it learns in shared storage. So a report goes to any live connection
 //! of the client that asked for the recording, and if none is connected it waits, in order, for the
-//! next one. Reports are few (a file every ten minutes per stream, one at the end), so the queue is
+//! next one. Reports are few (a file every two minutes per stream, one at the end), so the queue is
 //! small and bounded; past the bound the oldest is dropped.
 
 use std::collections::{HashMap, VecDeque};
@@ -16,8 +16,9 @@ use tracing::warn;
 use crate::metrics::Metrics;
 use crate::service::ConnHandle;
 
-/// Reports kept per client while it has no connection.
-pub const MAX_QUEUED: usize = 4096;
+/// Reports kept per client while it has no connection: 175 recorded lessons of about five streams
+/// send ~440 a minute, so this is over half an hour without the server, in a few MB.
+pub const MAX_QUEUED: usize = 16384;
 
 #[derive(Debug, Default)]
 struct Inner {
