@@ -254,10 +254,11 @@ pub struct RecordConfig {
     /// The most one capture (a run, from a `record_start`) may write, in bytes, files already
     /// uploaded included: it counts what was written, not what is on the disk (that is bounded by
     /// `max_pending_bytes`). A capture that reaches it ends cleanly (`disk_full`) with what it
-    /// has, while its class may be live, so it is not a guard to trip in a normal lesson: the
-    /// default is the most the server keeps of a recording (`RecordingMaxBytes`, 16 GiB), which
-    /// a four-hour lesson of ten cameras, their voices and a shared screen at the web client's
-    /// highest rates comes just under.
+    /// has, while its class may be live, so it is not a guard to trip in a normal lesson. A
+    /// capture stops a little after it crosses the cap (the rest of the batch being written, the
+    /// files it closes), and the server keeps at most 16 GiB of a recording, so the default
+    /// leaves a GiB under that; a four-hour lesson of ten cameras, their voices and a shared
+    /// screen at the web client's highest rates comes just under it.
     pub max_bytes: i64,
     /// The most bytes of closed files this node holds waiting to be uploaded, all recordings
     /// together. Above it recordings drop packets (each drop is a gap in the recording and is
@@ -368,7 +369,7 @@ impl Default for RecordConfig {
         Self {
             enabled: false,
             data_dir: "/data/recordings".into(),
-            max_bytes: 16 << 30,
+            max_bytes: 15 << 30,
             max_pending_bytes: 4 << 30,
             upload_mbps: 200,
         }
@@ -1113,6 +1114,9 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
         let bytes = bits_per_second / 8 * 4 * 3600;
         let cap = RecordConfig::default().max_bytes;
         assert!(bytes < cap, "{bytes} bytes in four hours, cap {cap}");
-        assert!(cap <= 16 << 30, "more than the server keeps of a recording");
+        assert!(
+            cap <= 15 << 30,
+            "a capture ends a little over its cap, and the server keeps 16 GiB"
+        );
     }
 }

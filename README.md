@@ -363,7 +363,7 @@ once when it is not taken (the node is draining and holds nothing of it, the rec
 call or first file number, the call has another recording, or the numbers reach those of a capture whose
 end is not sent yet), otherwise by the one `record_ended` of its run. The start a node already holds is
 not answered again, draining or not. An optional `maxFiles` in `record_start` bounds the run: it never
-opens more files than that, and ends as `file_limit` once the last is closed (absent or zero: no limit). Settings: `RTCD_RECORD_DATADIR`, `_MAXBYTES` (what one capture may write, 16 GiB by default: the most the server keeps of a recording),
+opens more files than that, and ends as `file_limit` as soon as the last number is taken, closing and uploading what it has (absent or zero: no limit). Settings: `RTCD_RECORD_DATADIR`, `_MAXBYTES` (what one capture may write, 15 GiB by default: under the 16 GiB the server keeps of a recording, since a capture stops a moment after it crosses the cap),
 `_MAXPENDINGBYTES` (closed files waiting for upload, all recordings; above it packets are left out and
 counted, not the recording ended) and `_UPLOADMBPS` (the node's upload rate, so uploads never compete
 with media). Files a dead process left in the data directory are removed at start. Metrics:

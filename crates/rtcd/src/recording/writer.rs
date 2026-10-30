@@ -208,12 +208,11 @@ impl Job {
         }
         self.collect_files();
         // Every file number the run may use has been taken (a file that cannot be opened is not
-        // one), and the last of them is closed: nothing more can be written, and the numbers
-        // beyond belong to the next range.
-        if !self.ended
-            && self.rec.file_limit_reached()
-            && !self.streams.values().any(|s| s.rec.is_writing())
-        {
+        // one). The run ends now rather than when the last file closes: a stream that cannot
+        // open a file leaves what it receives out, and a rotation is two minutes away. Ending
+        // closes the files that are open, none of which can be past the limit, and the server
+        // starts the call again from the numbers after.
+        if !self.ended && self.rec.file_limit_reached() {
             warn!(recording = %self.run.recording_id, files = self.run.max_files, "the recording used every file number it was given; ending it");
             self.rx.shared().cancel();
             self.end("file_limit", clock);
@@ -1130,7 +1129,7 @@ mod tests {
 
     /// A rotating rig with `max_files`, fed two streams (a voice and a camera) for `seconds` of
     /// media, packet by packet with a pump after each, until the run ends or the media does.
-    fn feed_until_over(rig: &mut Rig, seconds: u64) -> Option<Pump> {
+    fn feed_until_over(rig: &mut Rig, seconds: u64) -> Option<u64> {
         let t0 = rig.t0;
         rig.open(0, TrackType::Voice, "a", "ua");
         rig.open(1, TrackType::Video, "b", "ub");
@@ -1145,7 +1144,7 @@ mod tests {
                 rig.packet(1, vp8_frame(at, n as u16, n * 5400, n.is_multiple_of(10)));
             }
             if rig.job.pump(at) == Pump::Done {
-                return Some(Pump::Done);
+                return Some(ms);
             }
         }
         None
@@ -1158,7 +1157,7 @@ mod tests {
             ..eager()
         };
         let mut rig = limited_rig("limit", u64::MAX, u64::MAX, rotating, 5);
-        assert_eq!(feed_until_over(&mut rig, 60), Some(Pump::Done));
+        assert!(feed_until_over(&mut rig, 60).is_some());
         assert!(
             rig.sink.shared().is_cancelled(),
             "the SFU is told to let go of the call"
@@ -1184,6 +1183,31 @@ mod tests {
     }
 
     #[test]
+    fn a_run_ends_the_moment_its_last_number_is_taken() {
+        // Waiting for the last file to close would leave every stream without a file to write to
+        // for a rotation (two minutes); the run ends and the server starts the call again.
+        let rotating = Settings {
+            rotate_every: Duration::from_secs(120),
+            ..eager()
+        };
+        let mut rig = limited_rig("prompt", u64::MAX, u64::MAX, rotating, 2);
+        let over_at = feed_until_over(&mut rig, 60).expect("it ends");
+        assert!(
+            over_at < 1000,
+            "the voice and the first keyframe: {over_at} ms"
+        );
+        let (files, ended) = rig.told();
+        let ended = ended.unwrap();
+        assert_eq!((ended.reason, ended.files), ("file_limit", 2));
+        assert_eq!(
+            files.len(),
+            2,
+            "both open files were closed and are handed over"
+        );
+        assert!(files.iter().all(|(_, f)| f.size > 0));
+    }
+
+    #[test]
     fn the_file_limit_holds_however_the_streams_open_and_close() {
         // Voices and cameras that rotate quickly, with a file limit from one to a dozen: the run
         // never takes a number past `base + limit`, and ends for the limit once every one is used.
@@ -1193,7 +1217,7 @@ mod tests {
                 ..eager()
             };
             let mut rig = limited_rig(&format!("many{limit}"), u64::MAX, u64::MAX, rotating, limit);
-            assert_eq!(feed_until_over(&mut rig, 60), Some(Pump::Done), "{limit}");
+            assert!(feed_until_over(&mut rig, 60).is_some(), "{limit}");
             let (files, ended) = rig.told();
             let ended = ended.unwrap();
             assert_eq!(

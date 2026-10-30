@@ -158,6 +158,9 @@ async fn finish(run: &Run, ended: Ended, deps: &Deps) {
             }),
         );
     }
+    // As soon as the end is sent, not after the directory is removed: a resend of the same start
+    // in between would be taken for a new run.
+    deps.registry.reported(&run.recording_id, run.id);
     info!(recording = %run.recording_id, reason = ended.reason, files = ended.files, "recording over");
     if let Err(e) = tokio::fs::remove_dir_all(&run.dir).await
         && e.kind() != std::io::ErrorKind::NotFound
@@ -168,7 +171,6 @@ async fn finish(run: &Run, ended: Ended, deps: &Deps) {
         // Only if no later run of the recording is using it.
         let _ = tokio::fs::remove_dir(parent).await;
     }
-    deps.registry.reported(&run.recording_id, run.id);
     let _ = deps
         .unfinished
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -258,6 +260,7 @@ mod tests {
     use recorder::testing::{Fake, Lms, REC_ID, REC_PATH};
     use serde_json::{Value, json};
 
+    use super::super::Busy;
     use super::*;
     use crate::service::{ConnHandle, Outbound};
 
@@ -626,7 +629,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_numbers_of_a_run_are_free_once_its_end_has_been_sent_not_before() {
+    async fn the_numbers_of_a_run_stay_taken_until_its_end_has_been_sent_and_a_while_after() {
         let lms = Lms::start().await;
         let mut h = harness("numbers", quick());
         let run = h.run(lms.api(), 500);
@@ -663,9 +666,9 @@ mod tests {
         };
         assert_eq!(e.file_base, 500);
         h.quiet().await;
-        assert_eq!(h.registry.unreported(), 0, "free once the end is sent");
-        // And the same start, sent again after its end, is a new one.
-        assert_eq!(h.registry.begin(want, 2, &draining), Ok(()));
+        assert_eq!(h.registry.unreported(), 0, "its end is sent");
+        // A resend computed before the end arrived is still the one start, for a while.
+        assert_eq!(h.registry.begin(want, 2, &draining), Err(Busy::Same));
     }
 
     #[tokio::test]

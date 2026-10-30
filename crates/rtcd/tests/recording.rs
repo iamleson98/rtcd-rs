@@ -497,6 +497,10 @@ async fn a_run_never_takes_a_number_past_its_file_limit() {
     let all = reports([&c.wa, &c.wb]);
     let end = ends(&all, REC_ID).remove(0);
     assert_eq!((end.file_base, end.files), (300, 1), "{end:?}");
+    assert_eq!(
+        end.reason, "file_limit",
+        "the run ended by itself, not at the stop"
+    );
     let got = files(&all, REC_ID);
     assert_eq!(got.iter().map(|f| f.index).collect::<Vec<_>>(), [300]);
     let uploads = c

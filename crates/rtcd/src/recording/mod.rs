@@ -131,8 +131,14 @@ struct Active {
     file_base: u32,
 }
 
-/// A capture that is over and whose `record_ended` has not been sent: its files are still being
-/// uploaded, and the numbers they took are not to be taken again.
+/// How long the numbers of a run stay taken after its `record_ended` was sent. A resend that the
+/// server computed before the end reached it carries the same numbers; taken as a new run it would
+/// write over the files just uploaded. The server numbers every later start past an end it knows,
+/// so no start it means to make is held up.
+const HOLD_AFTER_REPORT: Duration = Duration::from_secs(300);
+
+/// A capture that is over: its files are still being uploaded, or its `record_ended` was sent a
+/// moment ago, and the numbers they took are not to be taken again.
 #[derive(Debug)]
 struct Over {
     run: u64,
@@ -141,6 +147,8 @@ struct Over {
     file_base: u32,
     /// The indexes the files took, counted from `file_base`.
     files: u32,
+    /// When its `record_ended` was sent; `None` until then.
+    reported_at: Option<Instant>,
 }
 
 impl Over {
@@ -163,17 +171,33 @@ struct Held {
 /// and is not taken again, whoever sends it again, until that end has been sent. One that is not
 /// taken is answered `refused` at once. Both are decided here, under one lock, so that two senders
 /// and a node that starts draining at the same time cannot both be right.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Registry {
     held: Mutex<Held>,
+    hold: Duration,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self::with_hold(HOLD_AFTER_REPORT)
+    }
 }
 
 impl Registry {
+    /// A registry that keeps the numbers of a run taken for `hold` after its end was sent.
+    pub fn with_hold(hold: Duration) -> Self {
+        Self {
+            held: Mutex::new(Held::default()),
+            hold,
+        }
+    }
+
     /// Registers the start as run `run`, unless something held says otherwise. What is already
     /// held comes first, so a resend of a start the node holds is never answered `refused`
     /// because the node is draining.
     pub fn begin(&self, want: Want<'_>, run: u64, draining: &AtomicBool) -> Result<(), Busy> {
         let mut held = self.held.lock();
+        self.forget_old(&mut held);
         if let Some(a) = held.active.get(want.recording_id) {
             return if a.client_id == want.client_id
                 && a.call_id == want.call_id
@@ -209,7 +233,10 @@ impl Registry {
                 ));
             }
         }
-        if draining.load(Ordering::Acquire) {
+        // Sequentially consistent with the store in `begin_drain`, which lists the captures
+        // after setting it: a start registered before that listing is stopped by the drain, and
+        // one that is not is refused here.
+        if draining.load(Ordering::SeqCst) {
             return Err(Busy::Refused("this node is shutting down"));
         }
         if held
@@ -256,19 +283,35 @@ impl Registry {
                     call_id: a.call_id,
                     file_base: a.file_base,
                     files,
+                    reported_at: None,
                 });
         }
     }
 
-    /// The end of the run has been sent (or there was nothing to say): its numbers are free.
+    /// The end of the run has been sent (or there was nothing to say): its numbers are free once
+    /// the time they are held for after that has passed.
     pub fn reported(&self, recording_id: &str, run: u64) {
         let mut held = self.held.lock();
-        if let Some(over) = held.over.get_mut(recording_id) {
-            over.retain(|o| o.run != run);
-            if over.is_empty() {
-                held.over.remove(recording_id);
-            }
+        if let Some(o) = held
+            .over
+            .get_mut(recording_id)
+            .and_then(|over| over.iter_mut().find(|o| o.run == run))
+        {
+            o.reported_at = Some(Instant::now());
         }
+        self.forget_old(&mut held);
+    }
+
+    /// Lets go of the runs whose end was sent longer ago than they are held for.
+    fn forget_old(&self, held: &mut Held) {
+        let now = Instant::now();
+        held.over.retain(|_, over| {
+            over.retain(|o| {
+                o.reported_at
+                    .is_none_or(|at| now.saturating_duration_since(at) < self.hold)
+            });
+            !over.is_empty()
+        });
     }
 
     /// The call a client's recording captures.
@@ -300,10 +343,16 @@ impl Registry {
         self.len() == 0
     }
 
-    /// Captures that are over and not reported yet.
+    /// Captures that are over and whose end has not been sent.
     #[cfg(test)]
     pub(crate) fn unreported(&self) -> usize {
-        self.held.lock().over.values().map(Vec::len).sum()
+        self.held
+            .lock()
+            .over
+            .values()
+            .flatten()
+            .filter(|o| o.reported_at.is_none())
+            .count()
     }
 }
 
@@ -575,7 +624,7 @@ impl Recordings {
         }
         // The drain stopped the captures it found; this one may have been registered after it
         // looked and handed to the SFU after it stopped them.
-        if live.draining.load(Ordering::Acquire)
+        if live.draining.load(Ordering::SeqCst)
             && let Err(e) = sfu.record_stop(client_id, &req.call_id, &req.recording_id)
         {
             warn!(recording = %req.recording_id, error = %e, "the SFU would not stop a recording for the shutdown");
@@ -635,7 +684,7 @@ impl Recordings {
         let Some(live) = &self.live else {
             return;
         };
-        live.draining.store(true, Ordering::Release);
+        live.draining.store(true, Ordering::SeqCst);
         live.throttle.lift();
         let all = live.registry.all();
         info!(
@@ -821,11 +870,20 @@ mod tests {
             Err(Busy::Same)
         );
         r.reported("rec1", 1);
-        assert!(matches!(
-            r.begin(want("rec1", "mm", "call", 40), 6, &draining),
-            Err(Busy::Refused(_))
-        ));
         assert_eq!(r.unreported(), 0);
+        assert_eq!(
+            r.begin(want("rec1", "mm", "call", 40), 6, &draining),
+            Err(Busy::Same),
+            "a resend computed before the end arrived is still the one start"
+        );
+        let r = Registry::with_hold(Duration::ZERO);
+        assert_eq!(r.begin(want("rec1", "mm", "call", 40), 1, &SERVING), Ok(()));
+        r.finish("rec1", 1, 3);
+        r.reported("rec1", 1);
+        assert!(matches!(
+            r.begin(want("rec1", "mm", "call", 40), 7, &draining),
+            Err(Busy::Refused("this node is shutting down"))
+        ));
     }
 
     #[test]
@@ -885,11 +943,91 @@ mod tests {
             "the numbers after the last one it took are free"
         );
         r.remove("rec1", 6);
-        r.reported("rec1", 1);
+    }
+
+    #[test]
+    fn the_numbers_of_a_run_are_held_for_a_while_after_its_end_was_sent() {
+        let r = Registry::default();
         assert_eq!(
-            r.begin(want("rec1", "mm", "call", 100), 7, &SERVING),
+            r.begin(want("rec1", "mm", "call", 100), 1, &SERVING),
             Ok(())
         );
+        r.finish("rec1", 1, 4);
+        r.reported("rec1", 1);
+        // A resend the server computed before the end reached it: not a new run that would
+        // write over the files just uploaded.
+        assert_eq!(
+            r.begin(want("rec1", "mm", "call", 100), 2, &SERVING),
+            Err(Busy::Same)
+        );
+        let other = Want {
+            call_id: "call2",
+            ..want("rec1", "mm", "call", 102)
+        };
+        assert!(matches!(r.begin(other, 3, &SERVING), Err(Busy::Refused(_))));
+        assert_eq!(
+            r.begin(want("rec1", "mm", "call", 104), 4, &SERVING),
+            Ok(()),
+            "what the server numbers past the end is free at once"
+        );
+
+        let r = Registry::with_hold(Duration::from_millis(30));
+        assert_eq!(
+            r.begin(want("rec1", "mm", "call", 100), 1, &SERVING),
+            Ok(())
+        );
+        r.finish("rec1", 1, 4);
+        r.reported("rec1", 1);
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            r.begin(want("rec1", "mm", "call", 100), 2, &SERVING),
+            Ok(()),
+            "forgotten after the hold"
+        );
+    }
+
+    #[test]
+    fn a_start_racing_a_drain_is_either_listed_by_it_or_refused() {
+        // `begin_drain` sets the flag and then lists the captures; a start that is registered
+        // before the listing is listed (and stopped), one after sees the flag.
+        for round in 0..300 {
+            let registry = Arc::new(Registry::default());
+            let draining = Arc::new(AtomicBool::new(false));
+            let starters: Vec<_> = (0..4u64)
+                .map(|n| {
+                    let (registry, draining) = (registry.clone(), draining.clone());
+                    std::thread::spawn(move || {
+                        let id = format!("rec{n}");
+                        let call = format!("call{n}");
+                        let got = registry.begin(
+                            Want {
+                                recording_id: &id,
+                                client_id: "mm",
+                                call_id: &call,
+                                file_base: 0,
+                                max_files: 0,
+                            },
+                            n,
+                            &draining,
+                        );
+                        (id, got)
+                    })
+                })
+                .collect();
+            draining.store(true, Ordering::SeqCst);
+            let listed: Vec<String> = registry.all().into_iter().map(|(_, id, _)| id).collect();
+            for starter in starters {
+                let (id, got) = starter.join().unwrap();
+                match got {
+                    Ok(()) => assert!(
+                        listed.contains(&id),
+                        "round {round}: {id} was taken but the drain did not list it"
+                    ),
+                    Err(Busy::Refused(why)) => assert_eq!(why, "this node is shutting down"),
+                    Err(Busy::Same) => panic!("nothing was held"),
+                }
+            }
+        }
     }
 
     #[test]
