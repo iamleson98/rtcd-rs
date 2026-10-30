@@ -5,6 +5,7 @@
 //! debt, and waits until the debt is repaid. A chunk larger than the bucket therefore never
 //! blocks for good, and callers that arrive together are served in the order they reserved.
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -38,6 +39,18 @@ pub struct Throttle {
     state: Mutex<State>,
     /// The rate no longer applies (see [`Throttle::lift`]).
     lifted: AtomicBool,
+    /// How many requests are being sent through it (see [`Throttle::enter`]).
+    in_flight: AtomicU32,
+}
+
+/// A request being sent through a [`Throttle`], counted while it lives.
+#[derive(Debug)]
+pub struct Flight(Arc<Throttle>);
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Throttle {
@@ -53,7 +66,21 @@ impl Throttle {
                 at: Instant::now(),
             }),
             lifted: AtomicBool::new(false),
+            in_flight: AtomicU32::new(0),
         }
+    }
+
+    /// Counts a request as being sent through the throttle until the returned guard is dropped.
+    pub fn enter(self: &Arc<Self>) -> Flight {
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        Flight(self.clone())
+    }
+
+    /// The rate, in bytes a second, each request in flight gets when the throttle is held to its
+    /// share `permille` thousandths of the whole (and at least this one request is in flight).
+    pub fn fair_rate(&self, permille: u32) -> f64 {
+        let in_flight = self.in_flight.load(Ordering::Relaxed).max(1);
+        self.rate * f64::from(permille.clamp(1, FULL)) / f64::from(FULL) / f64::from(in_flight)
     }
 
     /// Lets only `permille` thousandths of the rate through from now on (1,000: all of it; at
