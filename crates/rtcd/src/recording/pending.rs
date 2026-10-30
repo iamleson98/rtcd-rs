@@ -56,6 +56,12 @@ impl Pending {
         self.bytes.load(Ordering::Relaxed) >= self.cap
     }
 
+    /// Whether the files waiting are half of what the node will hold: past that, uploads must go
+    /// at their full rate, whatever else wants the network.
+    pub fn half_full(&self) -> bool {
+        self.bytes.load(Ordering::Relaxed).saturating_mul(2) >= self.cap
+    }
+
     pub fn bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
     }

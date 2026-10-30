@@ -453,11 +453,22 @@ impl Recordings {
     }
 
     /// Uploads go at a quarter of their rate while `yielding`, the whole of it otherwise: the
-    /// network card is refusing the media this node sends, and a file can wait.
+    /// network card is refusing the media this node sends, and a file can wait. Not once the
+    /// files waiting are half of what the node holds: they would reach the cap, and recordings
+    /// would start leaving packets out.
     pub fn yield_to_media(&self, yielding: bool) {
         if let Some(live) = &self.live {
+            let slow = yielding && !live.pending.half_full();
             live.throttle
-                .set_share(if yielding { YIELD_SHARE } else { 1000 });
+                .set_share(if slow { YIELD_SHARE } else { 1000 });
+        }
+    }
+
+    /// Records files of `n` bytes as closed and waiting for upload, as the writers do.
+    #[cfg(test)]
+    fn hold(&self, n: u64) {
+        if let Some(live) = &self.live {
+            live.pending.add(n);
         }
     }
 
@@ -552,6 +563,14 @@ mod tests {
         assert_eq!(r.upload_share(), Some(250));
         r.yield_to_media(false);
         assert_eq!(r.upload_share(), Some(1000));
+        // Files piling up past half of what the node holds end the courtesy: they would reach
+        // the cap and the recordings would start leaving packets out.
+        r.hold(1 << 30);
+        r.yield_to_media(true);
+        assert_eq!(r.upload_share(), Some(250), "a quarter of the cap waits");
+        r.hold(1 << 30);
+        r.yield_to_media(true);
+        assert_eq!(r.upload_share(), Some(1000), "half of it is full speed");
         let _ = std::fs::remove_dir_all(dir);
         assert_eq!(
             Recordings::new(
