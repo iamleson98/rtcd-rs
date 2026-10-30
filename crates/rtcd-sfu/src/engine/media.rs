@@ -617,7 +617,6 @@ impl Engine {
             packet.header.extensions.clear();
             let size = packet.marshal_size() as u64;
             let mut sent = [0u64; 4];
-            let mut writes = 0u64;
             let mut switched = Vec::new();
 
             // Receivers waiting for this stream join it at a keyframe (any packet, for codecs whose
@@ -638,7 +637,6 @@ impl Engine {
                         sent[type_slot(
                             r.down.get(sub.stream).map_or(TrackType::Video, |d| d.ty),
                         )] += size;
-                        writes += 1;
                     }
                     switched.push(sub);
                 }
@@ -658,7 +656,6 @@ impl Engine {
                 let ty = r.down.get(sub.stream).map_or(TrackType::Voice, |d| d.ty);
                 if wrote {
                     sent[type_slot(ty)] += size;
-                    writes += 1;
                 }
                 if let Some(started) = started {
                     self.metrics
@@ -670,10 +667,6 @@ impl Engine {
                     self.metrics.rtp_bytes_sent(ty, sent[type_slot(ty)]);
                 }
             }
-            // What the node's budget counts is on the wire: the IP and UDP headers add 28 bytes.
-            self.cfg
-                .egress
-                .add(sent.iter().sum::<u64>() + writes * 28, writes);
             for sub in switched {
                 self.complete_switch(sk, sub);
             }

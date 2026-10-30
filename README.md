@@ -48,14 +48,36 @@ What the receivers experience, read from the connection statistics of each sessi
 | `rtcd_rtc_screen_layer_seconds_total{layer}` | seconds receivers spent on the small and the large layer of a shared screen (`rate()` is the number of receivers on each) |
 | `rtcd_rtc_keyframe_requests_total{result}` | keyframes asked of senders, `sent` or `held_back` (asked a moment ago) |
 
+The node itself, the same figures as `GET /system` (read when the metrics are, gauges unless it says
+counter; the host figures average the last five seconds):
+
+| metric | what it is |
+|---|---|
+| `rtcd_sessions`, `rtcd_shards`, `rtcd_shards_pressured`, `rtcd_shards_saturated` | sessions, the threads serving them, and how many of those shed load or refuse new sessions |
+| `rtcd_egress_bps`, `rtcd_egress_pps` | what the shards hand to their sockets, link-layer headers included (the card's own counter is `rtcd_host_tx_bps`) |
+| `rtcd_egress_ceiling_bps`, `rtcd_egress_ceiling_pps` | the rate at which the kernel started refusing datagrams, as the node learned it (0 until it has) |
+| `rtcd_egress_squeezed`, `rtcd_egress_refusing`, `rtcd_egress_choked` | 1 while video is held to the small layers; while the kernel refuses datagrams (recording uploads slow down); while it keeps refusing after the squeeze (one voice per call) |
+| `rtcd_kernel_send_drops_total` (counter) | datagrams the kernel refused to queue (UDP `SndbufErrors`), from when the process first read the count |
+| `rtcd_host_cpu_load`, `rtcd_host_cpu_busiest` | busy share of all CPUs and of the busiest one (waiting for I/O counts as idle) |
+| `rtcd_host_cpu_iowait`, `rtcd_host_cpu_softirq` | share of all CPU time waiting for I/O, and in the kernel's deferred work (sending and receiving packets) |
+| `rtcd_host_mem_used`, `rtcd_host_mem_total_bytes`, `rtcd_host_mem_available_bytes` | memory in use as a share (what the kernel could not hand out without swapping or killing), and the figures it is made of |
+| `rtcd_rss_limit_bytes` | what the process's control group may hold (0: none); its use is `rtcd_process_resident_memory_bytes` |
+| `rtcd_host_tx_bps`, `rtcd_host_tx_pps`, `rtcd_host_tx_dropped_pps` | what the default-route network interface sends and its driver drops, everything on the machine counted (media, recording uploads, the rest) |
+
 What is spent on the wire: only video takes part in the bandwidth estimate, so voice packets carry no
 transport-wide sequence number (8 bytes on a 65-byte packet, both ways) and nobody reports on them.
 
 ## Running several instances
 
-`GET /system` returns `cpu_load` (the Go service's key) and, in addition, `sessions` and `shards`, so
-whatever places new calls (the LMS server does, from its DNS-discovered pool) can send them to the
-lighter instance. Calls stay on the instance they start on.
+`GET /system` returns `cpu_load` (the Go service's key, the busy share of all CPUs over the last
+five seconds) and, in addition, `sessions` and `shards`, so whatever places new calls (the LMS server
+does, from its DNS-discovered pool) can send them to the lighter instance. Calls stay on the instance
+they start on. For admitting more work (recordings) it also has `cpu_busiest` (the busiest single
+CPU), `cpu_iowait`, `cpu_softirq`, and memory: `mem_used` (the share of the machine's RAM in use, from
+`MemAvailable`), `mem_total_bytes`, `mem_available_bytes`, `rss_bytes` (this process) and
+`rss_limit_bytes` (its control group's limit, 0 for none). `host_tx_bps`, `host_tx_pps` and
+`host_tx_dropped_pps` are the network interface's own counters. Every key is also a metric (see
+above).
 
 Within an instance, threads called shards serve the calls, and a call lives on one of them. With
 `RTCD_RTC_SHARDS=0` (the default) the number follows the load, from two shards (one where there
@@ -123,14 +145,23 @@ shards add what they send to one gauge, and when its smoothed rate reaches 85 % 
 receiver's cameras and screen shares fall back to their small layer (no renegotiation, the same
 switch a receiver's own request makes); they go back up only after the rate has stayed under 65 %
 for twenty seconds, so the drop itself does not release it. 0 (the default) sets no budget, and the
-node finds its own ceiling instead: the first time the kernel refuses datagrams (50 or more a
-second, `SndbufErrors`) the rate it was sending becomes the ceiling, at 90 % of that rate, the
+node finds its own ceiling instead: when the kernel refuses datagrams (50 or more a
+second, `SndbufErrors`) for two seconds in a row (one burst, a keyframe sent to a whole class, is not
+a ceiling) the rate it was sending becomes the ceiling, at 90 % of that rate, the
 squeeze starts at once, and the ceiling is lifted by a tenth after every five quiet minutes, so a
 node is held to what its network can carry now and not to its worst moment. A refusal at the
 ceiling teaches a lower one; one while squeezed well below it does not. A budget that is set
 still applies, whichever is lower. `GET /system` reports `egress_bps`, `egress_squeezed` and the
 learned `egress_ceiling_bps` and `egress_ceiling_pps` (0 until the kernel has refused something),
 for whatever places new calls (`src/egress.rs`).
+
+The squeeze is the same whether a budget or the learned ceiling causes it: small video layers and two
+voices a call. It takes the bits down and leaves most of the packets, voice, so a kernel that goes on
+refusing for five seconds after the squeeze (`egress_choked`) cuts calls to their loudest voice until
+it has accepted everything for ten seconds. While the kernel refuses (`egress_refusing`) recording
+uploads, which share the card and can wait, go at a quarter of their rate. The rate is what the shards
+hand to their sockets, link-layer headers included: receiver reports, retransmissions, ICE and DTLS
+are in it with the media, as the card carries them.
 
 The card has a second ceiling, in packets: `RTCD_RTC_EGRESSBUDGETPPS=N` (`rtc.egress_budget_pps`)
 is the same rule for packets per second, and either budget squeezes. Voice packets are about 100
@@ -145,8 +176,9 @@ brought the node to its ceiling is cut where it is largest.
 
 The kernel does not tell the sender: a datagram the transmit queue refuses is counted
 (`UdpSndbufErrors`) and `sendmmsg` still succeeds, so the node counted those packets as sent.
-`GET /system` therefore reports `kernel_send_drops` (that counter since the start) and `egress_pps`;
-a node whose `kernel_send_drops` grows is sending more than its card takes.
+`GET /system` therefore reports `kernel_send_drops` (that counter since the process first read it) and
+`egress_pps`; a node whose `kernel_send_drops` grows is sending more than its card takes. The
+counter is the network namespace's, so it also counts what other processes in it were refused.
 
 ## Large calls: a shard with no room
 

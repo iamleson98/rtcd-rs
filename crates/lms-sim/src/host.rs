@@ -197,6 +197,11 @@ impl Rtcd {
         let reports = self.reports.clone();
         tokio::spawn(async move {
             while let Some(Ok(m)) = read.next().await {
+                // The owner of the connection is gone (it left): hang up, as a browser closing its
+                // tab does, instead of answering the service's pings for ever.
+                if in_tx.is_closed() {
+                    break;
+                }
                 if let WsMessage::Binary(b) = m
                     && let Ok(msg) = ClientMessage::unpack(&b)
                 {

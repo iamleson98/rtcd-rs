@@ -5,7 +5,12 @@
 //! ```text
 //! lms-sim run --recorder ./recorder --label rust --duration 30 --people 8 --cameras 6 --screens 1
 //! lms-sim run --builtin --label builtin --duration 30 --people 30 --cameras 10 --screens 1
+//! lms-sim soak --classes 40 --people 12 --cameras 4 --screens 1 --seconds 20 --record
 //! ```
+//!
+//! `soak` runs class after class and reports the resident set after each, to find a leak.
+
+mod soak;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -148,6 +153,11 @@ fn ffprobe(path: &Path) -> Value {
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("soak") {
+        let assets = std::env::temp_dir().join("lms-sim-assets");
+        soak::run(std::env::args().skip(2), assets).await;
+        return;
+    }
     let a = match parse() {
         Ok(a) => a,
         Err(e) => {

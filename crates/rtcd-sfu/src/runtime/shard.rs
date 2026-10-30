@@ -828,12 +828,20 @@ impl Shard {
                 Proto::Udp => {
                     self.traffic.udp_out_bytes += t.data.len() as u64;
                     self.traffic.udp_out_packets += 1;
+                    self.cfg
+                        .engine
+                        .egress
+                        .add_datagram(t.data.len(), t.peer, false);
                     let idx = self.udp_index(t.local).unwrap_or(0);
                     self.send[idx].push(t.peer, t.data);
                 }
                 Proto::Tcp => {
                     self.traffic.tcp_out_bytes += t.data.len() as u64;
                     self.traffic.tcp_out_packets += 1;
+                    self.cfg
+                        .engine
+                        .egress
+                        .add_datagram(t.data.len(), t.peer, true);
                     self.tcp_send(t.peer, &t.data)
                 }
             }

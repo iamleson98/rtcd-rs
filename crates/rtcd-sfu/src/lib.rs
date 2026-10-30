@@ -4,6 +4,8 @@ pub mod config;
 pub mod egress;
 pub mod engine;
 pub mod hostcpu;
+pub mod hostmem;
+pub mod hostnet;
 pub mod ids;
 pub mod layers;
 pub mod loudest;

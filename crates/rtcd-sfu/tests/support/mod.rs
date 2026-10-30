@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -136,6 +137,9 @@ impl Browser {
 pub struct World {
     pub now: Instant,
     pub engine: Engine,
+    /// The node's send gauge, which the shards would feed from their sockets: the world is the
+    /// engine's only socket.
+    egress: Arc<rtcd_sfu::egress::Gauge>,
     pub server: SocketAddr,
     pub browsers: Vec<Browser>,
     pub closed: Vec<(String, CloseReason)>,
@@ -150,6 +154,18 @@ pub struct World {
     /// Called just before the world calls into the engine, with `"datagram"` or `"timeout"` and
     /// `true`, and just after with `false`: for tests that measure the engine alone.
     pub around_engine: fn(&'static str, bool),
+}
+
+/// A node with no send budget whose kernel refuses the number of datagrams `refused` says it has
+/// refused so far: the tests raise it as time goes by.
+pub fn config_with_refusals(refused: &Arc<AtomicU64>) -> EngineConfig {
+    let refused = refused.clone();
+    EngineConfig {
+        egress: Arc::new(rtcd_sfu::egress::Gauge::with_kernel_drops(move || {
+            Some(refused.load(Ordering::Relaxed))
+        })),
+        ..engine_config()
+    }
 }
 
 pub fn engine_config() -> EngineConfig {
@@ -200,8 +216,10 @@ impl World {
             .try_init();
         cfg.validate().unwrap();
         let cfg_server = cfg.addresses[0].advertised_udp();
+        let egress = cfg.egress.clone();
         World {
             now: Instant::now(),
+            egress,
             engine: Engine::new(Arc::new(cfg), metrics, Rng::seeded(7)),
             server: cfg_server,
             browsers: Vec::new(),
@@ -494,6 +512,7 @@ impl World {
             // The engine's output to the browsers.
             while let Some(t) = self.engine.poll_transmit() {
                 moved = true;
+                self.egress.add_datagram(t.data.len(), t.peer, false);
                 if self.blackhole {
                     continue;
                 }
