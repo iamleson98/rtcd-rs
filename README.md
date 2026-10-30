@@ -145,8 +145,9 @@ shards add what they send to one gauge, and when its smoothed rate reaches 85 % 
 receiver's cameras and screen shares fall back to their small layer (no renegotiation, the same
 switch a receiver's own request makes); they go back up only after the rate has stayed under 65 %
 for twenty seconds, so the drop itself does not release it. 0 (the default) sets no budget, and the
-node finds its own ceiling instead: the first time the kernel refuses datagrams (50 or more a
-second, `SndbufErrors`) the rate it was sending becomes the ceiling, at 90 % of that rate, the
+node finds its own ceiling instead: when the kernel refuses datagrams (50 or more a
+second, `SndbufErrors`) for two seconds in a row (one burst, a keyframe sent to a whole class, is not
+a ceiling) the rate it was sending becomes the ceiling, at 90 % of that rate, the
 squeeze starts at once, and the ceiling is lifted by a tenth after every five quiet minutes, so a
 node is held to what its network can carry now and not to its worst moment. A refusal at the
 ceiling teaches a lower one; one while squeezed well below it does not. A budget that is set

@@ -54,6 +54,10 @@ const WINDOW: Duration = Duration::from_secs(1);
 /// A window in which the kernel refused at least this many datagrams a second taught the node
 /// where its ceiling is (one stray refusal is not a ceiling).
 const DROPS_PER_SEC: f64 = 50.0;
+/// ...in this many windows in a row: a burst (a keyframe fanned out to a whole class) overflows the
+/// queue for a moment without the rate being too high, and a ceiling learned from it would hold
+/// calls back for the hour it takes to lift.
+const LEARN_AFTER: u32 = 2;
 /// The learned ceiling is this share of the rate the node was sending when the kernel refused.
 const LEARNED_SHARE: f64 = 0.9;
 /// A refusal at a rate this close to the learned ceiling, or above it, teaches a lower one; below
@@ -92,6 +96,8 @@ struct State {
     ceiling_at: Option<Instant>,
     /// The kernel's count when the node first read it: refusals before that were not ours.
     drops_base: Option<u64>,
+    /// Windows in a row in which the kernel refused enough datagrams to matter.
+    refusal_windows: u32,
     /// The last window in which the kernel refused enough datagrams to matter, and the first of
     /// the run of them it belongs to.
     refusing_at: Option<Instant>,
@@ -320,10 +326,14 @@ fn lower_of(budget: u64, learned: f64) -> u64 {
 }
 
 /// What the kernel's refusals teach, given how many it made a second during the window just
-/// measured: a ceiling where there was none or a lower one, the squeeze at once, and a notch
-/// back up after a long quiet.
+/// measured: after [`LEARN_AFTER`] such windows in a row a ceiling where there was none or a lower
+/// one, with the squeeze at once, and a notch back up after a long quiet.
 fn learn(st: &mut State, now: Instant, refused_per_sec: f64) {
     if refused_per_sec >= DROPS_PER_SEC {
+        st.refusal_windows += 1;
+        if st.refusal_windows < LEARN_AFTER {
+            return;
+        }
         let near = |rate: f64, learned: f64| learned == 0.0 || rate >= learned * RELEARN_NEAR;
         if near(st.rate_bps, st.learned_bps) || near(st.rate_pps, st.learned_pps) {
             st.learned_bps = LEARNED_SHARE * st.rate_bps;
@@ -332,12 +342,15 @@ fn learn(st: &mut State, now: Instant, refused_per_sec: f64) {
         st.squeezed = true;
         st.calm_since = None;
         st.ceiling_at = Some(now);
-    } else if st.learned_bps > 0.0 || st.learned_pps > 0.0 {
-        let since = *st.ceiling_at.get_or_insert(now);
-        if now.saturating_duration_since(since) >= GROW_AFTER {
-            st.learned_bps *= GROW_BY;
-            st.learned_pps *= GROW_BY;
-            st.ceiling_at = Some(now);
+    } else {
+        st.refusal_windows = 0;
+        if st.learned_bps > 0.0 || st.learned_pps > 0.0 {
+            let since = *st.ceiling_at.get_or_insert(now);
+            if now.saturating_duration_since(since) >= GROW_AFTER {
+                st.learned_bps *= GROW_BY;
+                st.learned_pps *= GROW_BY;
+                st.ceiling_at = Some(now);
+            }
         }
     }
 }
@@ -582,6 +595,27 @@ mod tests {
     }
 
     #[test]
+    fn one_burst_of_refusals_is_not_a_ceiling() {
+        let g = Gauge::default();
+        let mut now = Instant::now();
+        let mut refused = 0;
+        g.update_with(now, 0, 0, Some(refused));
+        run_refusing(&g, &mut now, 10, 300, &mut refused, 0);
+        // A keyframe fanned out to a class: one window of refusals at a modest rate.
+        run_refusing(&g, &mut now, 1, 300, &mut refused, 20_000);
+        run_refusing(&g, &mut now, 10, 300, &mut refused, 0);
+        assert_eq!(g.ceiling_bps(), 0);
+        assert!(!g.squeezed());
+        // Two in a row are a ceiling, even with calm between the pairs.
+        run_refusing(&g, &mut now, 1, 600, &mut refused, 20_000);
+        run_refusing(&g, &mut now, 3, 600, &mut refused, 0);
+        run_refusing(&g, &mut now, 1, 600, &mut refused, 20_000);
+        assert_eq!(g.ceiling_bps(), 0, "the windows were not in a row");
+        run_refusing(&g, &mut now, 1, 600, &mut refused, 20_000);
+        assert!(g.ceiling_bps() > 0 && g.squeezed());
+    }
+
+    #[test]
     fn the_squeeze_that_follows_a_refusal_is_released_when_the_rate_falls() {
         let g = Gauge::default();
         let mut now = Instant::now();
@@ -727,7 +761,8 @@ mod tests {
         let mut now = Instant::now();
         let mut refused = 0;
         g.update_with(now, 0, 0, Some(refused));
-        run_refusing(&g, &mut now, 2, 700, &mut refused, 5_000);
+        // (The first window only takes the kernel's count as the base.)
+        run_refusing(&g, &mut now, 3, 700, &mut refused, 5_000);
         run_refusing(&g, &mut now, 20, 300, &mut refused, 0);
         assert!(g.squeezed());
         assert!(!g.choked());
