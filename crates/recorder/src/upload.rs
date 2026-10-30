@@ -1,8 +1,7 @@
 //! Each file of a recording is uploaded as an object of its own, numbered by its place in the
-//! manifest. The server says where each one goes: with direct access, straight to storage at URLs
+//! recording. The server says where each one goes: with direct access, straight to storage at URLs
 //! it presigns (the bytes leave the cluster once, and never pass through the server), otherwise to
-//! the server. Asking for those URLs a batch at a time also tells the server the upload is still
-//! going.
+//! the server.
 
 use std::io::SeekFrom;
 use std::path::Path;
@@ -15,16 +14,12 @@ use reqwest::{Body, Method};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::api::{Api, ApiError};
 use crate::media::Entry;
 use crate::throttle::Throttle;
 
-/// The most files the server takes in one request for URLs; the byte limit keeps a batch short
-/// enough that the next request comes well within the server's patience.
-const BATCH_FILES: usize = 1000;
-const BATCH_BYTES: u64 = 256 << 20;
 /// The slowest an upload may go before it is cut off (and retried): far below the cluster's capped
 /// 10 Mb/s.
 const UPLOAD_RATE: u64 = 256 << 10;
@@ -42,16 +37,12 @@ fn request_timeout(size: u64, throttle: Option<&Throttle>) -> Duration {
     Duration::from_secs(60 + (size as f64 / rate) as u64)
 }
 
-/// How many files, and how many parts of one file, are in flight at once. One connection to
-/// storage carries a few MB/s, far below what the node's link does, and the recording is not
-/// watchable before the last byte is in.
-const FILES_AT_ONCE: usize = 4;
+/// How many parts of one file are in flight at once. One connection to storage carries a few MB/s,
+/// far below what the node's link does.
 const PARTS_AT_ONCE: usize = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum UploadError {
-    #[error("the recording is empty")]
-    Empty,
     #[error("{0}")]
     Protocol(String),
     #[error("file {index}: {source}")]
@@ -69,16 +60,6 @@ pub enum UploadError {
     Api(#[from] ApiError),
     #[error("{0}")]
     Io(#[from] std::io::Error),
-}
-
-/// Orders the files along the timeline (their order in the manifest, and so their numbers) and
-/// fills in their sizes.
-pub fn manifest_files(mut files: Vec<Entry>) -> std::io::Result<Vec<Entry>> {
-    files.sort_by_key(|f| f.start_ms);
-    for f in &mut files {
-        f.size = std::fs::metadata(&f.path)?.len();
-    }
-    Ok(files)
 }
 
 #[derive(Serialize)]
@@ -141,83 +122,6 @@ fn expired(e: &UploadError) -> bool {
 }
 
 impl Api {
-    /// Sends every file and returns the uploads in parts to finish. The biggest go first, so the
-    /// last to finish is never a big one started late.
-    pub async fn upload(&self, files: &[Entry]) -> Result<Vec<MultipartDone>, UploadError> {
-        if files.is_empty() {
-            return Err(UploadError::Empty);
-        }
-        let mut multipart = Vec::new();
-        let mut start = 0;
-        while start < files.len() {
-            let (mut end, mut size) = (start, 0u64);
-            while end < files.len()
-                && end - start < BATCH_FILES
-                && (end == start || size + files[end].size <= BATCH_BYTES)
-            {
-                size += files[end].size;
-                end += 1;
-            }
-            let batch: Vec<_> = (start..end)
-                .map(|n| UploadRequest {
-                    index: n,
-                    kind: &files[n].kind,
-                    size: files[n].size,
-                    upload_id: "",
-                    first_part: 0,
-                })
-                .collect();
-            let targets = self.targets(&batch).await?;
-            let done = if !targets.direct {
-                let mut order: Vec<usize> = (start..end).collect();
-                order.sort_by_key(|&n| std::cmp::Reverse(files[n].size));
-                self.in_parallel(order.into_iter().map(|n| async move {
-                    self.upload_to_server(n, &files[n])
-                        .await
-                        .map_err(|e| UploadError::File {
-                            index: n,
-                            source: Box::new(e),
-                        })?;
-                    Ok(None)
-                }))
-                .await?
-            } else {
-                if targets.uploads.len() != batch.len() {
-                    return Err(UploadError::Protocol(format!(
-                        "asked where {} files go, told {}",
-                        batch.len(),
-                        targets.uploads.len()
-                    )));
-                }
-                let mut uploads = targets.uploads;
-                for t in &uploads {
-                    if t.index < start || t.index >= end {
-                        return Err(UploadError::Protocol(format!(
-                            "told where file {} goes, not asked",
-                            t.index
-                        )));
-                    }
-                }
-                uploads.sort_by_key(|t| std::cmp::Reverse(files[t.index].size));
-                self.in_parallel(uploads.into_iter().map(|t| async move {
-                    let n = t.index;
-                    self.send_direct(n, &files[n], t)
-                        .await
-                        .map_err(|e| UploadError::File {
-                            index: n,
-                            source: Box::new(e),
-                        })
-                }))
-                .await?
-            };
-            multipart.extend(done.into_iter().flatten());
-            info!(files = end, of = files.len(), "uploaded files");
-            start = end;
-        }
-        multipart.sort_by_key(|m| m.index);
-        Ok(multipart)
-    }
-
     /// Sends one file as object `index`, wherever the server says it goes, and returns the upload
     /// in parts for the server to finish, if it was one. For a recording whose files are uploaded
     /// as they close, so their numbers are not their places in a list.
@@ -271,20 +175,6 @@ impl Api {
                 })
             })
         }
-    }
-
-    /// Runs the uploads a few at a time; the first failure ends them all.
-    async fn in_parallel<F>(
-        &self,
-        jobs: impl Iterator<Item = F>,
-    ) -> Result<Vec<Option<MultipartDone>>, UploadError>
-    where
-        F: Future<Output = Result<Option<MultipartDone>, UploadError>>,
-    {
-        stream::iter(jobs)
-            .buffer_unordered(FILES_AT_ONCE)
-            .try_collect()
-            .await
     }
 
     async fn targets(&self, files: &[UploadRequest<'_>]) -> Result<Targets, UploadError> {
@@ -508,6 +398,7 @@ mod tests {
     }
 
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use serde_json::{Value, json};
 
@@ -534,56 +425,58 @@ mod tests {
                 end_ms: start + 1,
                 width: 0,
                 height: 0,
-                size: 0,
+                size: bodies[i].len() as u64,
                 path,
             });
         }
-        (manifest_files(entries).unwrap(), bodies)
+        (entries, bodies)
     }
 
     #[tokio::test]
     async fn files_go_straight_to_storage_in_parts_when_the_server_says_so() {
         let (files, bodies) = files("direct");
-        let fake = Fake::start(|r, attempt, site| {
+        let voice_asked = AtomicBool::new(false);
+        let fake = Fake::start(move |r, attempt, site| {
             match r.path.as_str() {
                 p if p == format!("{REC_PATH}/uploads") => {
                     let v: Value = serde_json::from_slice(&r.body).unwrap();
-                    let asked = v["files"].as_array().unwrap();
+                    let asked = &v["files"][0];
                     let part = |n: u64| json!({"number": n, "url": format!("{site}/store/up/{n}")});
+                    if asked["index"] == 0 {
+                        let url = if voice_asked.swap(true, Ordering::SeqCst) {
+                            "voice-again"
+                        } else {
+                            "voice"
+                        };
+                        return (200, Some(json!({"direct": true, "uploads": [
+                            {"index": 0, "content_type": "audio/webm", "url": format!("{site}/store/{url}")}
+                        ]})));
+                    }
                     let mut camera = json!({"index": 1, "content_type": "video/webm", "upload_id": "up", "part_size": 10});
-                    if asked.len() == 2 {
-                        camera["parts"] = json!([part(1), part(2)]);
-                        return (200, Some(json!({"direct": true, "uploads": [
-                            {"index": 0, "content_type": "audio/webm", "url": format!("{site}/store/voice")},
-                            camera
-                        ]})));
-                    }
-                    if asked[0]["index"] == 0 {
-                        return (200, Some(json!({"direct": true, "uploads": [
-                            {"index": 0, "content_type": "audio/webm", "url": format!("{site}/store/voice-again")}
-                        ]})));
-                    }
-                    camera["parts"] = json!([part(asked[0]["first_part"].as_u64().unwrap())]);
+                    camera["parts"] = match asked["first_part"].as_u64() {
+                        None => json!([part(1), part(2)]),
+                        Some(n) => json!([part(n)]),
+                    };
                     (200, Some(json!({"direct": true, "uploads": [camera]})))
                 }
-                // Its URL ran out: the recorder asks for a fresh one.
+                // Its URL ran out: the recording asks for a fresh one.
                 "/store/voice" => (403, None),
                 "/store/up/2" if attempt == 1 => (502, None),
                 _ => (200, None),
             }
         })
         .await;
-        let multipart = fake.api().upload(&files).await.unwrap();
+        let api = fake.api();
+        assert_eq!(api.upload_file(0, &files[0]).await.unwrap(), None);
         assert_eq!(
-            multipart,
-            [MultipartDone {
+            api.upload_file(1, &files[1]).await.unwrap(),
+            Some(MultipartDone {
                 index: 1,
                 upload_id: "up".into()
-            }]
+            })
         );
 
         let seen = fake.seen();
-        // Files and parts go at the same time: what was sent, not in which order.
         let mut calls: Vec<String> = seen
             .iter()
             .map(|r| {
@@ -598,6 +491,7 @@ mod tests {
         assert_eq!(
             calls,
             [
+                "POST /uploads",
                 "POST /uploads",
                 "POST /uploads",
                 "POST /uploads",
@@ -646,21 +540,25 @@ mod tests {
         })
         .await;
         let api = fake.api();
-        let multipart = api.upload(&files).await.unwrap();
-        api.complete(Duration::from_millis(93_500), &files, &multipart)
-            .await
-            .unwrap();
+        for (index, file) in files.iter().enumerate() {
+            assert_eq!(api.upload_file(index, file).await.unwrap(), None);
+        }
 
         let seen = fake.seen();
-        let mut calls: Vec<String> = seen
+        let calls: Vec<String> = seen
             .iter()
             .map(|r| format!("{} {}", r.method, r.path.strip_prefix(REC_PATH).unwrap()))
             .collect();
-        // The two files go at the same time, the biggest started first; the completion comes last.
-        assert_eq!(calls.pop().as_deref(), Some("POST /complete"));
-        assert_eq!(calls.remove(0), "POST /uploads");
-        calls.sort();
-        assert_eq!(calls, ["PUT /files/0", "PUT /files/1", "PUT /files/1"]);
+        assert_eq!(
+            calls,
+            [
+                "POST /uploads",
+                "PUT /files/0",
+                "POST /uploads",
+                "PUT /files/1",
+                "PUT /files/1"
+            ]
+        );
         assert!(seen.iter().all(|r| r.auth == "Bearer bot-token"));
         let sent = |path: &str| -> Vec<Vec<u8>> {
             seen.iter()
@@ -674,12 +572,6 @@ mod tests {
             [bodies[1].clone(), bodies[1].clone()],
             "the file is sent whole again after a failure"
         );
-        let body: Value = serde_json::from_slice(&seen.last().unwrap().body).unwrap();
-        assert_eq!(body["duration_ms"], 93_500);
-        assert_eq!(body["files"].as_array().unwrap().len(), 2);
-        assert_eq!(body["files"][1]["size"], 25);
-        assert_eq!(body["files"][0]["kind"], "voice");
-        assert_eq!(body["multipart"], json!([]));
     }
 
     #[tokio::test]
@@ -773,7 +665,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("big");
         std::fs::write(&path, vec![7u8; 600_000]).unwrap();
-        let entry = manifest_files(vec![Entry {
+        let entry = Entry {
             kind: VOICE.into(),
             session_id: String::new(),
             user_id: String::new(),
@@ -781,10 +673,9 @@ mod tests {
             end_ms: 1,
             width: 0,
             height: 0,
-            size: 0,
+            size: 600_000,
             path,
-        }])
-        .unwrap();
+        };
         let fake = Fake::start(|r, _, _| {
             if r.path.ends_with("/uploads") {
                 (200, Some(json!({"direct": false, "uploads": []})))
@@ -800,22 +691,18 @@ mod tests {
                 1_000_000,
             )));
         let started = std::time::Instant::now();
-        api.upload_file(0, &entry[0]).await.unwrap();
+        api.upload_file(0, &entry).await.unwrap();
         let took = started.elapsed();
         assert!(took >= Duration::from_millis(300), "{took:?}");
         assert_eq!(fake.seen().last().unwrap().body.len(), 600_000);
     }
 
     #[tokio::test]
-    async fn a_refusal_ends_the_upload_and_an_empty_recording_is_an_error() {
+    async fn a_refusal_ends_the_upload() {
         let (files, _) = files("refused");
         let fake = Fake::start(|_, _, _| (409, None)).await;
-        assert!(fake.api().upload(&files).await.is_err());
+        assert!(fake.api().upload_file(0, &files[0]).await.is_err());
         assert_eq!(fake.seen().len(), 1, "a 4xx is not retried");
-        assert!(matches!(
-            fake.api().upload(&[]).await,
-            Err(UploadError::Empty)
-        ));
     }
 
     #[tokio::test]
@@ -824,41 +711,7 @@ mod tests {
         let fake = Fake::start(|_, _, _| (503, None)).await;
         let mut api = fake.api();
         api.retries = 3;
-        assert!(api.upload(&files).await.is_err());
+        assert!(api.upload_file(0, &files[0]).await.is_err());
         assert_eq!(fake.seen().len(), 4, "the first try and three retries");
-    }
-
-    #[test]
-    fn the_manifest_is_in_timeline_order_with_sizes() {
-        let dir = std::env::temp_dir().join(format!("upload-{}-manifest", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let write = |name: &str, body: &str| {
-            let p = dir.join(name);
-            std::fs::write(&p, body).unwrap();
-            p
-        };
-        let entry = |kind: &str, start: i64, path: PathBuf| Entry {
-            kind: kind.into(),
-            session_id: String::new(),
-            user_id: String::new(),
-            start_ms: start,
-            end_ms: 0,
-            width: 0,
-            height: 0,
-            size: 0,
-            path,
-        };
-        let got = manifest_files(vec![
-            entry("screen", 0, write("screen", "SCREEN")),
-            entry("camera", 500, write("cam", "CAMERA")),
-            entry("voice", 100, write("voice", "VO")),
-        ])
-        .unwrap();
-        let got: Vec<String> = got
-            .iter()
-            .map(|f| format!("{}:{}", f.kind, f.size))
-            .collect();
-        assert_eq!(got, ["screen:6", "voice:2", "camera:6"]);
-        assert!(manifest_files(vec![entry("screen", 0, dir.join("gone"))]).is_err());
     }
 }

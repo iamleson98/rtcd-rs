@@ -152,10 +152,6 @@ impl Recording {
         self.start
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
     /// The path of the next file, `None` once the limit of files is reached.
     pub fn new_path(&self, kind: &str) -> Option<PathBuf> {
         let max = self.max_files;
@@ -321,15 +317,6 @@ impl StreamRecorder {
         }
     }
 
-    /// Whether a file of this stream is open.
-    pub fn is_writing(&self) -> bool {
-        self.seg.is_some()
-    }
-
-    pub fn info(&self) -> &StreamInfo {
-        &self.info
-    }
-
     /// Takes a packet, which arrived when it says. Returns whether the sender should be asked for
     /// a keyframe.
     pub fn packet(&mut self, p: TapPacket) -> bool {
@@ -388,11 +375,6 @@ impl StreamRecorder {
             return true;
         }
         false
-    }
-
-    /// When [`Self::tick`] next has something to do because of a gap.
-    pub fn deadline(&self) -> Option<Instant> {
-        self.reorder.deadline()
     }
 
     /// Writes what is ready at `now`; gaps are given up as if it were `give_up_at` (the end of the

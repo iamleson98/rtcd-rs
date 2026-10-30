@@ -184,7 +184,7 @@ fn hopeless(e: &UploadError) -> bool {
         UploadError::Api(a) => !a.retryable(),
         UploadError::File { source, .. } | UploadError::Part { source, .. } => hopeless(source),
         UploadError::Protocol(_) => true,
-        UploadError::Empty | UploadError::Io(_) => false,
+        UploadError::Io(_) => false,
     }
 }
 

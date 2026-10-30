@@ -1,19 +1,14 @@
-//! The LMS recorder endpoints, called with the bot session made for this recording
+//! The LMS recorder endpoints that take a recording's files, called with the bot session made for this recording
 //! (`/api/v4/lms/recorder/recordings/{id}/...`), and storage, called with the URLs the server
 //! presigns.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::{Client, Method, RequestBuilder, StatusCode};
-use serde::Serialize;
+use reqwest::{Client, Method, RequestBuilder};
 use serde::de::DeserializeOwned;
-use tracing::error;
 
-use crate::config::Config;
-use crate::media::Entry;
 use crate::throttle::Throttle;
-use crate::upload::MultipartDone;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
@@ -55,7 +50,7 @@ impl From<reqwest::Error> for ApiError {
 }
 
 /// TLS (the server may be reached over https) runs on ring; the process chooses it once.
-pub fn install_tls_provider() {
+fn install_tls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
@@ -93,7 +88,6 @@ impl Default for HttpClients {
 
 #[derive(Clone)]
 pub struct Api {
-    pub(crate) site: String,
     pub(crate) base: String,
     pub(crate) token: String,
     pub(crate) client: Client,
@@ -115,29 +109,7 @@ impl std::fmt::Debug for Api {
     }
 }
 
-/// What the recorder needs to know about its recording.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct Room {
-    #[serde(default)]
-    pub session_id: String,
-    #[serde(default)]
-    pub chat_channel_id: String,
-    #[serde(default)]
-    pub stop_at: i64,
-    #[serde(default)]
-    pub status: String,
-}
-
 impl Api {
-    pub fn new(cfg: &Config) -> Self {
-        Self::with_clients(
-            &HttpClients::new(),
-            &cfg.site_url,
-            &cfg.recording_id,
-            &cfg.auth_token,
-        )
-    }
-
     /// The API of one recording, called with its bot session's `token`, through `clients`.
     pub fn with_clients(
         clients: &HttpClients,
@@ -148,7 +120,6 @@ impl Api {
         let site = site_url.trim_end_matches('/').to_owned();
         Self {
             base: format!("{site}/api/v4/lms/recorder/recordings/{recording_id}"),
-            site,
             token: token.to_owned(),
             client: clients.client.clone(),
             uploads: clients.uploads.clone(),
@@ -193,125 +164,5 @@ impl Api {
 
     pub(crate) async fn json<T: DeserializeOwned>(req: RequestBuilder) -> Result<T, ApiError> {
         Ok(Self::send(req).await?.json().await?)
-    }
-
-    pub async fn room(&self) -> Result<Room, ApiError> {
-        Self::json(self.authed(Method::GET, &self.base)).await
-    }
-
-    /// Whether the channel has a call in progress (the server answers 404 when it has none).
-    pub async fn call_active(&self, channel_id: &str) -> Result<bool, ApiError> {
-        let url = format!("{}/api/v4/calls/channels/{channel_id}", self.site);
-        match Self::send(self.authed(Method::GET, &url)).await {
-            Ok(_) => Ok(true),
-            Err(e) if e.status() == Some(StatusCode::NOT_FOUND.as_u16()) => Ok(false),
-            Err(e) => Err(e),
-        }
-    }
-
-    async fn post_json(&self, path: &str, body: &impl Serialize) -> Result<(), ApiError> {
-        Self::send(
-            self.authed(Method::POST, &format!("{}{path}", self.base))
-                .json(body),
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// Reports that capture began.
-    pub async fn started(&self) -> Result<(), ApiError> {
-        self.post_json("/started", &serde_json::json!({})).await
-    }
-
-    /// Reports the recording's length, its files (in manifest order) and the uploads in parts to
-    /// finish once every file is uploaded.
-    pub async fn complete(
-        &self,
-        duration: Duration,
-        files: &[Entry],
-        multipart: &[MultipartDone],
-    ) -> Result<(), ApiError> {
-        self.post_json(
-            "/complete",
-            &serde_json::json!({
-                "duration_ms": duration.as_millis().max(1) as u64,
-                "files": files,
-                "multipart": multipart,
-            }),
-        )
-        .await
-    }
-
-    /// Gives the recording up; the server tells the teacher.
-    pub async fn fail(&self, reason: &str) {
-        if let Err(e) = self
-            .post_json("/fail", &serde_json::json!({ "error": reason }))
-            .await
-        {
-            error!(error = %e, "could not report the failure");
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::testing::{Fake, REC_PATH};
-
-    #[tokio::test]
-    async fn fail_reports_the_reason() {
-        let fake = Fake::start(|_, _, _| (200, None)).await;
-        fake.api().fail("no room").await;
-        let seen = fake.seen();
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].path, format!("{REC_PATH}/fail"));
-        assert!(String::from_utf8_lossy(&seen[0].body).contains(r#""error":"no room""#));
-        assert_eq!(seen[0].auth, "Bearer bot-token");
-
-        // A refusal is logged, not raised.
-        Fake::start(|_, _, _| (409, None))
-            .await
-            .api()
-            .fail("x")
-            .await;
-    }
-
-    #[tokio::test]
-    async fn call_active_reads_the_status() {
-        for (status, want) in [(200, true), (404, false)] {
-            let fake = Fake::start(move |_, _, _| (status, None)).await;
-            assert_eq!(
-                fake.api().call_active("chan").await.unwrap(),
-                want,
-                "status {status}"
-            );
-            assert_eq!(fake.seen()[0].path, "/api/v4/calls/channels/chan");
-        }
-        let fake = Fake::start(|_, _, _| (500, None)).await;
-        assert!(
-            fake.api().call_active("chan").await.is_err(),
-            "a server error is an error, not 'no call'"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_room_is_read_with_the_bot_token() {
-        let fake = Fake::start(|_, _, _| {
-            (200, Some(serde_json::json!({"session_id": "s1", "chat_channel_id": "c1", "stop_at": 5, "status": "RECORDING"})))
-        })
-        .await;
-        let api = fake.api();
-        let room = api.room().await.unwrap();
-        assert_eq!(
-            (
-                room.session_id.as_str(),
-                room.chat_channel_id.as_str(),
-                room.stop_at,
-                room.status.as_str()
-            ),
-            ("s1", "c1", 5, "RECORDING")
-        );
-        let seen = fake.seen();
-        assert_eq!(seen[0].path, REC_PATH);
-        assert!(seen.iter().all(|r| r.auth == "Bearer bot-token"));
     }
 }

@@ -1,15 +1,10 @@
-//! The session recorder.
+//! What a session recording is made of: the WebM files of a call's streams, and their upload to the
+//! LMS. rtcd records calls with it.
 
 pub mod api;
-pub mod call;
-pub mod config;
 pub mod disk;
-pub mod logging;
 pub mod media;
-pub mod peer;
 pub mod reorder;
-pub mod session;
-pub mod socket;
 pub mod tap;
 pub mod throttle;
 pub mod upload;
