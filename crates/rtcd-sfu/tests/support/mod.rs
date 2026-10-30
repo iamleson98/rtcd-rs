@@ -512,7 +512,10 @@ impl World {
             // The engine's output to the browsers.
             while let Some(t) = self.engine.poll_transmit() {
                 moved = true;
-                self.egress.add_datagram(t.data.len(), t.peer, false);
+                self.egress.add(
+                    rtcd_sfu::egress::Gauge::wire_len(t.data.len(), t.peer, false),
+                    1,
+                );
                 if self.blackhole {
                     continue;
                 }

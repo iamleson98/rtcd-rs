@@ -192,15 +192,17 @@ impl Gauge {
         }
     }
 
-    /// Counts a datagram of `len` bytes handed to a socket for `peer`, with the headers it will
-    /// carry on the wire. `tcp`: a segment of a TCP stream, not a UDP datagram.
-    pub fn add_datagram(&self, len: usize, peer: SocketAddr, tcp: bool) {
+    /// What a datagram of `len` bytes handed to a socket for `peer` takes on the wire, with the
+    /// headers it will carry. `tcp`: a segment of a TCP stream, not a UDP datagram.
+    pub fn wire_len(len: usize, peer: SocketAddr, tcp: bool) -> u64 {
         let ip = if peer.is_ipv6() { 40 } else { 20 };
         let transport = if tcp { 20 } else { 8 };
-        self.add(len as u64 + LINK_OVERHEAD + ip + transport, 1);
+        len as u64 + LINK_OVERHEAD + ip + transport
     }
 
-    /// Counts what was put on the wire: `bytes` (headers included) in `packets` datagrams.
+    /// Counts what was put on the wire: `bytes` (headers included) in `packets` datagrams. Every
+    /// shard adds to the same two counters, so a shard adds once for the whole of a batch it sent
+    /// (the sum of [`Gauge::wire_len`]), not once per datagram.
     pub fn add(&self, bytes: u64, packets: u64) {
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
         self.packets.fetch_add(packets, Ordering::Relaxed);
@@ -801,10 +803,11 @@ mod tests {
         let g = Gauge::default();
         let v4: SocketAddr = "10.0.0.1:5000".parse().unwrap();
         let v6: SocketAddr = "[2001:db8::1]:5000".parse().unwrap();
-        g.add_datagram(100, v4, false);
-        g.add_datagram(100, v6, false);
-        g.add_datagram(100, v4, true);
-        assert_eq!(g.bytes.load(Ordering::Relaxed), 142 + 162 + 154);
+        assert_eq!(Gauge::wire_len(100, v4, false), 142);
+        assert_eq!(Gauge::wire_len(100, v6, false), 162);
+        assert_eq!(Gauge::wire_len(100, v4, true), 154);
+        g.add(142 + 162 + 154, 3);
+        assert_eq!(g.bytes.load(Ordering::Relaxed), 458);
         assert_eq!(g.packets.load(Ordering::Relaxed), 3);
     }
 
