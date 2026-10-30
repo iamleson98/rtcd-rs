@@ -54,10 +54,3 @@ path = "fuzz_targets/recorder_stream.rs"
 test = false
 doc = false
 bench = false
-
-[[bin]]
-name = "recorder_signal"
-path = "fuzz_targets/recorder_signal.rs"
-test = false
-doc = false
-bench = false

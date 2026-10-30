@@ -1,10 +1,10 @@
 //! The media of a recording.
 //!
-//! Every stream the SFU forwards to the recorder is written as it arrives, without decoding or
-//! re-encoding, into WebM files the browser plays directly (VP8 video, Opus audio). A file is one
-//! stretch of continuous media from one person: a camera from when it is turned on until it is
-//! turned off, a voice while it is unmuted. Each starts at its own offset into the recording, so
-//! the player lines them up again.
+//! Every stream of a call is written as it arrives, without decoding or re-encoding, into WebM
+//! files the browser plays directly (VP8 video, Opus audio). A file is one stretch of continuous
+//! media from one person: a camera from when it is turned on until it is turned off, a voice while
+//! it is unmuted. Each starts at its own offset into the recording, so the player lines them up
+//! again.
 
 use std::collections::HashMap;
 use std::io;
@@ -150,10 +150,6 @@ impl Recording {
 
     pub fn start(&self) -> Instant {
         self.start
-    }
-
-    pub fn dir(&self) -> &Path {
-        &self.dir
     }
 
     /// The path of the next file, `None` once the limit of files is reached.
@@ -321,15 +317,6 @@ impl StreamRecorder {
         }
     }
 
-    /// Whether a file of this stream is open.
-    pub fn is_writing(&self) -> bool {
-        self.seg.is_some()
-    }
-
-    pub fn info(&self) -> &StreamInfo {
-        &self.info
-    }
-
     /// Takes a packet, which arrived when it says. Returns whether the sender should be asked for
     /// a keyframe.
     pub fn packet(&mut self, p: TapPacket) -> bool {
@@ -388,11 +375,6 @@ impl StreamRecorder {
             return true;
         }
         false
-    }
-
-    /// When [`Self::tick`] next has something to do because of a gap.
-    pub fn deadline(&self) -> Option<Instant> {
-        self.reorder.deadline()
     }
 
     /// Writes what is ready at `now`; gaps are given up as if it were `give_up_at` (the end of the

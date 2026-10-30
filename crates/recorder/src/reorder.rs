@@ -167,15 +167,6 @@ impl Reorder {
         self.gap_since = None;
         Some(Item::Lost((e - next) as u32))
     }
-
-    /// When a gap will have been waited for, if one is open.
-    pub fn deadline(&self) -> Option<Instant> {
-        self.gap_since.map(|t| t + self.wait)
-    }
-
-    pub fn held(&self) -> usize {
-        self.held
-    }
 }
 
 #[cfg(test)]
@@ -232,7 +223,6 @@ mod tests {
             r.push(pkt(t0, s));
         }
         assert_eq!(drain(&mut r, t0), ["10", "11"]);
-        assert_eq!(r.deadline(), Some(t0 + Duration::from_millis(100)));
         assert_eq!(
             drain(&mut r, t0 + Duration::from_millis(50)),
             Vec::<String>::new()
@@ -256,7 +246,6 @@ mod tests {
             drain(&mut r, t0 + Duration::from_millis(20)),
             ["11", "12", "13"]
         );
-        assert_eq!(r.deadline(), None);
     }
 
     #[test]

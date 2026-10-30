@@ -13,7 +13,7 @@ changing the LMS server or the web client.
 | Configuration | the same `config.toml` keys and the same `RTCD_*` environment variables, including `:8045`-style addresses, `ice_host_override` NAT maps, STUN discovery, TURN credential generation, TLS |
 | Container | the `Dockerfile` uses the LMS image's entrypoint and config template, so environment, ports (8045, 8443), user (2001) and the `/data` volume are unchanged |
 | Data | a data directory the Go rtcd used is opened as is: its registered clients are taken over on the first start (`crates/rtcd/src/legacy.rs`) |
-| Extension | a data channel frame of type 10 (`SharpScreen(true)`) asks for a shared screen at its large layer whatever the bandwidth estimate says, until the receiver's link is starved. The session recorder sends it; the Go service never sees it from a browser |
+| Extension | a data channel frame of type 10 (`SharpScreen(true)`) asks for a shared screen at its large layer whatever the bandwidth estimate says, until the receiver's link is starved. Only the standalone session recorder, since removed, sent it; the Go service never sees it from a browser |
 | Media | ICE-lite over UDP and ICE-TCP, DTLS-SRTP, the `calls-dc` data channel (lock protocol, zlib SDP, media map), Opus voice with VAD events, VP8 camera and screen share with simulcast layer switching that needs no renegotiation, `video_subscribe`, keyframe relay, bandwidth-driven screen layer choice |
 | Metrics | the Prometheus metric names are the Go service's, plus the network counters below |
 
@@ -278,8 +278,8 @@ With no setting changed, a node that takes this release behaves differently in f
 
 Off unless set: the send budgets (`RTCD_RTC_EGRESSBUDGETMBPS`, `RTCD_RTC_EGRESSBUDGETPPS`), acting
 on the kernel's refusals (`RTCD_RTC_EGRESSADAPT`) and the packet time (`RTCD_RTC_AUDIOPTIMEMS`). `GET /system` gains `shards_pressured`, `shards_saturated`,
-`egress_pps` and `kernel_send_drops`. The recorder reads the length of each Opus packet from the
-packet, so recordings are right whatever the packet time is.
+`egress_pps` and `kernel_send_drops`. A recording reads the length of each Opus packet from the
+packet, so it is right whatever the packet time is.
 
 ## Using it from class-management
 
@@ -291,7 +291,7 @@ packet, so recordings are right whatever the packet time is.
   start.
 - Its instances are found by the server's DNS discovery like the Go ones, and `GET /system` lets the
   server put new calls on the lighter instance.
-- The web client and the server's `custom_calls_*` actions need no change (tested in Chrome, Firefox and Safari). The session recorder is a crate of this workspace too (below).
+- The web client and the server's `custom_calls_*` actions need no change (tested in Chrome, Firefox and Safari). rtcd records calls itself (below).
 
 ## Layout
 
@@ -301,11 +301,11 @@ crates/rtcd-net     batched UDP (recvmmsg/sendmmsg/GSO on Linux), RFC 4571 frami
 crates/rtcd-sfu     the engine (one per shard thread, no locks) and the runtime around real sockets
 crates/rtcd         the service: config, auth, store, HTTP and websocket API, TLS, metrics, logging
 crates/rtcd-testkit an emulated browser used by the engine tests
-crates/recorder     the LMS session recorder: joins a class call as a bot and writes it as WebM files
-crates/lms-sim      a stand-in LMS around a real rtcd with synthetic participants, to test and measure the recorder
+crates/recorder     the files of a session recording (WebM from a call's streams) and their upload; rtcd records with it
+crates/lms-sim      a stand-in LMS around a real rtcd with synthetic participants, to test and measure its recording
 vendor/rtc          the WebRTC stack, pinned (git submodule)
 compat/golden       regenerates the golden vectors from the Go sources
-deploy/             the entrypoint and config template the image uses; recorder.Dockerfile
+deploy/             the entrypoint and config template the image uses
 ```
 
 ## Build, test, run
@@ -342,22 +342,13 @@ dependency audit, and the Docker image started through its entrypoint. `image.ym
 `ghcr.io/<owner>/rtcd-rust` on a version tag. The Go-versus-Rust comparison runs in the webrtc
 repository.
 
-## The session recorder
+## Recording inside rtcd
 
-`crates/recorder` replaces the Go recorder of the LMS (one short-lived job per recording: it joins the
-call listen-only and writes every voice, camera and screen share as WebM, with no re-encoding; the app
-server logs the whiteboard). Same environment, endpoints and manifest; `deploy/recorder.Dockerfile`
-builds a static image on `scratch`. It uses about a quarter of the Go recorder's CPU and a fifth of its
-memory; see [crates/recorder/README.md](crates/recorder/README.md) for the numbers, the method
-(`scripts/bench-recorder.py`) and what differs.
-
-### Recording inside rtcd
-
-With `[record] enabled = true` (`RTCD_RECORD_ENABLED`) a node records calls itself, without a recorder
-participant: the server sends `record_start` over the websocket, each published stream is copied once
+With `[record] enabled = true` (`RTCD_RECORD_ENABLED`) a node records calls itself (no participant
+joins the call): the server sends `record_start` over the websocket, each published stream is copied once
 to a writer thread (`rtcd_sfu::record`), the files are the recorder crate's, rotated every two minutes
 (bounding what a node shutting down still holds) and numbered from the start's `fileBase` in the order they close, and each is uploaded as it closes
-through the endpoints the bot uses, then reported (`record_file`) and deleted. `record_ended` follows
+through the LMS's recorder endpoints with the recording's token, then reported (`record_file`) and deleted. `record_ended` follows
 once every file is stored. Every `record_start` is answered once: `refused` at
 once when it is not taken (the node is draining and holds nothing of it, the recording is held for another
 call or first file number, the call has another recording, or the numbers reach those of a capture whose
@@ -368,15 +359,15 @@ opens more files than that, and ends as `file_limit` as soon as the last number 
 counted, not the recording ended) and `_UPLOADMBPS` (the node's upload rate, so uploads never compete
 with media). Files a dead process left in the data directory are removed at start. Metrics:
 `rtcd_record_{recordings,files_written_total,pending_bytes,uploaded_bytes_total,upload_failures_total,
-writer_dropped_packets_total,writer_busy_seconds_total}`. `lms-sim run --builtin` records a synthetic
+writer_dropped_packets_total,writer_busy_seconds_total}`. `lms-sim run` records a synthetic
 class this way; the writer threads used 0.14 % of a core for 8 people and 7 video streams, and 0.41 %
 for 100 people and 32 (release build, loopback).
 
 ## Fuzzing
 
 `fuzz/` holds libFuzzer targets for what comes from outside: data channel frames, websocket frames, the
-engine given a session and any SDP, ICE and announcements a client can send, VP8 payloads, the recorder's
-stream writer and its signal parser. `cd fuzz && cargo +nightly fuzz run <target>`; the `rtc` crates have
+engine given a session and any SDP, ICE and announcements a client can send, VP8 payloads and the recording's
+stream writer. `cd fuzz && cargo +nightly fuzz run <target>`; the `rtc` crates have
 targets of their own for STUN, RTP, RTCP, SDP, DTLS, SCTP and SRTP.
 
 ## Not done yet

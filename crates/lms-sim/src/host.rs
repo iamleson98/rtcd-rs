@@ -224,7 +224,7 @@ impl Rtcd {
         self.reports.messages.lock().unwrap().clone()
     }
 
-    /// Packets to this client are not lost (the synthetic participants: only the recorder is tried).
+    /// Packets to this client are not lost (the synthetic participants).
     pub fn exempt(&self, client: SocketAddr) {
         if let Some(r) = &self.relay {
             r.exempt.lock().unwrap().insert(client);
