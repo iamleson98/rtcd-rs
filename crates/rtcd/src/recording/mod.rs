@@ -266,6 +266,9 @@ fn valid_site(url: &str) -> bool {
     })
 }
 
+/// The share of their rate, in thousandths, at which uploads go while the node's media is refused.
+const YIELD_SHARE: u32 = 250;
+
 impl Recordings {
     /// Sets recording up as the configuration says. Must be called inside the runtime (the
     /// uploader is a task of it).
@@ -449,6 +452,21 @@ impl Recordings {
         }
     }
 
+    /// Uploads go at a quarter of their rate while `yielding`, the whole of it otherwise: the
+    /// network card is refusing the media this node sends, and a file can wait.
+    pub fn yield_to_media(&self, yielding: bool) {
+        if let Some(live) = &self.live {
+            live.throttle
+                .set_share(if yielding { YIELD_SHARE } else { 1000 });
+        }
+    }
+
+    /// How much of its rate the uploads are let through now, in thousandths (`None` where
+    /// recording is off).
+    pub fn upload_share(&self) -> Option<u32> {
+        self.live.as_ref().map(|l| l.throttle.share())
+    }
+
     /// The node is shutting down: takes no new recording, lifts the upload rate (the media this
     /// node sends is about to end anyway, and the files must get out first), and stops every
     /// capture at once so that its open files close and are uploaded. Call it before the SFU
@@ -517,6 +535,34 @@ mod tests {
         // A start in the future (clocks differ a little) is now; so is one before the clock began.
         assert_eq!(instant_of(1_002_000, now, wall), now);
         assert_eq!(instant_of(-5, now, wall).max(now), now);
+    }
+
+    #[tokio::test]
+    async fn uploads_stand_aside_while_the_node_yields_to_media() {
+        let dir = std::env::temp_dir().join(format!("rtcd-yield-{}", std::process::id()));
+        let metrics = Arc::new(Metrics::new());
+        let cfg = RecordConfig {
+            enabled: true,
+            data_dir: dir.to_string_lossy().into_owned(),
+            ..RecordConfig::default()
+        };
+        let r = Recordings::new(&cfg, Arc::new(Reports::new(metrics.clone())), metrics);
+        assert_eq!(r.upload_share(), Some(1000));
+        r.yield_to_media(true);
+        assert_eq!(r.upload_share(), Some(250));
+        r.yield_to_media(false);
+        assert_eq!(r.upload_share(), Some(1000));
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(
+            Recordings::new(
+                &RecordConfig::default(),
+                Arc::new(Reports::new(Arc::new(Metrics::new()))),
+                Arc::new(Metrics::new())
+            )
+            .upload_share(),
+            None,
+            "recording is off by default"
+        );
     }
 
     #[test]

@@ -116,6 +116,28 @@ impl Service {
         }
     }
 
+    /// Slows recording uploads down for as long as the kernel refuses the datagrams of the node's
+    /// media, once a second, until the task is aborted: both go out of the same network card, and
+    /// a file can wait where a call cannot.
+    pub async fn yield_uploads(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut yielding = false;
+        loop {
+            tick.tick().await;
+            let now = self.sfu.egress_refusing();
+            if now != yielding {
+                yielding = now;
+                if yielding {
+                    warn!("the kernel is refusing datagrams: recording uploads slow down");
+                } else {
+                    info!("the kernel accepts datagrams again: recording uploads at full rate");
+                }
+                self.recordings.yield_to_media(yielding);
+            }
+        }
+    }
+
     pub fn connection_count(&self) -> usize {
         self.conns.lock().len()
     }

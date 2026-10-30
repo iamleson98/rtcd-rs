@@ -6,11 +6,13 @@
 //! blocks for good, and callers that arrive together are served in the order they reserved.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 /// How much unused rate is kept for a burst: a quarter of a second's worth.
 const BURST: f64 = 0.25;
+/// The whole rate, in thousandths.
+const FULL: u32 = 1000;
 
 #[derive(Debug)]
 struct State {
@@ -24,6 +26,8 @@ struct State {
 pub struct Throttle {
     /// Bytes per second.
     rate: f64,
+    /// How much of `rate` is let through, in thousandths (see [`Throttle::set_share`]).
+    share: AtomicU32,
     state: Mutex<State>,
     /// The rate no longer applies (see [`Throttle::lift`]).
     lifted: AtomicBool,
@@ -35,12 +39,26 @@ impl Throttle {
         let rate = bytes_per_second.max(1) as f64;
         Self {
             rate,
+            share: AtomicU32::new(FULL),
             state: Mutex::new(State {
                 tokens: rate * BURST,
                 at: Instant::now(),
             }),
             lifted: AtomicBool::new(false),
         }
+    }
+
+    /// Lets only `permille` thousandths of the rate through from now on (1,000: all of it; at
+    /// least one). Uploads stand aside like this while the network is short of room for the media
+    /// the same node sends: a file that waits an extra minute costs nothing, and a call that
+    /// loses packets costs a class.
+    pub fn set_share(&self, permille: u32) {
+        self.share.store(permille.clamp(1, FULL), Ordering::Relaxed);
+    }
+
+    /// How much of the rate is let through now, in thousandths.
+    pub fn share(&self) -> u32 {
+        self.share.load(Ordering::Relaxed)
     }
 
     /// Stops holding anything back, for good: a process that is about to exit and has files to
@@ -54,14 +72,15 @@ impl Throttle {
         if self.lifted.load(Ordering::Acquire) {
             return Duration::ZERO;
         }
+        let rate = self.rate * f64::from(self.share.load(Ordering::Relaxed)) / f64::from(FULL);
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let elapsed = now.saturating_duration_since(s.at).as_secs_f64();
         s.at = s.at.max(now);
-        s.tokens = (s.tokens + elapsed * self.rate).min(self.rate * BURST) - bytes as f64;
+        s.tokens = (s.tokens + elapsed * rate).min(rate * BURST) - bytes as f64;
         if s.tokens >= 0.0 {
             Duration::ZERO
         } else {
-            Duration::from_secs_f64(-s.tokens / self.rate)
+            Duration::from_secs_f64(-s.tokens / rate)
         }
     }
 
@@ -109,6 +128,22 @@ mod tests {
             (wait.as_secs_f64() - 0.25).abs() < 1e-6,
             "an hour saved no more than a burst: {wait:?}"
         );
+    }
+
+    #[test]
+    fn a_smaller_share_paces_the_bytes_at_that_share_of_the_rate() {
+        let t = Throttle::new(1000);
+        let now = Instant::now();
+        t.set_share(250);
+        // A burst is a quarter second of the reduced rate (62 bytes); past it a byte costs 4 ms.
+        assert_eq!(t.reserve(62, now), Duration::ZERO);
+        let wait = t.reserve(250, now);
+        assert!((wait.as_secs_f64() - 1.0).abs() < 0.02, "{wait:?}");
+        // A share of nothing is a thousandth: slow, but the bytes still go in the end.
+        let t = Throttle::new(1000);
+        t.set_share(0);
+        let wait = t.reserve(1000, now);
+        assert!((wait.as_secs_f64() - 1000.0).abs() < 1.0, "{wait:?}");
     }
 
     #[test]
