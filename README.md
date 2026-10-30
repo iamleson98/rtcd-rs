@@ -145,11 +145,13 @@ shards add what they send to one gauge, and when its smoothed rate reaches 85 % 
 receiver's cameras and screen shares fall back to their small layer (no renegotiation, the same
 switch a receiver's own request makes); they go back up only after the rate has stayed under 65 %
 for twenty seconds, so the drop itself does not release it. 0 (the default) sets no budget, and the
-node finds its own ceiling instead: when the kernel refuses datagrams (50 or more a
-second, `SndbufErrors`) for two seconds in a row (one burst, a keyframe sent to a whole class, is not
-a ceiling) the rate it was sending becomes the ceiling, at 90 % of that rate, the
-squeeze starts at once, and the ceiling is lifted by a tenth after every five quiet minutes, so a
-node is held to what its network can carry now and not to its worst moment. A refusal at the
+node finds its own ceiling instead: when the kernel refuses datagrams (50 a second or 0.5 % of
+what is being sent, whichever is more) in three one-second windows in a row (a burst, a keyframe
+sent to a whole class, or a stall of the machine, is not a ceiling) the rate it was sending
+becomes the ceiling, at 90 % of that rate, the squeeze starts at once, and the ceiling is lifted by
+a tenth for every five minutes without a refusal (all of them at once after a long idle spell: a
+node idle all night starts the morning without it), so a node is held to what its network can carry
+now and not to its worst moment. A refusal at the
 ceiling teaches a lower one; one while squeezed well below it does not. A budget that is set
 still applies, whichever is lower. `GET /system` reports `egress_bps`, `egress_squeezed` and the
 learned `egress_ceiling_bps` and `egress_ceiling_pps` (0 until the kernel has refused something),
@@ -157,11 +159,19 @@ for whatever places new calls (`src/egress.rs`).
 
 The squeeze is the same whether a budget or the learned ceiling causes it: small video layers and two
 voices a call. It takes the bits down and leaves most of the packets, voice, so a kernel that goes on
-refusing for five seconds after the squeeze (`egress_choked`) cuts calls to their loudest voice until
-it has accepted everything for ten seconds. While the kernel refuses (`egress_refusing`) recording
-uploads, which share the card and can wait, go at a quarter of their rate. The rate is what the shards
+refusing in five windows in a row while squeezed (`egress_choked`) cuts calls to their loudest voice
+until it has accepted everything for ten seconds; a choke that comes back within a minute begins at
+the first refusing window and is held twice as long (up to two minutes), so a steady overload does
+not cycle. Bursts that do not last never choke. While the kernel refuses (`egress_refusing`, which
+ends by itself ten seconds after the last refusal) recording uploads, which share the card and can
+wait, go at a quarter of their rate, unless the files waiting are half of
+`max_pending_bytes`. The rate is what the shards
 hand to their sockets, link-layer headers included: receiver reports, retransmissions, ICE and DTLS
-are in it with the media, as the card carries them.
+are in it with the media, as the card carries them. That makes `egress_bps` read higher than
+before, by up to half on voice-heavy traffic (every datagram now adds 52 bytes of headers and
+encryption to a payload of about 100): during a rollout, with old and new instances side by side, the
+two are on different scales, and a server that compares them (its placement margin) compares unlike
+numbers.
 
 The card has a second ceiling, in packets: `RTCD_RTC_EGRESSBUDGETPPS=N` (`rtc.egress_budget_pps`)
 is the same rule for packets per second, and either budget squeezes. Voice packets are about 100
@@ -177,8 +187,11 @@ brought the node to its ceiling is cut where it is largest.
 The kernel does not tell the sender: a datagram the transmit queue refuses is counted
 (`UdpSndbufErrors`) and `sendmmsg` still succeeds, so the node counted those packets as sent.
 `GET /system` therefore reports `kernel_send_drops` (that counter since the process first read it) and
-`egress_pps`; a node whose `kernel_send_drops` grows is sending more than its card takes. The
-counter is the network namespace's, so it also counts what other processes in it were refused.
+`egress_pps`; a node whose `kernel_send_drops` grows is sending more than its card takes. The count
+is IPv4 and IPv6 together and is the network namespace's: rtcd runs with `hostNetwork`, so it counts
+every process on the machine that sends UDP, and the node's reaction (small video, fewer voices,
+slower uploads) answers a refusal that may not be its own. It counts calls, not datagrams: a
+segmented send of up to 64 datagrams that fails adds one, so the rate is read low, the safe way.
 
 ## Large calls: a shard with no room
 

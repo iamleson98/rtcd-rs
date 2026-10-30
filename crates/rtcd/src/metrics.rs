@@ -105,7 +105,7 @@ impl Node {
             ),
             rss_limit: g(
                 "rss_limit_bytes",
-                "What this process's control group may hold in memory (0: no limit); its use is process_resident_memory_bytes",
+                "What this process's control group may hold in memory (0: no limit); its use is rtcd_process_resident_memory_bytes",
             ),
             tx_bps: g(
                 "host_tx_bps",

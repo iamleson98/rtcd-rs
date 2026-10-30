@@ -22,6 +22,8 @@ pub struct Stat {
 /// The jiffies one `cpu` line holds that matter here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Cpu {
+    /// Which CPU (the number in `cpuN`; 0 for the line of all of them).
+    pub id: u32,
     /// Time spent idle, waiting for I/O included: a CPU waiting for a disk can run another thread.
     pub idle: u64,
     /// Of that, the time spent waiting for I/O. Tools that show a CPU as busy when it is not idle
@@ -112,11 +114,15 @@ pub fn reading(before: &Stat, after: &Stat) -> Option<Reading> {
         return None;
     }
     let share = |a: u64, b: u64| a.saturating_sub(b) as f64 / all as f64;
-    let busiest = before
+    // Paired by number: a CPU that went offline or came online between the readings is left out,
+    // not matched with its neighbour.
+    let busiest = after
         .cores
         .iter()
-        .zip(&after.cores)
-        .map(|(b, a)| busy_fraction(b.jiffies(), a.jiffies()))
+        .filter_map(|a| {
+            let b = before.cores.iter().find(|b| b.id == a.id)?;
+            Some(busy_fraction(b.jiffies(), a.jiffies()))
+        })
         .fold(0.0, f64::max);
     Some(Reading {
         busy: busy_fraction(before.all.jiffies(), after.all.jiffies()),
@@ -146,15 +152,16 @@ pub fn parse_stat(stat: &str) -> Option<Stat> {
 
 /// Reads one `cpuN` line of `/proc/stat`.
 fn parse_cpu_line(line: &str) -> Option<Cpu> {
-    let fields: Vec<u64> = line
-        .strip_prefix("cpu")?
-        .split_whitespace()
-        // The first word of a per-CPU line is its number.
-        .skip(usize::from(
-            line.as_bytes().get(3).is_some_and(u8::is_ascii_digit),
-        ))
-        .filter_map(|f| f.parse().ok())
-        .collect();
+    let rest = line.strip_prefix("cpu")?;
+    // The first word of a per-CPU line is its number.
+    let per_cpu = rest.as_bytes().first().is_some_and(u8::is_ascii_digit);
+    let mut words = rest.split_whitespace();
+    let id = if per_cpu {
+        words.next()?.parse().ok()?
+    } else {
+        0
+    };
+    let fields: Vec<u64> = words.filter_map(|f| f.parse().ok()).collect();
     if fields.len() < 5 {
         return None;
     }
@@ -162,6 +169,7 @@ fn parse_cpu_line(line: &str) -> Option<Cpu> {
     // inside user time already.
     let at = |i: usize| fields.get(i).copied().unwrap_or(0);
     Some(Cpu {
+        id,
         idle: at(3) + at(4),
         iowait: at(4),
         softirq: at(6),
@@ -238,6 +246,27 @@ mod tests {
         assert!((r.iowait - 0.3).abs() < 1e-9, "{r:?}");
         assert!((r.softirq - 0.1).abs() < 1e-9, "{r:?}");
         assert!((r.spare_cores() - 2.0).abs() < 1e-9, "{r:?}");
+    }
+
+    #[test]
+    fn a_cpu_that_went_offline_is_not_paired_with_its_neighbour() {
+        // cpu1 is busy all the time and goes offline; cpu2 and cpu3 are idle.
+        let before = parse_stat(
+            "cpu  0 0 0 0 0\ncpu0 0 0 0 0 0\ncpu1 0 0 0 0 0\ncpu2 0 0 0 0 0\ncpu3 0 0 0 0 0\n",
+        )
+        .unwrap();
+        let after = parse_stat(
+            "cpu  100 0 0 300 0\ncpu0 0 0 0 100 0\ncpu2 0 0 0 100 0\ncpu3 100 0 0 0 0\n",
+        )
+        .unwrap();
+        let r = reading(&before, &after).unwrap();
+        assert_eq!(r.cpus, 3);
+        // By position cpu2 would have been compared with cpu1's history and cpu3 with cpu2's;
+        // by number only cpu3, which worked the whole interval, is the busiest.
+        assert!((r.busiest - 1.0).abs() < 1e-9, "{r:?}");
+        let swapped = parse_stat("cpu  0 0 0 0 0\ncpu0 0 0 0 0 0\ncpu2 0 0 0 0 0\n").unwrap();
+        let gone = parse_stat("cpu  10 0 0 10 0\ncpu0 0 0 0 10 0\ncpu2 10 0 0 0 0\n").unwrap();
+        assert!((reading(&swapped, &gone).unwrap().busiest - 1.0).abs() < 1e-9);
     }
 
     #[test]

@@ -82,8 +82,10 @@ pub struct SystemInfo {
 }
 
 /// The body of `GET /system`, and the node-level gauges of `/metrics`: the machine, and what the
-/// media plane is doing about it. The key names are the names of the metrics without their
-/// `rtcd_` prefix (and `_total` for the counter).
+/// media plane is doing about it. A key is the name of its metric without the `rtcd_` prefix, and
+/// without `_total` for the counter, except that the `cpu_*` and `mem_*` keys are the metrics
+/// `rtcd_host_cpu_*` and `rtcd_host_mem_*` (and `host_tx_*` already say so); `rss_bytes` has no
+/// gauge of its own, it is the process collector's `rtcd_process_resident_memory_bytes`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct SystemStatus {
     #[serde(flatten)]
