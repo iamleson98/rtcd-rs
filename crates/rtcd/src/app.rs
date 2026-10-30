@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rtcd_sfu::config::{EngineConfig, LocalAddress};
+use rtcd_sfu::egress::Gauge;
 use rtcd_sfu::engine::Event;
 use rtcd_sfu::runtime::{ScalingPolicy, Sfu, SfuConfig};
 use tokio::net::TcpListener;
@@ -86,6 +87,12 @@ pub fn sfu_config(cfg: &Config, addresses: Vec<LocalAddress>) -> SfuConfig {
     engine.audio_ptime_ms = rtc.audio_ptime_ms.clamp(0, 120) as u32;
     engine.egress_budget_bps = rtc.egress_budget_mbps.clamp(0, 100_000) as u64 * 1_000_000;
     engine.egress_budget_pps = rtc.egress_budget_pps.clamp(0, 100_000_000) as u64;
+    if rtc.egress_adapt {
+        engine.egress = std::sync::Arc::new(Gauge::adaptive(
+            rtc.egress_learn_min_mbps.clamp(0, 100_000) as u64 * 1_000_000,
+            rtc.egress_learn_min_pps.clamp(0, 100_000_000) as u64,
+        ));
+    }
     // A shard is a thread, a call lives on one, and one carries a few hundred participants before it
     // saturates (measured: a single shard dropped 3 % of the voice packets at 600 participants on
     // four cores, and lost two thirds at 900, where two shards lost 7 %). Another is not free
@@ -256,5 +263,18 @@ impl App {
         self.events.abort();
         self.uploads.abort();
         info!("service: shut down");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_node_acts_on_the_kernels_refusals_only_when_told_to() {
+        let mut cfg = Config::default();
+        assert!(!sfu_config(&cfg, Vec::new()).engine.egress.adapts());
+        cfg.rtc.egress_adapt = true;
+        assert!(sfu_config(&cfg, Vec::new()).engine.egress.adapts());
     }
 }

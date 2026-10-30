@@ -84,10 +84,12 @@ struct UploadPace {
 }
 
 impl UploadPace {
-    /// One tick: whether the kernel is refusing, and so how fast the uploads go. Asked every tick
+    /// One tick: whether the kernel is refusing (and the node acts on it: otherwise `false`, and
+    /// the uploads go at their full rate), and so how fast they go. Asked every tick
     /// and not only when `refusing` changes, because the answer also depends on how many files
     /// wait (see `Recordings::yield_to_media`), which changes while the kernel goes on refusing.
-    fn step(&mut self, refusing: bool, recordings: &Recordings) {
+    fn step(&mut self, refusing: bool, adapts: bool, recordings: &Recordings) {
+        let refusing = refusing && adapts;
         if refusing != self.yielding {
             if refusing {
                 warn!("the kernel is refusing datagrams: recording uploads slow down");
@@ -156,7 +158,11 @@ impl Service {
 
     fn tick(&self, uploads: &mut UploadPace, now: Instant) {
         self.sfu.tick_egress(now);
-        uploads.step(self.sfu.egress_refusing(), &self.recordings);
+        uploads.step(
+            self.sfu.egress_refusing(),
+            self.sfu.egress_adapts(),
+            &self.recordings,
+        );
     }
 
     /// What `GET /system` reports and `/metrics` exports about the node.
@@ -393,21 +399,32 @@ mod tests {
         let (r, dir) = recordings("pile");
         let mut pace = UploadPace::default();
         // The kernel starts refusing with little waiting: uploads give way.
-        pace.step(true, &r);
+        pace.step(true, true, &r);
         assert_eq!(r.upload_share(), Some(250));
         // It goes on refusing for minutes, and the files of the ended classes pile up; `refusing`
         // never changes, so only a check on every tick sees half the cap go by.
         for gib in [1u64, 1] {
             r.hold(gib << 30);
-            pace.step(true, &r);
+            pace.step(true, true, &r);
         }
         assert_eq!(
             r.upload_share(),
             Some(1000),
             "uploads at full speed once half of the cap waits, refusals or not"
         );
-        pace.step(false, &r);
+        pace.step(false, true, &r);
         assert_eq!(r.upload_share(), Some(1000));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn uploads_never_yield_on_a_node_that_does_not_adapt() {
+        let (r, dir) = recordings("off");
+        let mut pace = UploadPace::default();
+        for _ in 0..30 {
+            pace.step(true, false, &r);
+            assert_eq!(r.upload_share(), Some(1000));
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

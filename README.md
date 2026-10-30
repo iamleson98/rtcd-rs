@@ -144,42 +144,53 @@ everyone past about 320 Mbit/s). With `RTCD_RTC_EGRESSBUDGETMBPS=N` (`rtc.egress
 shards add what they send to one gauge, and when its smoothed rate reaches 85 % of `N` every
 receiver's cameras and screen shares fall back to their small layer (no renegotiation, the same
 switch a receiver's own request makes); they go back up only after the rate has stayed under 65 %
-for twenty seconds, so the drop itself does not release it. 0 (the default) sets no budget, and the
-node finds its own ceiling instead: when the kernel refuses datagrams (50 a second or 0.5 % of
-what is being sent, whichever is more) in three one-second windows in a row (a burst, a keyframe
-sent to a whole class, or a stall of the machine, is not a ceiling) and the node was sending more
-than 1.1 times the most it carried without refusals in the last five to ten minutes, the rate it was
-sending becomes the ceiling, at 90 % of that rate, and the squeeze starts at once. Refusals at a rate
-the node has just carried cleanly are a stall of the machine or the card, not a rate that is too
-high: they squeeze video and voices only while they last, teach nothing and never choke. The ceiling
-is lifted by a tenth for every five minutes without a refusal and forgotten once it is twice what
-was taught (a node idle all night starts the morning without it), so a node is held to what its
-network can carry now and not to its worst moment; a refusal that finds the node not squeezed
-teaches the rate afresh, one while squeezed teaches only a lower rate (a refusal near or above the
-ceiling). A squeeze that comes back within two minutes of its release is released after twice the
-wait (up to five minutes), so a node whose demand is just over its ceiling does not switch layers
-and voices every twenty seconds. A budget that is set
-still applies, whichever is lower. `GET /system` reports `egress_bps`, `egress_squeezed` and the
-learned `egress_ceiling_bps` and `egress_ceiling_pps` (0 until the kernel has refused something),
-for whatever places new calls (`src/egress.rs`).
+for twenty seconds, so the drop itself does not release it. 0 (the default) sets no budget, and
+nothing else squeezes video: `GET /system` reports `egress_bps`, `egress_squeezed` and the kernel's
+refusals either way, for whatever places new calls (`src/egress.rs`).
 
-The squeeze is the same whether a budget or the learned ceiling causes it: small video layers and two
-voices a call. It takes the bits down and leaves most of the packets, voice, so a kernel that goes on
-refusing in five windows in a row while squeezed (`egress_choked`) cuts calls to their loudest voice
-until it has accepted everything for ten seconds; a choke that comes back within a minute begins at
-the first refusing window and is held twice as long (up to two minutes), so a steady overload does
-not cycle. Bursts that do not last never choke. While the kernel refuses (`egress_refusing`, which
-ends by itself ten seconds after the last refusal) recording uploads, which share the card and can
-wait, go at a quarter of their rate, unless the files waiting are half of
-`max_pending_bytes` (checked every second, not only when the refusals start or stop). The
-service also brings the send figures up to date every second whether or not any session is left,
-so an idle node reports no squeeze and no rate. The rate is what the shards
-hand to their sockets, link-layer headers included: receiver reports, retransmissions, ICE and DTLS
-are in it with the media, as the card carries them. That makes `egress_bps` read higher than
-before, by up to half on voice-heavy traffic (every datagram now adds 52 bytes of headers and
-encryption to a payload of about 100): during a rollout, with old and new instances side by side, the
-two are on different scales, and a server that compares them (its placement margin) compares unlike
-numbers.
+### Acting on the kernel's refusals: `RTCD_RTC_EGRESSADAPT` (default off)
+
+The node counts the datagrams the kernel refuses to queue and reports them (`kernel_send_drops`,
+`rtcd_kernel_send_drops_total`, `egress_refusing`) whatever its settings. With
+`RTCD_RTC_EGRESSADAPT=true` (`rtc.egress_adapt`) it also acts on them, in steps. The refusals are the
+whole machine's signal (rtcd runs with `hostNetwork`, so any UDP sender on the node adds to the
+count, which also counts calls and not datagrams), so these are guesses until a run on the real card
+has shown them right, and they are off until then; off, only a send budget squeezes, no voice is cut
+and uploads go at their full rate, as in the release before. A window *refuses* when the kernel
+refused at least 50 datagrams a second and 0.5 % of those sent.
+
+1. Two refusing windows in a row slow recording uploads to a quarter of their rate for as long as the
+   refusals last and ten seconds after (`egress_refusing`), unless the files waiting are half of
+   `max_pending_bytes` (checked every second). Uploads share the card and can wait.
+2. Three in a row squeeze video to the small layers and calls to two voices for as long as they last
+   and ten seconds after (`egress_squeezed`). A stall of the machine or the card lasts seconds and
+   teaches nothing. A squeeze that comes back within two minutes is held twice as long (up to five
+   minutes), so a demand just over the limit does not switch layers and voices every few seconds.
+3. Fifteen in a row are an overload, not a stall. If the node sends at least the *learn floor*
+   (`RTCD_RTC_EGRESSLEARNMINMBPS`, default 400, or `RTCD_RTC_EGRESSLEARNMINPPS`, default 80000: about
+   half of what the OVH video VPS's card was measured to take; below it refusals are never taken for
+   an overload) the ceiling becomes 90 % of the most it sent in the run, before the squeeze took it
+   down (`egress_ceiling_bps`, `_pps`), and the squeeze is held by it from then on, released after
+   twenty seconds under 65 % of it (twice as long when it keeps coming back). The ceiling is lifted
+   by a tenth for every five minutes without a refusal and forgotten once it is twice what was taught
+   (a node idle all night starts the morning without it). An overload that finds the node not
+   squeezed teaches the rate afresh; one while squeezed teaches only a lower rate.
+4. A squeeze the node decided on (a budget, a ceiling) that the kernel refuses through for five
+   windows in a row *chokes* the node (`egress_choked`): calls forward their loudest voice only, until
+   the kernel has accepted everything for ten seconds. A choke that comes back within a minute begins
+   at the first refusing window and is held twice as long (up to two minutes). A clean window between
+   the refusals starts the count again, so an overload that stutters never chokes; and a stall that
+   falls in a squeeze from a real ceiling and lasts five windows costs one voice per call for ten
+   seconds.
+
+The service also brings these figures up to date every second whether or not any session is left,
+and a window in which nothing was sent clears the squeeze and the choke, so an idle node reports no
+squeeze and no rate. The rate is what the shards hand to their sockets, link-layer headers included:
+receiver reports, retransmissions, ICE and DTLS are in it with the media, as the card carries them.
+That makes `egress_bps` read higher than before, by up to half on voice-heavy traffic (every
+datagram now adds 52 bytes of headers and encryption to a payload of about 100): during a rollout,
+with old and new instances side by side, the two are on different scales, and a server that compares
+them (its placement margin) compares unlike numbers.
 
 The card has a second ceiling, in packets: `RTCD_RTC_EGRESSBUDGETPPS=N` (`rtc.egress_budget_pps`)
 is the same rule for packets per second, and either budget squeezes. Voice packets are about 100
@@ -189,8 +200,8 @@ with 0.1 % loss (a plain UDP test), but under the lecture load above, with 120 t
 packets a second leaving at 250 to 520 Mbit/s, its transmit ring stayed full and the kernel refused
 280 to 570 thousand datagrams every five seconds. Set it to about 80 % of what the card was
 measured to take.
-While the node is squeezed, a call also forwards at most two voices (see above), so the load that
-brought the node to its ceiling is cut where it is largest.
+While the node is squeezed, a call also forwards at most two voices, so the load that brought the
+node to its ceiling is cut where it is largest.
 
 The kernel does not tell the sender: a datagram the transmit queue refuses is counted
 (`UdpSndbufErrors`) and `sendmmsg` still succeeds, so the node counted those packets as sent.
@@ -240,8 +251,8 @@ With no setting changed, a node that takes this release behaves differently in f
 - Under load (90 % busy for two seconds, or a send budget reached) it holds receivers to the small
   video layers and forwards two voices.
 
-Off unless set: the send budgets (`RTCD_RTC_EGRESSBUDGETMBPS`, `RTCD_RTC_EGRESSBUDGETPPS`; without
-them the node learns its ceiling from the kernel refusing datagrams) and the packet time (`RTCD_RTC_AUDIOPTIMEMS`). `GET /system` gains `shards_pressured`, `shards_saturated`,
+Off unless set: the send budgets (`RTCD_RTC_EGRESSBUDGETMBPS`, `RTCD_RTC_EGRESSBUDGETPPS`), acting
+on the kernel's refusals (`RTCD_RTC_EGRESSADAPT`) and the packet time (`RTCD_RTC_AUDIOPTIMEMS`). `GET /system` gains `shards_pressured`, `shards_saturated`,
 `egress_pps` and `kernel_send_drops`. The recorder reads the length of each Opus packet from the
 packet, so recordings are right whatever the packet time is.
 

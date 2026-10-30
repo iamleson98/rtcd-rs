@@ -208,6 +208,21 @@ pub struct RtcConfig {
     /// its transmit ring stays full. Set it to about 80 % of what the card was measured to take.
     /// 0 (the default) sets no budget, and the node learns its own ceiling.
     pub egress_budget_pps: i64,
+    /// Whether the node acts on the kernel refusing its datagrams (`RTCD_RTC_EGRESSADAPT`). Off,
+    /// the default, it counts and reports them (`GET /system`, `/metrics`) and squeezes video
+    /// only for a send budget, as the previous release did. On, it also squeezes video and cuts
+    /// voices to two while refusals last, learns a ceiling from an overload that goes on for
+    /// fifteen seconds, cuts calls to their loudest voice if the squeeze does not stop the
+    /// refusals, and slows recording uploads while they last (see `rtcd_sfu::egress`). Those are
+    /// guesses about a signal that is the whole machine's: turn it on after a run on the real card.
+    pub egress_adapt: bool,
+    /// The learn floor, when `egress_adapt` is on: refusals while the node sends under this many
+    /// megabits a second and under `egress_learn_min_pps` packets a second never teach it a
+    /// ceiling (it squeezes while they last and no longer), because a node that small is not at
+    /// its card's limit. The defaults are about half of what the OVH video VPS's card was measured
+    /// to take: 800 Mbit/s of large packets, 160 thousand small ones a second.
+    pub egress_learn_min_mbps: i64,
+    pub egress_learn_min_pps: i64,
     /// Whether a join is refused while the shard that would serve it is at its limit (a thread
     /// busy for three seconds at 95 % or more, after shedding what it can): the participants it
     /// has keep their quality, where letting more in makes every call on the shard lose packets.
@@ -326,6 +341,9 @@ impl Default for RtcConfig {
             audio_ptime_ms: 0,
             egress_budget_mbps: 0,
             egress_budget_pps: 0,
+            egress_adapt: false,
+            egress_learn_min_mbps: 400,
+            egress_learn_min_pps: 80_000,
             refuse_when_saturated: true,
             drain_timeout_seconds: 0,
         }
@@ -468,6 +486,9 @@ impl Config {
         integer!("RTC_AUDIOPTIMEMS", self.rtc.audio_ptime_ms);
         integer!("RTC_EGRESSBUDGETMBPS", self.rtc.egress_budget_mbps);
         integer!("RTC_EGRESSBUDGETPPS", self.rtc.egress_budget_pps);
+        boolean!("RTC_EGRESSADAPT", self.rtc.egress_adapt);
+        integer!("RTC_EGRESSLEARNMINMBPS", self.rtc.egress_learn_min_mbps);
+        integer!("RTC_EGRESSLEARNMINPPS", self.rtc.egress_learn_min_pps);
         boolean!("RTC_REFUSEWHENSATURATED", self.rtc.refuse_when_saturated);
         integer!("RTC_DRAINTIMEOUTSECONDS", self.rtc.drain_timeout_seconds);
         text!("STORE_DATASOURCE", self.store.data_source);
@@ -581,6 +602,18 @@ impl Config {
         if !(0..=100_000_000).contains(&rtc.egress_budget_pps) {
             return Err(invalid(
                 "EgressBudgetPps",
+                "must be between 0 and 100000000",
+            ));
+        }
+        if !(0..=100_000).contains(&rtc.egress_learn_min_mbps) {
+            return Err(invalid(
+                "EgressLearnMinMbps",
+                "must be between 0 and 100000",
+            ));
+        }
+        if !(0..=100_000_000).contains(&rtc.egress_learn_min_pps) {
+            return Err(invalid(
+                "EgressLearnMinPps",
                 "must be between 0 and 100000000",
             ));
         }
@@ -875,6 +908,9 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
             ("RTCD_RTC_AUDIOPTIMEMS", "40"),
             ("RTCD_RTC_EGRESSBUDGETMBPS", "250"),
             ("RTCD_RTC_EGRESSBUDGETPPS", "120000"),
+            ("RTCD_RTC_EGRESSADAPT", "true"),
+            ("RTCD_RTC_EGRESSLEARNMINMBPS", "300"),
+            ("RTCD_RTC_EGRESSLEARNMINPPS", "60000"),
             ("RTCD_RTC_REFUSEWHENSATURATED", "false"),
             ("RTCD_STORE_DATASOURCE", "/data/db"),
             ("RTCD_LOGGER_ENABLEFILE", "false"),
@@ -890,6 +926,9 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
         assert_eq!(c.rtc.audio_ptime_ms, 40);
         assert_eq!(c.rtc.egress_budget_mbps, 250);
         assert_eq!(c.rtc.egress_budget_pps, 120_000);
+        assert!(c.rtc.egress_adapt);
+        assert_eq!(c.rtc.egress_learn_min_mbps, 300);
+        assert_eq!(c.rtc.egress_learn_min_pps, 60_000);
         assert!(!c.rtc.refuse_when_saturated);
         assert_eq!(c.store.data_source, "/data/db");
         assert!(!c.logger.enable_file);
@@ -977,6 +1016,8 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
         assert!(bad(&|c| c.rtc.audio_ptime_ms = -20).contains("multiple of 20"));
         assert!(bad(&|c| c.rtc.egress_budget_mbps = -1).contains("between 0 and 100000"));
         assert!(bad(&|c| c.rtc.egress_budget_pps = -1).contains("between 0 and 100000000"));
+        assert!(bad(&|c| c.rtc.egress_learn_min_mbps = -1).contains("between 0 and 100000"));
+        assert!(bad(&|c| c.rtc.egress_learn_min_pps = -1).contains("between 0 and 100000000"));
         assert!(
             bad(&|c| c.rtc.ice_servers = vec![IceServer {
                 urls: vec!["http://x".into()],

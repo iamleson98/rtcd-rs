@@ -32,6 +32,14 @@ ice_host_override = "__RTCD_ICE_HOST_OVERRIDE__"
 # empty and (b) as the default STUN handed to callers.
 ice_servers = [{urls = ["__RTCD_ICE_SERVERS__"]}]
 
+# Tuning is set by environment (RTCD_RTC_*), not here. One switch is worth knowing about:
+# RTCD_RTC_EGRESSADAPT (egress_adapt, default false). Off, the node counts and reports the
+# datagrams the kernel refuses (/system, /metrics) and holds video to the small layers only for
+# a send budget. On, it also acts on them: small video and fewer voices while they last, a
+# learned ceiling after an overload of fifteen seconds (above RTCD_RTC_EGRESSLEARNMINMBPS = 400
+# or RTCD_RTC_EGRESSLEARNMINPPS = 80000 sent), one voice a call if the squeeze is not enough,
+# slower recording uploads. Turn it on after a run on the real card; see README.md.
+
 [store]
 # Registered client credentials persist here — keep /data on a volume so
 # restarting the SFU does not orphan the server registration.
