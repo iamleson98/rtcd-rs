@@ -1,10 +1,10 @@
 //! The media of a recording.
 //!
-//! Every stream the SFU forwards to the recorder is written as it arrives, without decoding or
-//! re-encoding, into WebM files the browser plays directly (VP8 video, Opus audio). A file is one
-//! stretch of continuous media from one person: a camera from when it is turned on until it is
-//! turned off, a voice while it is unmuted. Each starts at its own offset into the recording, so
-//! the player lines them up again.
+//! Every stream of a call is written as it arrives, without decoding or re-encoding, into WebM
+//! files the browser plays directly (VP8 video, Opus audio). A file is one stretch of continuous
+//! media from one person: a camera from when it is turned on until it is turned off, a voice while
+//! it is unmuted. Each starts at its own offset into the recording, so the player lines them up
+//! again.
 
 use std::collections::HashMap;
 use std::io;
