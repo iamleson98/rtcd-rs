@@ -44,7 +44,18 @@ impl Live {
 
     /// Starts with `shards` and lets the SFU grow to `max_shards` by `scaling`.
     pub fn start_up_to(shards: usize, max_shards: usize, scaling: ScalingPolicy) -> Live {
+        Self::start_with(shards, max_shards, scaling, Arc::default())
+    }
+
+    /// Starts with the node's send `egress` gauge given, to feed it what a test needs.
+    pub fn start_with(
+        shards: usize,
+        max_shards: usize,
+        scaling: ScalingPolicy,
+        egress: Arc<rtcd_sfu::egress::Gauge>,
+    ) -> Live {
         let engine = EngineConfig {
+            egress,
             addresses: vec![LocalAddress {
                 bind: "127.0.0.1".parse().unwrap(),
                 public: None,

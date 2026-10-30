@@ -75,6 +75,31 @@ pub struct Service {
     closed: Mutex<HashMap<String, Instant>>,
 }
 
+/// Recording uploads slow down for as long as the kernel refuses the datagrams of the node's media
+/// (both go out of the same network card, and a file can wait where a call cannot), and speed up
+/// again when it stops.
+#[derive(Debug, Default)]
+struct UploadPace {
+    yielding: bool,
+}
+
+impl UploadPace {
+    /// One tick: whether the kernel is refusing, and so how fast the uploads go. Asked every tick
+    /// and not only when `refusing` changes, because the answer also depends on how many files
+    /// wait (see `Recordings::yield_to_media`), which changes while the kernel goes on refusing.
+    fn step(&mut self, refusing: bool, recordings: &Recordings) {
+        if refusing != self.yielding {
+            if refusing {
+                warn!("the kernel is refusing datagrams: recording uploads slow down");
+            } else {
+                info!("the kernel accepts datagrams again: recording uploads at full rate");
+            }
+            self.yielding = refusing;
+        }
+        recordings.yield_to_media(refusing);
+    }
+}
+
 /// How long a closed session is remembered.
 const CLOSED_MEMORY: Duration = Duration::from_secs(60);
 
@@ -116,26 +141,22 @@ impl Service {
         }
     }
 
-    /// Slows recording uploads down for as long as the kernel refuses the datagrams of the node's
-    /// media, once a second, until the task is aborted: both go out of the same network card, and
-    /// a file can wait where a call cannot.
-    pub async fn yield_uploads(self: Arc<Self>) {
+    /// What the service does about the network once a second, until the task is aborted: brings
+    /// the node's send figures up to date (sessions do it too, but a node with none left would
+    /// report its last rate and squeeze for ever), and sets how fast recording uploads go.
+    pub async fn upkeep(self: Arc<Self>) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut yielding = false;
+        let mut uploads = UploadPace::default();
         loop {
             tick.tick().await;
-            let now = self.sfu.egress_refusing();
-            if now != yielding {
-                yielding = now;
-                if yielding {
-                    warn!("the kernel is refusing datagrams: recording uploads slow down");
-                } else {
-                    info!("the kernel accepts datagrams again: recording uploads at full rate");
-                }
-                self.recordings.yield_to_media(yielding);
-            }
+            self.tick(&mut uploads, Instant::now());
         }
+    }
+
+    fn tick(&self, uploads: &mut UploadPace, now: Instant) {
+        self.sfu.tick_egress(now);
+        uploads.step(self.sfu.egress_refusing(), &self.recordings);
     }
 
     /// What `GET /system` reports and `/metrics` exports about the node.
@@ -346,5 +367,47 @@ impl Service {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RecordConfig;
+
+    fn recordings(name: &str) -> (Recordings, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("rtcd-pace-{name}-{}", std::process::id()));
+        let metrics = Arc::new(Metrics::new());
+        let cfg = RecordConfig {
+            enabled: true,
+            data_dir: dir.to_string_lossy().into_owned(),
+            max_pending_bytes: 4 << 30,
+            ..RecordConfig::default()
+        };
+        let r = Recordings::new(&cfg, Arc::new(Reports::new(metrics.clone())), metrics);
+        (r, dir)
+    }
+
+    #[tokio::test]
+    async fn uploads_speed_up_when_files_pile_up_while_the_kernel_goes_on_refusing() {
+        let (r, dir) = recordings("pile");
+        let mut pace = UploadPace::default();
+        // The kernel starts refusing with little waiting: uploads give way.
+        pace.step(true, &r);
+        assert_eq!(r.upload_share(), Some(250));
+        // It goes on refusing for minutes, and the files of the ended classes pile up; `refusing`
+        // never changes, so only a check on every tick sees half the cap go by.
+        for gib in [1u64, 1] {
+            r.hold(gib << 30);
+            pace.step(true, &r);
+        }
+        assert_eq!(
+            r.upload_share(),
+            Some(1000),
+            "uploads at full speed once half of the cap waits, refusals or not"
+        );
+        pace.step(false, &r);
+        assert_eq!(r.upload_share(), Some(1000));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

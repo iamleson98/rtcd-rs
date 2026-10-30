@@ -466,7 +466,7 @@ impl Recordings {
 
     /// Records files of `n` bytes as closed and waiting for upload, as the writers do.
     #[cfg(test)]
-    fn hold(&self, n: u64) {
+    pub(crate) fn hold(&self, n: u64) {
         if let Some(live) = &self.live {
             live.pending.add(n);
         }

@@ -194,7 +194,7 @@ impl App {
         let service = Service::new(cfg.clone(), auth, sfu, metrics);
         service.system.spawn();
         let events = tokio::spawn(service.clone().run_events(rx));
-        let uploads = tokio::spawn(service.clone().yield_uploads());
+        let uploads = tokio::spawn(service.clone().upkeep());
 
         let listener = listen(&cfg.api.http.listen_address).await?;
         let http_addr = listener.local_addr().map_err(|e| StartError::Listen {
