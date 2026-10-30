@@ -583,7 +583,7 @@ fn a_shard_with_room_keeps_the_large_layer() {
 fn a_node_with_no_budget_squeezes_video_when_the_kernel_refuses_datagrams() {
     // No budget is set: the node's own ceiling, learned from the refusals, is all there is.
     let refused = Arc::new(AtomicU64::new(0));
-    let mut w = World::with_config(config_with_refusals(&refused));
+    let mut w = World::with_config(config_with_refusals(&refused, true));
     let a = w.join_with_camera("alice", "call1");
     let b = w.join("bob", "call1");
     let tail = |w: &World| {
@@ -606,5 +606,25 @@ fn a_node_with_no_budget_squeezes_video_when_the_kernel_refuses_datagrams() {
     assert!(
         tail.iter().all(|l| *l == Layer::Low),
         "still on the large layer while the kernel refuses 5,000 datagrams a second"
+    );
+}
+
+#[test]
+fn a_node_that_does_not_adapt_keeps_the_large_layer_whatever_the_kernel_refuses() {
+    // The production release's behaviour: only a send budget squeezes.
+    let refused = Arc::new(AtomicU64::new(0));
+    let mut w = World::with_config(config_with_refusals(&refused, false));
+    let a = w.join_with_camera("alice", "call1");
+    let b = w.join("bob", "call1");
+    w.stream_video(a, false, 3.0, 30, &BOTH);
+    for _ in 0..40 {
+        refused.fetch_add(20_000, Ordering::Relaxed);
+        w.stream_video(a, false, 1.0, 30, &BOTH);
+    }
+    let all = video_of(&w, b, "video_");
+    let last = all.len().saturating_sub(30);
+    assert!(
+        all[last..].iter().all(|(l, _)| *l == Layer::High),
+        "a refusal storm changed a layer"
     );
 }

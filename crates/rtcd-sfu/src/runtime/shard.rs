@@ -21,6 +21,7 @@ use super::registry::Registry;
 use super::scaler::{Level, Pressure};
 use super::table::ShardTable;
 use super::tcp::TcpConn;
+use crate::egress::Gauge;
 use crate::engine::{Command, Engine, Event, FastMap, Load, Proto, RouteUpdate};
 use crate::metrics::{Metrics, NetTraffic};
 use crate::record::RecordSink;
@@ -823,28 +824,30 @@ impl Shard {
                 dir.apply(self.id, updates);
             }
         }
+        // What goes to the node's send gauge is added once for the batch: every shard adds to the
+        // same two counters, and an atomic add per datagram is a million contended writes a
+        // second on a busy node.
+        let (mut wire_bytes, mut wire_packets) = (0u64, 0u64);
         while let Some(t) = self.engine.poll_transmit() {
+            let tcp = matches!(t.proto, Proto::Tcp);
+            wire_bytes += Gauge::wire_len(t.data.len(), t.peer, tcp);
+            wire_packets += 1;
             match t.proto {
                 Proto::Udp => {
                     self.traffic.udp_out_bytes += t.data.len() as u64;
                     self.traffic.udp_out_packets += 1;
-                    self.cfg
-                        .engine
-                        .egress
-                        .add_datagram(t.data.len(), t.peer, false);
                     let idx = self.udp_index(t.local).unwrap_or(0);
                     self.send[idx].push(t.peer, t.data);
                 }
                 Proto::Tcp => {
                     self.traffic.tcp_out_bytes += t.data.len() as u64;
                     self.traffic.tcp_out_packets += 1;
-                    self.cfg
-                        .engine
-                        .egress
-                        .add_datagram(t.data.len(), t.peer, true);
                     self.tcp_send(t.peer, &t.data)
                 }
             }
+        }
+        if wire_packets > 0 {
+            self.cfg.engine.egress.add(wire_bytes, wire_packets);
         }
         for (i, batch) in self.send.iter_mut().enumerate() {
             if !batch.is_empty() {

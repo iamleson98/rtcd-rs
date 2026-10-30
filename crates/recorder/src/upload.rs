@@ -19,6 +19,7 @@ use tracing::{info, warn};
 
 use crate::api::{Api, ApiError};
 use crate::media::Entry;
+use crate::throttle::Throttle;
 
 /// The most files the server takes in one request for URLs; the byte limit keeps a batch short
 /// enough that the next request comes well within the server's patience.
@@ -27,6 +28,20 @@ const BATCH_BYTES: u64 = 256 << 20;
 /// The slowest an upload may go before it is cut off (and retried): far below the cluster's capped
 /// 10 Mb/s.
 const UPLOAD_RATE: u64 = 256 << 10;
+
+/// How long a request of `size` bytes may take. Held to a node-wide rate shared by every request in
+/// flight, a request gets a share of it; and where uploads may stand aside for the node's own media
+/// (the throttle says to what share) a request started at the full rate can find the share cut under
+/// it. The allowance is for the slowest share a request may meet, divided among the requests in
+/// flight, and twice what it takes (the number in flight may grow while it is sent). Where uploads
+/// never stand aside the slowest share is the current one, and the allowance is production's.
+fn request_timeout(size: u64, throttle: Option<&Throttle>) -> Duration {
+    let rate = throttle.map_or(UPLOAD_RATE as f64, |t| {
+        (UPLOAD_RATE as f64).min(t.fair_rate(t.slowest_share()) / 2.0)
+    });
+    Duration::from_secs(60 + (size as f64 / rate) as u64)
+}
+
 /// How many files, and how many parts of one file, are in flight at once. One connection to
 /// storage carries a few MB/s, far below what the node's link does, and the recording is not
 /// watchable before the last byte is in.
@@ -406,6 +421,7 @@ impl Api {
     ) -> Result<(), UploadError> {
         Ok(self
             .retry("upload", || async {
+                let _flight = self.throttle.as_ref().map(Throttle::enter);
                 let mut file = tokio::fs::File::open(path)
                     .await
                     .map_err(|e| ApiError::Network(e.to_string()))?;
@@ -427,7 +443,7 @@ impl Api {
                 let mut req = self
                     .uploads
                     .put(url)
-                    .timeout(Duration::from_secs(60 + size / UPLOAD_RATE))
+                    .timeout(request_timeout(size, self.throttle.as_deref()))
                     .header(CONTENT_LENGTH, size)
                     .body(Body::wrap_stream(stream));
                 if let Some(ct) = content_type {
@@ -466,6 +482,31 @@ impl Api {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_request_held_to_a_share_of_the_rate_is_given_the_time_the_share_takes() {
+        use super::*;
+        let size: u64 = 16 << 20;
+        assert_eq!(request_timeout(size, None).as_secs(), 60 + 64);
+        // A node-wide rate of 1 MiB/s: started at the full rate, a request may find the throttle
+        // cut to a quarter (256 KiB/s) under it, and wants twice the time that takes.
+        let throttle = std::sync::Arc::new(Throttle::new(1 << 20));
+        // Where uploads never stand aside, a throttle faster than the slowest link changes nothing.
+        assert_eq!(request_timeout(size, Some(&throttle)).as_secs(), 60 + 64);
+        throttle.may_yield_to(250);
+        assert_eq!(request_timeout(size, Some(&throttle)).as_secs(), 60 + 128);
+        // Eight requests share it: 32 KiB/s each at the quarter, twice the time for 16 MiB.
+        let flights: Vec<_> = (0..8).map(|_| throttle.enter()).collect();
+        assert_eq!(request_timeout(size, Some(&throttle)).as_secs(), 60 + 1024);
+        drop(flights);
+        assert_eq!(request_timeout(size, Some(&throttle)).as_secs(), 60 + 128);
+        // Held to a tenth: slower than the quarter it was allowed for.
+        throttle.set_share(100);
+        assert_eq!(request_timeout(size, Some(&throttle)).as_secs(), 60 + 320);
+        // A fast node-wide rate never allows less than the slowest the upload may go.
+        let fast = Throttle::new(1 << 30);
+        assert_eq!(request_timeout(size, Some(&fast)).as_secs(), 60 + 64);
+    }
+
     use std::path::PathBuf;
 
     use serde_json::{Value, json};

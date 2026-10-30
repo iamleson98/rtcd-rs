@@ -691,14 +691,30 @@ impl Sfu {
         self.core.cfg.engine.egress.squeezed()
     }
 
+    /// Brings the node's send figures up to `now`, as every session's upkeep does once a second:
+    /// the service calls it on a tick of its own, so that a node with no session left (the last
+    /// class ended while it was squeezed) stops reporting its last rate and squeeze, which a
+    /// server placing calls would read as a node that is full.
+    pub fn tick_egress(&self, now: Instant) {
+        let engine = &self.core.cfg.engine;
+        engine
+            .egress
+            .update(now, engine.egress_budget_bps, engine.egress_budget_pps);
+    }
+
+    /// Whether the node acts on the kernel's refusals, or only counts and reports them.
+    pub fn egress_adapts(&self) -> bool {
+        self.core.cfg.engine.egress.adapts()
+    }
+
     /// Whether the kernel is refusing datagrams now (or was a few seconds ago).
     pub fn egress_refusing(&self) -> bool {
-        self.core.cfg.engine.egress.refusing()
+        self.core.cfg.engine.egress.refusing(Instant::now())
     }
 
     /// Whether it has gone on refusing after the squeeze: calls forward their loudest voice only.
     pub fn egress_choked(&self) -> bool {
-        self.core.cfg.engine.egress.choked()
+        self.core.cfg.engine.egress.choked(Instant::now())
     }
 
     /// How many threads serve sessions right now.

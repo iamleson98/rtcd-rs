@@ -22,6 +22,18 @@ use crate::tap::TapPacket;
 use crate::vp8;
 use crate::webm::{Track, WebmWriter};
 
+/// Why a file could not be opened: the recording's limit of files is reached.
+#[derive(Debug)]
+struct FileLimit;
+
+impl std::fmt::Display for FileLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the recording's limit of files is reached")
+    }
+}
+
+impl std::error::Error for FileLimit {}
+
 /// A voice that stops this long (a muted microphone, a dropped connection) closes its file; the
 /// next frame opens a new one. Shorter gaps are bridged with silence, so a file plays as one
 /// continuous stream.
@@ -102,6 +114,8 @@ pub struct Recording {
     pub disk: Disk,
     files: Mutex<Vec<Entry>>,
     next: AtomicU32,
+    /// The most files that may be opened; zero is no limit.
+    max_files: u32,
 }
 
 impl Recording {
@@ -112,7 +126,21 @@ impl Recording {
             disk: Disk::new(limit),
             files: Mutex::new(Vec::new()),
             next: AtomicU32::new(0),
+            max_files: 0,
         }
+    }
+
+    /// Allows at most `n` files to be opened (zero, no limit): once `n` have been, a stream that
+    /// would open another cannot, and what it receives is left out. A bound on the numbers the
+    /// files will need, not a cut of the ones being written.
+    pub fn with_file_limit(mut self, n: u32) -> Self {
+        self.max_files = n;
+        self
+    }
+
+    /// Whether every file the limit allows has been opened.
+    pub fn file_limit_reached(&self) -> bool {
+        self.max_files > 0 && self.next.load(Ordering::Relaxed) >= self.max_files
     }
 
     /// A moment's offset into the recording, in milliseconds.
@@ -128,9 +156,22 @@ impl Recording {
         &self.dir
     }
 
-    pub fn new_path(&self, kind: &str) -> PathBuf {
-        let n = self.next.fetch_add(1, Ordering::Relaxed) + 1;
-        self.dir.join(format!("{n:05}-{kind}.webm"))
+    /// The path of the next file, `None` once the limit of files is reached.
+    pub fn new_path(&self, kind: &str) -> Option<PathBuf> {
+        let max = self.max_files;
+        let n = self
+            .next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (max == 0 || n < max).then_some(n + 1)
+            })
+            .ok()?
+            + 1;
+        Some(self.dir.join(format!("{n:05}-{kind}.webm")))
+    }
+
+    /// A file that was given a path and could not be created does not count against the limit.
+    fn give_back_path(&self) {
+        self.next.fetch_sub(1, Ordering::Relaxed);
     }
 
     fn add(&self, e: Entry) {
@@ -278,6 +319,11 @@ impl StreamRecorder {
             (Some(seg), Some(every)) => at.saturating_duration_since(seg.opened) >= every,
             _ => false,
         }
+    }
+
+    /// Whether a file of this stream is open.
+    pub fn is_writing(&self) -> bool {
+        self.seg.is_some()
     }
 
     pub fn info(&self) -> &StreamInfo {
@@ -435,7 +481,7 @@ impl StreamRecorder {
                 },
                 (w, h),
             ) {
-                error!(kind = self.info.kind, error = %e, "cannot open a segment");
+                self.open_failed(&e);
                 return;
             }
         }
@@ -460,10 +506,18 @@ impl StreamRecorder {
         if self.seg.is_none()
             && let Err(e) = self.open(now, ts, Track::Opus, (0, 0))
         {
-            error!(kind = self.info.kind, error = %e, "cannot open a segment");
+            self.open_failed(&e);
             return;
         }
         self.write(ts, true, data, false);
+    }
+
+    /// A file could not be opened. Reaching the limit of files is not an error of the stream, and
+    /// whoever set the limit knows (every packet that follows would say it again).
+    fn open_failed(&self, e: &io::Error) {
+        if !e.get_ref().is_some_and(|inner| inner.is::<FileLimit>()) {
+            error!(kind = self.info.kind, error = %e, "cannot open a segment");
+        }
     }
 
     fn open(
@@ -473,8 +527,17 @@ impl StreamRecorder {
         track: Track,
         size: (u32, u32),
     ) -> io::Result<()> {
-        let path = self.rec.new_path(self.info.kind);
-        let writer = WebmWriter::create(&path, &track, self.info.kind, self.rec.disk.clone())?;
+        let Some(path) = self.rec.new_path(self.info.kind) else {
+            return Err(io::Error::other(FileLimit));
+        };
+        let writer = match WebmWriter::create(&path, &track, self.info.kind, self.rec.disk.clone())
+        {
+            Ok(w) => w,
+            Err(e) => {
+                self.rec.give_back_path();
+                return Err(e);
+            }
+        };
         let user_id = self
             .users
             .lock()
@@ -611,6 +674,22 @@ impl StreamRecorder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_recording_with_a_file_limit_opens_no_more_files_than_it() {
+        let dir = std::env::temp_dir().join(format!("recorder-limit-{}", std::process::id()));
+        let rec = Recording::new(&dir, Instant::now(), u64::MAX).with_file_limit(2);
+        assert!(!rec.file_limit_reached());
+        assert!(rec.new_path("voice").is_some());
+        rec.give_back_path(); // a file that could not be created does not count
+        assert!(rec.new_path("voice").is_some());
+        assert!(rec.new_path("camera").is_some());
+        assert!(rec.file_limit_reached());
+        assert!(rec.new_path("voice").is_none(), "the third has no number");
+        let free = Recording::new(&dir, Instant::now(), u64::MAX);
+        assert!((0..1000).all(|_| free.new_path("voice").is_some()));
+        assert!(!free.file_limit_reached(), "zero is no limit");
+    }
+
     use super::*;
     use crate::webm::parse::*;
 

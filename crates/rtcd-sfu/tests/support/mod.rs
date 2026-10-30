@@ -158,12 +158,12 @@ pub struct World {
 
 /// A node with no send budget whose kernel refuses the number of datagrams `refused` says it has
 /// refused so far: the tests raise it as time goes by.
-pub fn config_with_refusals(refused: &Arc<AtomicU64>) -> EngineConfig {
+pub fn config_with_refusals(refused: &Arc<AtomicU64>, adapt: bool) -> EngineConfig {
     let refused = refused.clone();
+    let gauge =
+        rtcd_sfu::egress::Gauge::with_kernel_drops(move || Some(refused.load(Ordering::Relaxed)));
     EngineConfig {
-        egress: Arc::new(rtcd_sfu::egress::Gauge::with_kernel_drops(move || {
-            Some(refused.load(Ordering::Relaxed))
-        })),
+        egress: Arc::new(if adapt { gauge.adapting(0, 0) } else { gauge }),
         ..engine_config()
     }
 }
@@ -512,7 +512,10 @@ impl World {
             // The engine's output to the browsers.
             while let Some(t) = self.engine.poll_transmit() {
                 moved = true;
-                self.egress.add_datagram(t.data.len(), t.peer, false);
+                self.egress.add(
+                    rtcd_sfu::egress::Gauge::wire_len(t.data.len(), t.peer, false),
+                    1,
+                );
                 if self.blackhole {
                     continue;
                 }

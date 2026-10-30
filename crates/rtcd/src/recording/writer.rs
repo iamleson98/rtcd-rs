@@ -139,7 +139,8 @@ impl Job {
         links: Links,
         settings: Settings,
     ) -> Self {
-        let rec = Arc::new(Recording::new(&run.dir, run.t0, max_bytes));
+        let rec =
+            Arc::new(Recording::new(&run.dir, run.t0, max_bytes).with_file_limit(run.max_files));
         Self {
             next_index: run.file_base,
             run,
@@ -206,6 +207,16 @@ impl Job {
             self.end("disk_full", clock);
         }
         self.collect_files();
+        // Every file number the run may use has been taken (a file that cannot be opened is not
+        // one). The run ends now rather than when the last file closes: a stream that cannot
+        // open a file leaves what it receives out, and a rotation is two minutes away. Ending
+        // closes the files that are open, none of which can be past the limit, and the server
+        // starts the call again from the numbers after.
+        if !self.ended && self.rec.file_limit_reached() {
+            warn!(recording = %self.run.recording_id, files = self.run.max_files, "the recording used every file number it was given; ending it");
+            self.rx.shared().cancel();
+            self.end("file_limit", clock);
+        }
         self.report_dropped();
         if self.ended {
             Pump::Done
@@ -236,8 +247,10 @@ impl Job {
                     RecordEnd::Stopped => "stopped",
                     RecordEnd::CallEnded => "call_ended",
                     RecordEnd::Refused => "refused",
-                    // A second request for a recording that goes on: not ours to report.
-                    RecordEnd::AlreadyRecording => "",
+                    // The SFU still holds an earlier capture of this call (one that ended by
+                    // itself a moment ago and has not been let go of): this start was not
+                    // attached to anything, and is answered like any other that is not taken.
+                    RecordEnd::AlreadyRecording => "refused",
                 };
                 self.end(reason, at);
             }
@@ -329,7 +342,8 @@ impl Job {
             dropped,
         };
         info!(recording = %self.run.recording_id, reason, files = ended.files, duration_ms = ended.duration_ms, dropped, "capture ended");
-        self.registry.remove(&self.run.recording_id, self.run.id);
+        self.registry
+            .finish(&self.run.recording_id, self.run.id, ended.files);
         self.metrics.record_capture(-1);
         let _ = self.uploads.send(Cmd::Ended {
             run: self.run.clone(),
@@ -466,6 +480,7 @@ mod tests {
     use rtcd_sfu::record::{RecordBegin, RecordSink, record_channel};
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
+    use super::super::Want;
     use super::*;
 
     struct Rig {
@@ -481,6 +496,16 @@ mod tests {
     }
 
     fn rig(tag: &str, max_bytes: u64, pending_cap: u64, settings: Settings) -> Rig {
+        limited_rig(tag, max_bytes, pending_cap, settings, 0)
+    }
+
+    fn limited_rig(
+        tag: &str,
+        max_bytes: u64,
+        pending_cap: u64,
+        settings: Settings,
+        max_files: u32,
+    ) -> Rig {
         let dir = std::env::temp_dir().join(format!("rtcd-writer-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -491,6 +516,7 @@ mod tests {
             client_id: "mm".into(),
             call_id: "call".into(),
             file_base: 100,
+            max_files,
             dir,
             api: Api::with_clients(&HttpClients::new(), "http://127.0.0.1:1", "rec1", "tok"),
             t0,
@@ -498,7 +524,19 @@ mod tests {
         let metrics = Arc::new(Metrics::new());
         let pending = Arc::new(Pending::new(pending_cap, metrics.clone()));
         let registry = Arc::new(Registry::default());
-        registry.begin("rec1", "mm", "call", 1).unwrap();
+        registry
+            .begin(
+                Want {
+                    recording_id: "rec1",
+                    client_id: "mm",
+                    call_id: "call",
+                    file_base: 100,
+                    max_files,
+                },
+                1,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
         let draining = Arc::new(AtomicBool::new(false));
         let (uploads, cmds) = unbounded_channel();
         let (sink, rx) = record_channel(65536);
@@ -1087,5 +1125,155 @@ mod tests {
             0,
             "the thread let go of the recording"
         );
+    }
+
+    /// A rotating rig with `max_files`, fed two streams (a voice and a camera) for `seconds` of
+    /// media, packet by packet with a pump after each, until the run ends or the media does.
+    fn feed_until_over(rig: &mut Rig, seconds: u64) -> Option<u64> {
+        let t0 = rig.t0;
+        rig.open(0, TrackType::Voice, "a", "ua");
+        rig.open(1, TrackType::Video, "b", "ub");
+        for ms in (0..seconds * 1000).step_by(20) {
+            let at = t0 + Duration::from_millis(ms);
+            rig.packet(
+                0,
+                opus(at, (ms / 20) as u16, (ms / 20) as u32 * 960, &[0xfc, 1, 2]),
+            );
+            if ms.is_multiple_of(60) {
+                let n = (ms / 60) as u32;
+                rig.packet(1, vp8_frame(at, n as u16, n * 5400, n.is_multiple_of(10)));
+            }
+            if rig.job.pump(at) == Pump::Done {
+                return Some(ms);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_run_ends_at_its_file_limit_having_uploaded_what_it_wrote() {
+        let rotating = Settings {
+            rotate_every: Duration::from_millis(1500),
+            ..eager()
+        };
+        let mut rig = limited_rig("limit", u64::MAX, u64::MAX, rotating, 5);
+        assert!(feed_until_over(&mut rig, 60).is_some());
+        assert!(
+            rig.sink.shared().is_cancelled(),
+            "the SFU is told to let go of the call"
+        );
+        let (files, ended) = rig.told();
+        let ended = ended.expect("the run is reported ended");
+        assert_eq!((ended.reason, ended.files), ("file_limit", 5), "{ended:?}");
+        assert_eq!(
+            files.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            [100, 101, 102, 103, 104],
+            "every number of the range, none past it"
+        );
+        for (_, f) in &files {
+            assert!(f.size > 0 && std::fs::metadata(&f.path).is_ok(), "{f:?}");
+        }
+        assert!(rig.registry.is_empty());
+        assert_eq!(rig.registry.unreported(), 1, "its numbers stay taken");
+        assert!(
+            rig.metrics
+                .render()
+                .contains("rtcd_record_files_written_total 5")
+        );
+    }
+
+    #[test]
+    fn a_run_ends_the_moment_its_last_number_is_taken() {
+        // Waiting for the last file to close would leave every stream without a file to write to
+        // for a rotation (two minutes); the run ends and the server starts the call again.
+        let rotating = Settings {
+            rotate_every: Duration::from_secs(120),
+            ..eager()
+        };
+        let mut rig = limited_rig("prompt", u64::MAX, u64::MAX, rotating, 2);
+        let over_at = feed_until_over(&mut rig, 60).expect("it ends");
+        assert!(
+            over_at < 1000,
+            "the voice and the first keyframe: {over_at} ms"
+        );
+        let (files, ended) = rig.told();
+        let ended = ended.unwrap();
+        assert_eq!((ended.reason, ended.files), ("file_limit", 2));
+        assert_eq!(
+            files.len(),
+            2,
+            "both open files were closed and are handed over"
+        );
+        assert!(files.iter().all(|(_, f)| f.size > 0));
+    }
+
+    #[test]
+    fn the_file_limit_holds_however_the_streams_open_and_close() {
+        // Voices and cameras that rotate quickly, with a file limit from one to a dozen: the run
+        // never takes a number past `base + limit`, and ends for the limit once every one is used.
+        for limit in 1..=12u32 {
+            let rotating = Settings {
+                rotate_every: Duration::from_millis(400),
+                ..eager()
+            };
+            let mut rig = limited_rig(&format!("many{limit}"), u64::MAX, u64::MAX, rotating, limit);
+            assert!(feed_until_over(&mut rig, 60).is_some(), "{limit}");
+            let (files, ended) = rig.told();
+            let ended = ended.unwrap();
+            assert_eq!(
+                (ended.reason, ended.files),
+                ("file_limit", limit),
+                "limit {limit}"
+            );
+            assert!(
+                files.iter().all(|(i, _)| (100..100 + limit).contains(i)),
+                "limit {limit}: {:?}",
+                files.iter().map(|(i, _)| i).collect::<Vec<_>>()
+            );
+            assert_eq!(files.len() as u32, limit);
+        }
+    }
+
+    #[test]
+    fn a_stop_before_the_limit_is_a_stop_and_a_run_without_a_limit_has_none() {
+        let rotating = Settings {
+            rotate_every: Duration::from_millis(1500),
+            ..eager()
+        };
+        let mut rig = limited_rig("below", u64::MAX, u64::MAX, rotating, 50);
+        assert_eq!(feed_until_over(&mut rig, 6), None);
+        let t = rig.t0 + Duration::from_secs(6);
+        rig.end(RecordEnd::Stopped, t);
+        assert_eq!(rig.job.pump(t), Pump::Done);
+        let (files, ended) = rig.told();
+        let ended = ended.unwrap();
+        assert_eq!(ended.reason, "stopped");
+        assert_eq!(files.len() as u32, ended.files);
+        assert!(ended.files < 50);
+
+        let mut rig = rig_without_limit(rotating);
+        assert_eq!(feed_until_over(&mut rig, 30), None);
+        assert!(!rig.sink.shared().is_cancelled());
+    }
+
+    fn rig_without_limit(settings: Settings) -> Rig {
+        limited_rig("nolimit", u64::MAX, u64::MAX, settings, 0)
+    }
+
+    #[test]
+    fn a_second_request_for_a_call_the_sfu_still_holds_is_a_refusal() {
+        // The SFU lets go of a capture that ended by itself a moment after it did; a start in
+        // between is not attached to anything, and is answered like any that is not taken.
+        let mut rig = rig("already", u64::MAX, u64::MAX, eager());
+        let now = rig.t0;
+        rig.send(RecordItem::Begin(Box::new(RecordBegin {
+            recording_id: "rec1".into(),
+            t0: now,
+        })));
+        rig.end(RecordEnd::AlreadyRecording, now);
+        assert_eq!(rig.job.pump(now), Pump::Done);
+        let (files, ended) = rig.told();
+        assert!(files.is_empty());
+        assert_eq!(ended.unwrap().reason, "refused");
     }
 }

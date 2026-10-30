@@ -10,6 +10,49 @@ use rtcd_proto::MessageType;
 use rtcd_sfu::engine::{CloseReason, Event};
 use rtcd_sfu::runtime::ScalingPolicy;
 
+/// The node's send figures age by themselves: the last class ended while the node was squeezed,
+/// and nothing but the service's tick is left to bring them up to date.
+#[test]
+fn a_node_with_no_session_left_stops_reporting_its_last_squeeze_and_rates() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use rtcd_sfu::egress::Gauge;
+
+    let refused = Arc::new(AtomicU64::new(0));
+    let counter = refused.clone();
+    let gauge = Arc::new(
+        Gauge::with_kernel_drops(move || Some(counter.load(Ordering::Relaxed))).adapting(0, 0),
+    );
+    let live = Live::start_with(1, 0, ScalingPolicy::default(), gauge.clone());
+    let sfu = &live.sfu;
+    // Ticks on a clock of the test's own: a class sends, then the kernel refuses for a while.
+    let start = Instant::now();
+    let mut second = 0u64;
+    let mut tick = |sent_mbps: u64, refused_now: u64| {
+        second += 1;
+        gauge.add(sent_mbps * 125_000, sent_mbps * 125_000 / 1_200);
+        refused.fetch_add(refused_now, Ordering::Relaxed);
+        sfu.tick_egress(start + Duration::from_secs(second));
+    };
+    for _ in 0..10 {
+        tick(300, 0);
+    }
+    for _ in 0..5 {
+        tick(700, 5_000);
+    }
+    assert!(sfu.egress_squeezed(), "the kernel refused");
+    assert!(sfu.egress_bps() > 400_000_000);
+    // The last session leaves. Nothing sends, nothing is refused, and nobody is left to update
+    // the gauge but the tick.
+    for _ in 0..60 {
+        tick(0, 0);
+    }
+    assert!(!sfu.egress_squeezed(), "still squeezed with nobody there");
+    assert_eq!(sfu.egress_bps(), 0);
+    assert_eq!(sfu.egress_pps(), 0);
+}
+
 #[test]
 fn two_browsers_connect_and_hear_each_other_over_real_sockets() {
     let mut live = Live::start(1);

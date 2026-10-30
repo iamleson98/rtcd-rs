@@ -5,6 +5,7 @@
 //! debt, and waits until the debt is repaid. A chunk larger than the bucket therefore never
 //! blocks for good, and callers that arrive together are served in the order they reserved.
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -14,10 +15,17 @@ const BURST: f64 = 0.25;
 /// The whole rate, in thousandths.
 const FULL: u32 = 1000;
 
+/// Longest sleep before a waiter looks again at the rate, which may have changed.
+const SLICE: Duration = Duration::from_millis(500);
+
 #[derive(Debug)]
 struct State {
-    /// Bytes that may be sent at once; negative while a reservation is being waited out.
-    tokens: f64,
+    /// Bytes the rate has allowed so far, and bytes reserved so far, both counted from the start;
+    /// what may be sent at once is the difference (negative while reservations are waited out).
+    /// A reservation's place in the queue is the total reserved up to it, so a waiter can ask
+    /// again later, at whatever the rate has become, how long is left.
+    allowed: f64,
+    reserved: f64,
     at: Instant,
 }
 
@@ -26,11 +34,25 @@ struct State {
 pub struct Throttle {
     /// Bytes per second.
     rate: f64,
-    /// How much of `rate` is let through, in thousandths (see [`Throttle::set_share`]).
+    /// How much of `rate` is let through, in thousandths (see [`Throttle::set_share`]), and the
+    /// least it may be set to (see [`Throttle::may_yield_to`]).
     share: AtomicU32,
+    floor: AtomicU32,
     state: Mutex<State>,
     /// The rate no longer applies (see [`Throttle::lift`]).
     lifted: AtomicBool,
+    /// How many requests are being sent through it (see [`Throttle::enter`]).
+    in_flight: AtomicU32,
+}
+
+/// A request being sent through a [`Throttle`], counted while it lives.
+#[derive(Debug)]
+pub struct Flight(Arc<Throttle>);
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Throttle {
@@ -40,12 +62,28 @@ impl Throttle {
         Self {
             rate,
             share: AtomicU32::new(FULL),
+            floor: AtomicU32::new(FULL),
             state: Mutex::new(State {
-                tokens: rate * BURST,
+                allowed: rate * BURST,
+                reserved: 0.0,
                 at: Instant::now(),
             }),
             lifted: AtomicBool::new(false),
+            in_flight: AtomicU32::new(0),
         }
+    }
+
+    /// Counts a request as being sent through the throttle until the returned guard is dropped.
+    pub fn enter(self: &Arc<Self>) -> Flight {
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        Flight(self.clone())
+    }
+
+    /// The rate, in bytes a second, each request in flight gets when the throttle is held to its
+    /// share `permille` thousandths of the whole (and at least this one request is in flight).
+    pub fn fair_rate(&self, permille: u32) -> f64 {
+        let in_flight = self.in_flight.load(Ordering::Relaxed).max(1);
+        self.rate * f64::from(permille.clamp(1, FULL)) / f64::from(FULL) / f64::from(in_flight)
     }
 
     /// Lets only `permille` thousandths of the rate through from now on (1,000: all of it; at
@@ -54,6 +92,18 @@ impl Throttle {
     /// loses packets costs a class.
     pub fn set_share(&self, permille: u32) {
         self.share.store(permille.clamp(1, FULL), Ordering::Relaxed);
+    }
+
+    /// Says that the share may be set as low as `permille` thousandths later (by whoever makes
+    /// uploads stand aside), so that [`Throttle::slowest_share`] allows for it.
+    pub fn may_yield_to(&self, permille: u32) {
+        self.floor.store(permille.clamp(1, FULL), Ordering::Relaxed);
+    }
+
+    /// The slowest share a request sent now may find itself held to: the current one, or the
+    /// lowest it may be set to if that is lower.
+    pub fn slowest_share(&self) -> u32 {
+        self.share().min(self.floor.load(Ordering::Relaxed))
     }
 
     /// How much of the rate is let through now, in thousandths.
@@ -67,29 +117,63 @@ impl Throttle {
         self.lifted.store(true, Ordering::Release);
     }
 
-    /// Reserves `bytes` at `now` and says how long to wait before sending them.
-    pub fn reserve(&self, bytes: u64, now: Instant) -> Duration {
+    fn rate_now(&self) -> f64 {
+        self.rate * f64::from(self.share.load(Ordering::Relaxed)) / f64::from(FULL)
+    }
+
+    /// Lets the time since the last call pay for bytes at the rate in force, up to a burst.
+    fn advance(&self, s: &mut State, now: Instant, rate: f64) {
+        let elapsed = now.saturating_duration_since(s.at).as_secs_f64();
+        s.at = s.at.max(now);
+        s.allowed = (s.allowed + elapsed * rate).min(s.reserved + rate * BURST);
+    }
+
+    /// Reserves `bytes` at `now`: the place in the queue, and how long to wait for it at the rate
+    /// in force now.
+    fn ticket(&self, bytes: u64, now: Instant) -> (f64, Duration) {
+        if self.lifted.load(Ordering::Acquire) {
+            return (0.0, Duration::ZERO);
+        }
+        let rate = self.rate_now();
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        self.advance(&mut s, now, rate);
+        s.reserved += bytes as f64;
+        let ticket = s.reserved;
+        (ticket, wait(&s, ticket, rate))
+    }
+
+    /// How long is left to wait for a place in the queue, at the rate in force now.
+    fn remaining(&self, ticket: f64, now: Instant) -> Duration {
         if self.lifted.load(Ordering::Acquire) {
             return Duration::ZERO;
         }
-        let rate = self.rate * f64::from(self.share.load(Ordering::Relaxed)) / f64::from(FULL);
+        let rate = self.rate_now();
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let elapsed = now.saturating_duration_since(s.at).as_secs_f64();
-        s.at = s.at.max(now);
-        s.tokens = (s.tokens + elapsed * rate).min(rate * BURST) - bytes as f64;
-        if s.tokens >= 0.0 {
-            Duration::ZERO
-        } else {
-            Duration::from_secs_f64(-s.tokens / rate)
-        }
+        self.advance(&mut s, now, rate);
+        wait(&s, ticket, rate)
     }
 
-    /// Waits until `bytes` may be sent.
+    /// Reserves `bytes` at `now` and says how long to wait before sending them.
+    pub fn reserve(&self, bytes: u64, now: Instant) -> Duration {
+        self.ticket(bytes, now).1
+    }
+
+    /// Waits until `bytes` may be sent. The wait follows the rate: bytes reserved while uploads
+    /// stood aside go as soon as the rate is back, not when the slow rate would have let them.
     pub async fn take(&self, bytes: u64) {
-        let wait = self.reserve(bytes, Instant::now());
-        if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
+        let (ticket, mut left) = self.ticket(bytes, Instant::now());
+        while !left.is_zero() {
+            tokio::time::sleep(left.min(SLICE)).await;
+            left = self.remaining(ticket, Instant::now());
         }
+    }
+}
+
+fn wait(s: &State, ticket: f64, rate: f64) -> Duration {
+    if s.allowed >= ticket {
+        Duration::ZERO
+    } else {
+        Duration::from_secs_f64((ticket - s.allowed) / rate)
     }
 }
 
@@ -144,6 +228,56 @@ mod tests {
         t.set_share(0);
         let wait = t.reserve(1000, now);
         assert!((wait.as_secs_f64() - 1000.0).abs() < 1.0, "{wait:?}");
+    }
+
+    #[test]
+    fn a_waiter_follows_the_rate_when_it_changes() {
+        let t = Throttle::new(1000);
+        let now = Instant::now();
+        t.set_share(100);
+        // 100 bytes a second after a burst of 25: a reservation of 1250 waits 12.25 seconds.
+        let (ticket, wait) = t.ticket(1250, now);
+        assert!((wait.as_secs_f64() - 12.25).abs() < 0.01, "{wait:?}");
+        // A second later the rate is half the full one: 25 + 500 bytes have been allowed and 725
+        // are left, 1.45 seconds at the new rate, where the old rate would have taken 7 more.
+        t.set_share(500);
+        let left = t.remaining(ticket, now + Duration::from_secs(1));
+        assert!((left.as_secs_f64() - 1.45).abs() < 0.01, "{left:?}");
+    }
+
+    #[tokio::test]
+    async fn a_sleeper_wakes_early_when_the_rate_returns() {
+        // 1,000 bytes a second after the burst: 5,000 bytes would take five seconds.
+        let t = std::sync::Arc::new(Throttle::new(100_000));
+        t.set_share(10);
+        let started = Instant::now();
+        let waiting = {
+            let t = t.clone();
+            tokio::spawn(async move { t.take(5_000).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        t.set_share(1000);
+        waiting.await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn waiters_are_served_in_the_order_they_reserved_whatever_the_rate_does() {
+        let t = Throttle::new(1000);
+        let now = Instant::now();
+        // The burst is 250 bytes: the first is ready after 0.25 s, the second after 0.75 s.
+        let (first, _) = t.ticket(500, now);
+        let (second, _) = t.ticket(500, now);
+        let at = now + Duration::from_millis(400);
+        assert!(t.remaining(first, at) < t.remaining(second, at));
+        let ready = now + Duration::from_millis(550);
+        assert!(t.remaining(first, ready).is_zero());
+        let left = t.remaining(second, ready).as_secs_f64();
+        assert!((left - 0.2).abs() < 0.01, "{left}");
     }
 
     #[test]

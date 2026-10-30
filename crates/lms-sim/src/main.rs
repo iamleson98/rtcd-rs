@@ -196,6 +196,7 @@ async fn record_in_rtcd(
             .unwrap()
             .as_millis() as i64,
         file_base: 0,
+        max_files: 0,
         site_url: lms.url.clone(),
         token: "bot-token".into(),
     }));
