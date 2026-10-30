@@ -145,8 +145,10 @@ struct State {
     run: u32,
     squeezed_run: u32,
     /// Whether the node was squeezed when the run began (if not, the ceiling it had did not
-    /// protect it), and the most it sent during the run.
+    /// protect it), and the most the card took of what the node sent, in the last window and
+    /// during the run: bits and packets per second.
     run_began_squeezed: bool,
+    accepted: (f64, f64),
     run_peak: (f64, f64),
     /// The last window that refused, and the last in which the kernel was refusing (two in a row,
     /// for the uploads).
@@ -380,6 +382,12 @@ impl Gauge {
             total.saturating_sub(st.bytes) as f64 * 8.0 / secs,
         );
         st.rate_pps = smooth(st.rate_pps, sent as f64 / secs);
+        if sent == 0 {
+            // Nothing was handed to a socket: an empty node reports no rate, not the average of
+            // its last seconds.
+            st.rate_bps = 0.0;
+            st.rate_pps = 0.0;
+        }
         st.at = Some(now);
         st.bytes = total;
         st.packets = packets;
@@ -405,6 +413,10 @@ impl Gauge {
 
         let refusing =
             refused as f64 / secs >= (REFUSAL_SHARE * sent as f64 / secs).max(DROPS_PER_SEC);
+        // What the card took of what was handed to the sockets: the gauge counts a datagram the
+        // kernel then refuses too, so the demand can be twice the card's limit.
+        let kept = 1.0 - (refused as f64 / sent.max(1) as f64).min(1.0);
+        st.accepted = (st.rate_bps * kept, st.rate_pps * kept);
         if sent == 0 {
             // Nothing was sent: no session is left, and an empty node is neither squeezed nor
             // choked nor in the middle of anything (the ceiling it learned ages on its own).
@@ -417,8 +429,8 @@ impl Gauge {
             st.run += 1;
             st.refused_at = Some(now);
             st.run_peak = (
-                st.run_peak.0.max(st.rate_bps),
-                st.run_peak.1.max(st.rate_pps),
+                st.run_peak.0.max(st.accepted.0),
+                st.run_peak.1.max(st.accepted.1),
             );
             if st.run >= YIELD_AFTER {
                 st.refusing_at = Some(now);
@@ -528,33 +540,35 @@ fn quiet(st: &mut State) {
 }
 
 /// What an overload teaches, given whether the window just measured refused (`st.run` counts the
-/// refusing windows in a row up to it) and the learn floor: after [`OVERLOAD_AFTER`] of them at a
-/// rate over the floor, a ceiling at 90 % of the most the node sent in the run (before the squeeze
-/// took it down), with the squeeze at once. A node that was
-/// not squeezed when the run began was not protected by the ceiling it had, whatever it was, and
-/// learns afresh; one that was squeezed learns only a lower rate (a refusal near or above the
-/// ceiling), the squeeze being what answers the rest. A ceiling is lifted a notch for every
-/// [`GROW_AFTER`] spent without refusals, however many went by since it was last looked at, and
-/// forgotten once it is [`FORGET_AT`] times what was taught.
+/// refusing windows in a row up to it) and the learn floor: after [`OVERLOAD_AFTER`] of them, with
+/// the card having taken at least the floor in bits or in packets, each limit's ceiling at 90 % of
+/// the most the card took in the run (what was handed to the sockets less what the kernel refused,
+/// before the squeeze took the node down), with the squeeze at once. A node that was not squeezed
+/// when the run began was not protected by the ceiling it had, whatever it was, and learns afresh;
+/// one that was squeezed learns a limit again only if that limit is the one being met (the card
+/// takes near or above its ceiling), the squeeze being what answers the rest. A ceiling is lifted a
+/// notch for every [`GROW_AFTER`] spent without refusals, however many went by since it was last
+/// looked at, and forgotten once it is [`FORGET_AT`] times what was taught.
 fn learn(st: &mut State, now: Instant, refusing: bool, floor: (f64, f64)) {
     if refusing {
-        if st.run < OVERLOAD_AFTER || (st.rate_bps < floor.0 && st.rate_pps < floor.1) {
+        // The floor is checked against the most the card took in the run, which is also what the
+        // ceiling is made of, not against the rate now (the stall squeeze has lowered it).
+        if st.run < OVERLOAD_AFTER || (st.run_peak.0 < floor.0 && st.run_peak.1 < floor.1) {
             return;
         }
         let near = |rate: f64, learned: f64| learned == 0.0 || rate >= learned * RELEARN_NEAR;
-        let none = st.learned_bps == 0.0 && st.learned_pps == 0.0;
-        let fresh = none || !st.run_began_squeezed;
-        if fresh || near(st.rate_bps, st.learned_bps) || near(st.rate_pps, st.learned_pps) {
-            // What the node sent when the card began to refuse it, before the squeeze took it
-            // down; a node already squeezed that is refused still has only the rate it has now.
-            let base = if fresh {
-                st.run_peak
-            } else {
-                (st.rate_bps, st.rate_pps)
-            };
+        // What the node sent when the card began to refuse it, before the squeeze took it down;
+        // a node already squeezed that is refused still has only what the card takes now. Each
+        // limit is taught on its own: a packet-bound overload must not teach the bit ceiling from
+        // the bit rate the squeeze left.
+        let fresh = !st.run_began_squeezed;
+        let base = if fresh { st.run_peak } else { st.accepted };
+        if fresh || near(st.accepted.0, st.learned_bps) {
             st.learned_bps = LEARNED_SHARE * base.0;
-            st.learned_pps = LEARNED_SHARE * base.1;
             st.taught_bps = st.learned_bps;
+        }
+        if fresh || near(st.accepted.1, st.learned_pps) {
+            st.learned_pps = LEARNED_SHARE * base.1;
             st.taught_pps = st.learned_pps;
         }
         st.squeezed = true;
@@ -1033,7 +1047,7 @@ Udp6InCsumErrors                \t0\n";
     }
 
     #[test]
-    fn a_long_stall_never_chokes_and_a_stall_that_returns_is_held_longer() {
+    fn a_stall_of_fourteen_seconds_never_chokes_and_a_stall_that_returns_is_held_longer() {
         let mut rig = Rig::adaptive();
         rig.run_pps(300, 60_000, 0);
         let mut ever_choked = false;
@@ -1094,9 +1108,10 @@ Udp6InCsumErrors                \t0\n";
         }
         let ceiling = rig.g.ceiling_pps();
         assert!(
-            (89_000..=91_000).contains(&ceiling),
-            "0.9 of the 100 thousand it sent before the squeeze: {ceiling}"
+            (80_000..=82_000).contains(&ceiling),
+            "0.9 of the 90 thousand the card took of the 100 thousand sent: {ceiling}"
         );
+        assert!(ceiling <= 90_000, "a ceiling above what the card takes");
         assert!(rig.g.squeezed());
         assert!(rig.choked(), "the squeeze did not help");
         assert!(chokes > 30);
@@ -1141,7 +1156,11 @@ Udp6InCsumErrors                \t0\n";
         let (onsets, chokes) = bandwidth_ramp(&mut rig, 500.0, 1.05, 1.0, 400);
         assert!(chokes > 0, "refused for four minutes and never choked");
         assert!(onsets <= 3, "{onsets} squeezes");
-        assert!(rig.g.ceiling_bps() > 400_000_000, "{}", rig.g.ceiling_bps());
+        let ceiling = rig.g.ceiling_bps();
+        assert!(
+            (400_000_000..=500_000_000).contains(&ceiling),
+            "at or below what the 500 Mbit/s card takes: {ceiling}"
+        );
     }
 
     #[test]
@@ -1270,5 +1289,89 @@ Udp6InCsumErrors                \t0\n";
         }
         assert!(onsets <= 8, "{onsets} squeezes in 25 minutes");
         assert!(onsets >= 2, "it does release: {onsets}");
+    }
+
+    #[test]
+    fn what_a_stall_teaches_depends_on_what_the_card_took_and_on_how_long_it_lasts() {
+        // The limit of what the gauge can tell apart, to be measured on the real card: refusals
+        // for OVERLOAD_AFTER windows are an overload however they came about, if the card took at
+        // least the floor of what was sent. A stall that took everything took nothing.
+        let mut rig = Rig::new(Gauge::adaptive(400_000_000, 80_000));
+        rig.run_pps(300, 90_000, 0);
+        rig.run_pps(60, 90_000, 90_000);
+        assert_eq!(
+            rig.g.ceiling_pps(),
+            0,
+            "a stall of a minute that took nothing"
+        );
+        rig.run_pps(30, 90_000, 0);
+        // The card takes half of 180 thousand a second: 14 windows of that are no overload...
+        rig.run_pps(14, 180_000, 90_000);
+        assert_eq!(rig.g.ceiling_pps(), 0);
+        rig.run_pps(30, 90_000, 0);
+        // ...and fifteen are, and the ceiling is what the card took.
+        rig.run_pps(15, 180_000, 90_000);
+        let ceiling = rig.g.ceiling_pps();
+        assert!((80_000..=90_000).contains(&ceiling), "{ceiling}");
+    }
+
+    #[test]
+    fn the_ceiling_is_made_of_what_the_card_took_not_of_what_was_asked_of_it() {
+        // Demand at twice the card's limit of 90 thousand packets a second.
+        let mut rig = Rig::new(Gauge::adaptive(0, 80_000));
+        rig.run_pps(60, 60_000, 0);
+        rig.run_pps(30, 180_000, 90_000);
+        let ceiling = rig.g.ceiling_pps();
+        assert!(
+            ceiling > 0 && ceiling <= 90_000,
+            "a ceiling of {ceiling} for a card of 90,000"
+        );
+        assert!(ceiling >= 80_000, "{ceiling}");
+    }
+
+    #[test]
+    fn a_packet_bound_overload_does_not_teach_the_bit_ceiling_from_the_squeezed_bit_rate() {
+        let mut rig = Rig::new(Gauge::adaptive(0, 0));
+        rig.run_pps(60, 85_000, 0);
+        // Voice: 100 thousand packets of 1,000 bytes asked of a card that takes 90 thousand.
+        for _ in 0..16 {
+            rig.window_with(100_000 * 1_000, 100_000, 10_000, (0, 0));
+        }
+        let (bits, packets) = (rig.g.ceiling_bps(), rig.g.ceiling_pps());
+        assert!(bits > 0 && packets > 0);
+        // The squeeze takes the video away: a third of the bits, the same packets, still refused.
+        for _ in 0..10 {
+            rig.window_with(100_000 * 330, 100_000, 10_000, (0, 0));
+        }
+        assert_eq!(
+            rig.g.ceiling_bps(),
+            bits,
+            "the bit ceiling was taught from the squeezed rate"
+        );
+        assert!(
+            rig.g.ceiling_pps() <= packets,
+            "the packet ceiling is the limit being met"
+        );
+    }
+
+    #[test]
+    fn an_emptied_node_reports_no_rate_and_does_not_flash_a_squeeze() {
+        let mut rig = Rig::new(Gauge::adaptive(0, 0));
+        rig.run(300, 300, 0);
+        rig.run(20, 700, 5_000);
+        assert!(rig.g.squeezed() && rig.g.rate_bps() > 0);
+        let mut ever = false;
+        rig.run(1, 0, 0);
+        ever |= rig.g.squeezed();
+        assert_eq!(rig.g.rate_bps(), 0, "an average of the last seconds");
+        assert_eq!(rig.g.rate_pps(), 0);
+        assert!(!ever, "squeezed in the first empty window");
+        // The same for a budget alone.
+        let mut rig = Rig::new(Gauge::default());
+        run_budget(&mut rig, 6, 290, 300);
+        assert!(rig.g.squeezed());
+        run_budget(&mut rig, 1, 0, 300);
+        assert_eq!((rig.g.rate_bps(), rig.g.rate_pps()), (0, 0));
+        assert!(!rig.g.squeezed());
     }
 }

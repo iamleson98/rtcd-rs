@@ -715,17 +715,18 @@ fn a_node_whose_kernel_keeps_refusing_after_the_squeeze_forwards_the_loudest_voi
     assert!(calm[0] > 100 && calm[1] > 100, "both are heard: {calm:?}");
 
     // The first seconds of refusals: video is squeezed and two voices are forwarded.
-    gained(&mut w, 3, 5_000, 4);
-    let squeezed = gained(&mut w, 2, 5_000, 4);
+    gained(&mut w, 3, 100, 4);
+    let squeezed = gained(&mut w, 2, 100, 4);
     assert!(
         squeezed[0] > 50 && squeezed[1] > 50 && squeezed[2] < 30 && squeezed[3] < 30,
         "the two loudest go on, the others are left out: {squeezed:?}"
     );
 
-    // An overload: refusals for fifteen seconds teach the ceiling, and refusals that go on through
+    // An overload: the card takes most of the 800 or so packets a second but not all (a hundred
+    // refused, an eighth), and refusals for fifteen seconds teach the ceiling, and refusals that go on through
     // the squeeze it holds for five more leave the loudest voice only.
-    gained(&mut w, 15, 5_000, 4);
-    let choked = gained(&mut w, 3, 5_000, 4);
+    gained(&mut w, 15, 100, 4);
+    let choked = gained(&mut w, 3, 100, 4);
     assert!(choked[0] > 100, "the loudest goes on: {choked:?}");
     assert!(
         choked[1] < 30 && choked[2] < 30 && choked[3] < 30,
@@ -871,4 +872,43 @@ fn a_node_that_does_not_adapt_forwards_every_voice_whatever_the_kernel_refuses()
             "speaker {i} was heard {gained} times of 2000"
         );
     }
+}
+
+#[test]
+fn a_budget_squeezes_and_limits_voices_on_a_node_that_does_not_adapt() {
+    // The production release's behaviour with a send budget set (the gauge now counts every
+    // datagram, so a budget trips earlier, but it still squeezes and follows the voice limit).
+    let mut w = World::with_config(EngineConfig {
+        audio_loudest: 0,
+        egress_budget_pps: 1,
+        ..engine_config()
+    });
+    let speakers: Vec<usize> = (0..4).map(|i| w.join(&format!("s{i}"), "call1")).collect();
+    let listener = w.join("listener", "call1");
+    wait_tracks(&mut w, listener, 0);
+    let levels = [25u8, 30, 90, 100];
+    let second = |w: &mut World| {
+        for _ in 0..50 {
+            for (&i, &level) in speakers.iter().zip(&levels) {
+                w.send_audio(i, level);
+            }
+            w.run_for(Duration::from_millis(20));
+        }
+    };
+    for _ in 0..4 {
+        second(&mut w);
+    }
+    let before: Vec<usize> = (0..4)
+        .map(|i| w.browsers[listener].received_on(&format!("voice_session-s{i}")))
+        .collect();
+    for _ in 0..3 {
+        second(&mut w);
+    }
+    let gained: Vec<usize> = (0..4)
+        .map(|i| w.browsers[listener].received_on(&format!("voice_session-s{i}")) - before[i])
+        .collect();
+    assert!(
+        gained[0] > 100 && gained[1] > 100 && gained[2] < 30 && gained[3] < 30,
+        "the two loudest go on, the others are left out: {gained:?}"
+    );
 }
