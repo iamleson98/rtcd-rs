@@ -364,22 +364,45 @@ impl Gauge {
     }
 }
 
-/// The kernel's count of UDP datagrams it could not queue for sending (`SndbufErrors` in
-/// `/proc/net/snmp`), where the system has one.
+/// The kernel's count of UDP datagrams it could not queue for sending, IPv4 and IPv6 together
+/// (`SndbufErrors` in `/proc/net/snmp`, `Udp6SndbufErrors` in `/proc/net/snmp6`), where the
+/// system has one.
+///
+/// It is the network namespace's, so with `hostNetwork` it counts every process on the machine
+/// that sends UDP, and the node's reaction (small video, fewer voices, slower uploads) answers a
+/// refusal that may not be its own. It counts calls, not datagrams: a segmented send of up to 64
+/// datagrams that fails adds one, so the rate it gives is low, the safe way.
 fn udp_send_errors() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        let snmp = std::fs::read_to_string("/proc/net/snmp").ok()?;
-        let mut lines = snmp.lines().filter(|l| l.starts_with("Udp:"));
-        let names = lines.next()?;
-        let values = lines.next()?;
-        let at = names.split_whitespace().position(|n| n == "SndbufErrors")?;
-        values.split_whitespace().nth(at)?.parse().ok()
+        let read = |path| std::fs::read_to_string(path).ok();
+        let v4 = read("/proc/net/snmp").and_then(|t| parse_snmp(&t));
+        let v6 = read("/proc/net/snmp6").and_then(|t| parse_snmp6(&t));
+        (v4.is_some() || v6.is_some()).then(|| v4.unwrap_or(0) + v6.unwrap_or(0))
     }
     #[cfg(not(target_os = "linux"))]
     {
         None
     }
+}
+
+/// `SndbufErrors` of the `Udp:` lines of `/proc/net/snmp` (a line of names, then one of values).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_snmp(snmp: &str) -> Option<u64> {
+    let mut lines = snmp.lines().filter(|l| l.starts_with("Udp:"));
+    let names = lines.next()?;
+    let values = lines.next()?;
+    let at = names.split_whitespace().position(|n| n == "SndbufErrors")?;
+    values.split_whitespace().nth(at)?.parse().ok()
+}
+
+/// `Udp6SndbufErrors` of `/proc/net/snmp6` (a name and a value on each line).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_snmp6(snmp6: &str) -> Option<u64> {
+    snmp6.lines().find_map(|l| {
+        let mut f = l.split_whitespace();
+        (f.next()? == "Udp6SndbufErrors").then(|| f.next()?.parse().ok())?
+    })
 }
 
 /// The lower of a configured budget (0: none) and a learned ceiling (0: none yet); 0 if neither.
@@ -796,6 +819,23 @@ mod tests {
         }
         let reads = reads.load(Ordering::Relaxed);
         assert!((10..=11).contains(&reads), "{reads} reads");
+    }
+
+    #[test]
+    fn the_refusal_counts_of_both_families_are_read() {
+        // As Linux 6 prints them (shortened).
+        let snmp = "Ip: Forwarding DefaultTTL\nIp: 1 64\n\
+Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti MemErrors\n\
+Udp: 10 2 0 9 1 777 0 0 0\n";
+        assert_eq!(parse_snmp(snmp), Some(777));
+        let snmp6 = "Ip6InReceives                   \t5\n\
+Udp6InDatagrams                 \t3\n\
+Udp6RcvbufErrors                \t0\n\
+Udp6SndbufErrors                \t41\n\
+Udp6InCsumErrors                \t0\n";
+        assert_eq!(parse_snmp6(snmp6), Some(41));
+        assert_eq!(parse_snmp("Udp: InDatagrams\nUdp: 1\n"), None);
+        assert_eq!(parse_snmp6("Udp6InDatagrams 3\n"), None);
     }
 
     #[test]
