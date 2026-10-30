@@ -515,3 +515,61 @@ async fn a_run_never_takes_a_number_past_its_file_limit() {
     assert_eq!(uploads, ["300"], "nothing was uploaded past the limit");
     c.s.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_sent_again_after_its_end_was_lost_gets_the_end_again() {
+    let (mut c, _) = call_of_two("lostend").await;
+    c.wa.send(&start(&c.lms, REC_ID, "call1", 400)).await;
+    c.speak(60).await;
+    c.wa.send(&ClientMessage::RecordStop(RecordStop {
+        recording_id: REC_ID.into(),
+    }))
+    .await;
+    c.until("the end", |r| ends(r, REC_ID).len() == 1).await;
+    let first = ends(&reports([&c.wa, &c.wb]), REC_ID).remove(0);
+    assert_eq!(
+        (first.reason.as_str(), first.file_base, first.files),
+        ("stopped", 400, 2)
+    );
+
+    // The same start again, as the server sends it when it never got the end: the end again.
+    c.wa.send(&start(&c.lms, REC_ID, "call1", 400)).await;
+    c.until("the end again", |r| ends(r, REC_ID).len() == 2)
+        .await;
+    assert_eq!(ends(&reports([&c.wa, &c.wb]), REC_ID)[1], first);
+
+    // A start numbered into the files it wrote (the server counted what was reported): the
+    // end again, and the start itself refused, so that it has an answer too.
+    c.wa.send(&start(&c.lms, REC_ID, "call1", 401)).await;
+    c.until("the end and the refusal", |r| ends(r, REC_ID).len() == 4)
+        .await;
+    let all = ends(&reports([&c.wa, &c.wb]), REC_ID);
+    assert!(all[2..].contains(&first), "{all:?}");
+    assert!(
+        all[2..]
+            .iter()
+            .any(|e| e.reason == "refused" && e.file_base == 401 && e.files == 0),
+        "{all:?}"
+    );
+
+    // Numbers past the files it wrote are free at once: the start is taken, records, and its
+    // own end (not a refusal) comes when it is stopped.
+    c.wa.send(&start(&c.lms, REC_ID, "call1", 402)).await;
+    c.speak(60).await;
+    c.wa.send(&ClientMessage::RecordStop(RecordStop {
+        recording_id: REC_ID.into(),
+    }))
+    .await;
+    c.until("the end of the start that was taken", |r| {
+        ends(r, REC_ID)
+            .iter()
+            .any(|e| e.file_base == 402 && e.reason == "stopped")
+    })
+    .await;
+    let taken = ends(&reports([&c.wa, &c.wb]), REC_ID)
+        .into_iter()
+        .find(|e| e.file_base == 402)
+        .unwrap();
+    assert_eq!(taken.files, 2, "{taken:?}");
+    c.s.shutdown().await;
+}
