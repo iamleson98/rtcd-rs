@@ -145,22 +145,22 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, tx: mpsc::WeakUnboundedSender
 
 /// Reports the end of a recording, now that its files are in, and clears its directory.
 async fn finish(run: &Run, ended: Ended, deps: &Deps) {
-    if !ended.reason.is_empty() {
-        deps.reports.send(
-            &run.client_id,
-            ClientMessage::RecordEnded(RecordEnded {
-                recording_id: run.recording_id.clone(),
-                reason: ended.reason.to_owned(),
-                file_base: run.file_base,
-                files: ended.files,
-                duration_ms: ended.duration_ms,
-                dropped: ended.dropped,
-            }),
-        );
+    let report = (!ended.reason.is_empty()).then(|| RecordEnded {
+        recording_id: run.recording_id.clone(),
+        reason: ended.reason.to_owned(),
+        file_base: run.file_base,
+        files: ended.files,
+        duration_ms: ended.duration_ms,
+        dropped: ended.dropped,
+    });
+    if let Some(report) = &report {
+        deps.reports
+            .send(&run.client_id, ClientMessage::RecordEnded(report.clone()));
     }
     // As soon as the end is sent, not after the directory is removed: a resend of the same start
-    // in between would be taken for a new run.
-    deps.registry.reported(&run.recording_id, run.id);
+    // in between would be taken for a new run. The end is kept for a resend: the connection it
+    // went on may have dropped before the server read it.
+    deps.registry.reported(&run.recording_id, run.id, report);
     info!(recording = %run.recording_id, reason = ended.reason, files = ended.files, "recording over");
     if let Err(e) = tokio::fs::remove_dir_all(&run.dir).await
         && e.kind() != std::io::ErrorKind::NotFound
@@ -667,8 +667,17 @@ mod tests {
         assert_eq!(e.file_base, 500);
         h.quiet().await;
         assert_eq!(h.registry.unreported(), 0, "its end is sent");
-        // A resend computed before the end arrived is still the one start, for a while.
-        assert_eq!(h.registry.begin(want, 2, &draining), Err(Busy::Same));
+        // A resend computed before the end arrived (or after the connection it went on dropped)
+        // is answered with the end again, for a while.
+        match h.registry.begin(want, 2, &draining) {
+            Err(Busy::Resend { end, refuse: None }) => {
+                assert_eq!(
+                    (end.file_base, end.files, end.reason.as_str()),
+                    (500, 1, "stopped")
+                );
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[tokio::test]

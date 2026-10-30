@@ -109,6 +109,15 @@ pub enum Busy {
     /// or over with its `record_ended` not sent yet. That one end answers it, so nothing more is
     /// said.
     Same,
+    /// The start belongs to a run that is over and whose `record_ended` was sent a moment ago
+    /// (the numbers are held for a while after that). Whoever sends it again has not got the end,
+    /// or computed the start before it did: the end is sent again, which the server takes as it
+    /// takes any end it sees twice. `refuse` is set when the start itself is not that run's but
+    /// numbered into its files, and so also needs its own answer.
+    Resend {
+        end: Box<RecordEnded>,
+        refuse: Option<&'static str>,
+    },
     /// The start is not taken and is answered `refused`; the text is for the log.
     Refused(&'static str),
 }
@@ -142,6 +151,9 @@ const HOLD_AFTER_REPORT: Duration = Duration::from_secs(300);
 #[derive(Debug)]
 struct Over {
     run: u64,
+    /// The `record_ended` that was sent, kept to be sent again; `None` until it is, and for a
+    /// capture that reports nothing.
+    end: Option<RecordEnded>,
     client_id: String,
     call_id: String,
     file_base: u32,
@@ -212,15 +224,19 @@ impl Registry {
         }
         for o in held.over.get(want.recording_id).into_iter().flatten() {
             if o.holds(want.file_base) {
-                return if o.client_id == want.client_id
-                    && o.call_id == want.call_id
-                    && o.file_base == want.file_base
-                {
-                    Err(Busy::Same)
-                } else {
-                    Err(Busy::Refused(
+                let same_run = o.client_id == want.client_id && o.call_id == want.call_id;
+                let same_start = same_run && o.file_base == want.file_base;
+                return match (&o.end, same_run) {
+                    (Some(end), true) => Err(Busy::Resend {
+                        end: Box::new(end.clone()),
+                        refuse: (!same_start).then_some(
+                            "the file numbers are those of a capture whose end was just sent",
+                        ),
+                    }),
+                    _ if same_start => Err(Busy::Same),
+                    _ => Err(Busy::Refused(
                         "the file numbers are those of a capture that is not reported yet",
-                    ))
+                    )),
                 };
             }
             // A run that would number its way into a capture that is not reported yet.
@@ -283,20 +299,23 @@ impl Registry {
                     call_id: a.call_id,
                     file_base: a.file_base,
                     files,
+                    end: None,
                     reported_at: None,
                 });
         }
     }
 
-    /// The end of the run has been sent (or there was nothing to say): its numbers are free once
-    /// the time they are held for after that has passed.
-    pub fn reported(&self, recording_id: &str, run: u64) {
+    /// The end of the run has been sent, as `end` (`None`: there was nothing to say): its numbers
+    /// are free once the time they are held for after that has passed, and a start that comes for
+    /// them meanwhile gets `end` again.
+    pub fn reported(&self, recording_id: &str, run: u64, end: Option<RecordEnded>) {
         let mut held = self.held.lock();
         if let Some(o) = held
             .over
             .get_mut(recording_id)
             .and_then(|over| over.iter_mut().find(|o| o.run == run))
         {
+            o.end = end;
             o.reported_at = Some(Instant::now());
         }
         self.forget_old(&mut held);
@@ -437,6 +456,30 @@ fn valid_site(url: &str) -> bool {
     })
 }
 
+/// Hands a registered capture to the SFU. If the SFU cannot take the recording it drops the sink,
+/// which the writer takes for a recording that failed and reports.
+///
+/// The drain stops the captures it finds in the registry. One registered after it looked is
+/// refused, but one registered before it looked can be handed to the SFU after the drain asked
+/// the SFU to stop it, which the SFU, not knowing it yet, ignores: so the flag is read again after
+/// the hand-over (both sides sequentially consistent: either this sees the flag, or the drain's
+/// stop is later than the hand-over) and the capture is stopped here.
+fn hand_over<E: std::fmt::Display>(
+    draining: &AtomicBool,
+    recording_id: &str,
+    start: impl FnOnce() -> Result<(), E>,
+    stop: impl FnOnce() -> Result<(), E>,
+) {
+    if let Err(e) = start() {
+        error!(recording = %recording_id, error = %e, "the SFU would not start the recording");
+    }
+    if draining.load(Ordering::SeqCst)
+        && let Err(e) = stop()
+    {
+        warn!(recording = %recording_id, error = %e, "the SFU would not stop a recording for the shutdown");
+    }
+}
+
 /// The share of their rate, in thousandths, at which uploads go while the node's media is refused.
 const YIELD_SHARE: u32 = 250;
 
@@ -569,6 +612,15 @@ impl Recordings {
                 debug!(recording = %req.recording_id, file_base = req.file_base, "asked again to record what this node holds");
                 return;
             }
+            Err(Busy::Resend { end, refuse }) => {
+                info!(recording = %req.recording_id, file_base = req.file_base, "asked again to record what this node has just reported ended; reporting it again");
+                self.reports
+                    .send(client_id, ClientMessage::RecordEnded(*end));
+                if let Some(why) = refuse {
+                    self.refuse(client_id, &req, "refused", why);
+                }
+                return;
+            }
             Err(Busy::Refused(why)) => return self.refuse(client_id, &req, "refused", why),
         }
         let dir = live
@@ -617,18 +669,12 @@ impl Recordings {
         live.unfinished.fetch_add(1, Ordering::AcqRel);
         live.writers.add(job);
         info!(recording = %req.recording_id, call = %req.call_id, file_base = req.file_base, max_files = req.max_files, "recording a call");
-        // If the SFU cannot take the recording it drops the sink, which the writer takes for a
-        // recording that failed and reports.
-        if let Err(e) = sfu.record_start(client_id, &req.call_id, &req.recording_id, t0, sink) {
-            error!(recording = %req.recording_id, error = %e, "the SFU would not start the recording");
-        }
-        // The drain stopped the captures it found; this one may have been registered after it
-        // looked and handed to the SFU after it stopped them.
-        if live.draining.load(Ordering::SeqCst)
-            && let Err(e) = sfu.record_stop(client_id, &req.call_id, &req.recording_id)
-        {
-            warn!(recording = %req.recording_id, error = %e, "the SFU would not stop a recording for the shutdown");
-        }
+        hand_over(
+            &live.draining,
+            &req.recording_id,
+            || sfu.record_start(client_id, &req.call_id, &req.recording_id, t0, sink),
+            || sfu.record_stop(client_id, &req.call_id, &req.recording_id),
+        );
     }
 
     /// Stops a recording: the SFU ends it, the writer closes what is open and the uploader
@@ -869,7 +915,7 @@ mod tests {
             r.begin(want("rec1", "mm", "call", 40), 5, &draining),
             Err(Busy::Same)
         );
-        r.reported("rec1", 1);
+        r.reported("rec1", 1, None);
         assert_eq!(r.unreported(), 0);
         assert_eq!(
             r.begin(want("rec1", "mm", "call", 40), 6, &draining),
@@ -879,7 +925,7 @@ mod tests {
         let r = Registry::with_hold(Duration::ZERO);
         assert_eq!(r.begin(want("rec1", "mm", "call", 40), 1, &SERVING), Ok(()));
         r.finish("rec1", 1, 3);
-        r.reported("rec1", 1);
+        r.reported("rec1", 1, None);
         assert!(matches!(
             r.begin(want("rec1", "mm", "call", 40), 7, &draining),
             Err(Busy::Refused("this node is shutting down"))
@@ -945,6 +991,77 @@ mod tests {
         r.remove("rec1", 6);
     }
 
+    fn ended(reason: &str, base: u32, files: u32) -> RecordEnded {
+        RecordEnded {
+            recording_id: "rec1".into(),
+            reason: reason.into(),
+            file_base: base,
+            files,
+            ..RecordEnded::default()
+        }
+    }
+
+    #[test]
+    fn a_resend_of_a_start_whose_end_was_lost_gets_the_end_again() {
+        // Nothing reported (the resend has the same number), and some files reported (the server
+        // numbered the resend past them): the end went out on a connection that dropped, or the
+        // server failed to keep it. Both are answered by the end, and the second also refused.
+        for (files, base, refuse) in [(0u32, 100u32, false), (3, 101, true)] {
+            let r = Registry::default();
+            assert_eq!(
+                r.begin(want("rec1", "mm", "call", 100), 1, &SERVING),
+                Ok(())
+            );
+            r.finish("rec1", 1, files);
+            let before = r.begin(want("rec1", "mm", "call", base), 2, &SERVING);
+            if files == 0 {
+                assert_eq!(before, Err(Busy::Same), "the run's own end answers it");
+            } else {
+                assert!(matches!(before, Err(Busy::Refused(_))), "{before:?}");
+            }
+            let end = ended("stopped", 100, files);
+            r.reported("rec1", 1, Some(end.clone()));
+            let got = r.begin(want("rec1", "mm", "call", base), 3, &SERVING);
+            match got {
+                Err(Busy::Resend {
+                    end: sent,
+                    refuse: r,
+                }) => {
+                    assert_eq!(*sent, end);
+                    assert_eq!(r.is_some(), refuse);
+                }
+                other => panic!("files {files}: {other:?}"),
+            }
+        }
+        // Another call's start, or a run that reported nothing, is not answered with an end.
+        let r = Registry::default();
+        assert_eq!(
+            r.begin(want("rec1", "mm", "call", 100), 1, &SERVING),
+            Ok(())
+        );
+        r.finish("rec1", 1, 3);
+        r.reported("rec1", 1, Some(ended("stopped", 100, 3)));
+        let other_call = Want {
+            call_id: "call2",
+            ..want("rec1", "mm", "call", 101)
+        };
+        assert!(matches!(
+            r.begin(other_call, 2, &SERVING),
+            Err(Busy::Refused(_))
+        ));
+        let r = Registry::default();
+        assert_eq!(
+            r.begin(want("rec1", "mm", "call", 100), 1, &SERVING),
+            Ok(())
+        );
+        r.finish("rec1", 1, 3);
+        r.reported("rec1", 1, None);
+        assert_eq!(
+            r.begin(want("rec1", "mm", "call", 100), 2, &SERVING),
+            Err(Busy::Same)
+        );
+    }
+
     #[test]
     fn the_numbers_of_a_run_are_held_for_a_while_after_its_end_was_sent() {
         let r = Registry::default();
@@ -953,7 +1070,7 @@ mod tests {
             Ok(())
         );
         r.finish("rec1", 1, 4);
-        r.reported("rec1", 1);
+        r.reported("rec1", 1, None);
         // A resend the server computed before the end reached it: not a new run that would
         // write over the files just uploaded.
         assert_eq!(
@@ -977,7 +1094,7 @@ mod tests {
             Ok(())
         );
         r.finish("rec1", 1, 4);
-        r.reported("rec1", 1);
+        r.reported("rec1", 1, None);
         std::thread::sleep(Duration::from_millis(60));
         assert_eq!(
             r.begin(want("rec1", "mm", "call", 100), 2, &SERVING),
@@ -987,9 +1104,62 @@ mod tests {
     }
 
     #[test]
+    fn a_drain_that_begins_between_the_registration_and_the_hand_over_stops_the_capture() {
+        use std::cell::{Cell, RefCell};
+        let draining = AtomicBool::new(false);
+        let registry = Registry::default();
+        assert_eq!(
+            registry.begin(want("rec1", "mm", "call", 0), 1, &draining),
+            Ok(())
+        );
+        let calls = RefCell::new(Vec::new());
+        let listed = Cell::new(0);
+        hand_over(
+            &draining,
+            "rec1",
+            || -> Result<(), String> {
+                // The drain begins now: it sets the flag, lists the capture (which the SFU does
+                // not know yet) and asks the SFU to stop it, which does nothing.
+                draining.store(true, Ordering::SeqCst);
+                listed.set(registry.all().len());
+                calls
+                    .borrow_mut()
+                    .push("drain stops it (ignored: not started yet)");
+                calls.borrow_mut().push("started");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("stopped by the hand-over");
+                Ok(())
+            },
+        );
+        assert_eq!(listed.get(), 1);
+        assert_eq!(
+            calls.into_inner().last(),
+            Some(&"stopped by the hand-over"),
+            "the capture is stopped after the SFU has it"
+        );
+
+        // Without a drain, nothing is stopped.
+        let stops = Cell::new(0);
+        hand_over(
+            &AtomicBool::new(false),
+            "rec2",
+            || -> Result<(), String> { Ok(()) },
+            || {
+                stops.set(stops.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(stops.get(), 0);
+    }
+
+    #[test]
     fn a_start_racing_a_drain_is_either_listed_by_it_or_refused() {
         // `begin_drain` sets the flag and then lists the captures; a start that is registered
-        // before the listing is listed (and stopped), one after sees the flag.
+        // before the listing is listed (and stopped), one after sees the flag. The registry's own
+        // lock already orders these two, so this holds the contract (and would catch a check
+        // moved out of the lock); the hand-over after the listing is tested below.
         for round in 0..300 {
             let registry = Arc::new(Registry::default());
             let draining = Arc::new(AtomicBool::new(false));
@@ -1024,7 +1194,7 @@ mod tests {
                         "round {round}: {id} was taken but the drain did not list it"
                     ),
                     Err(Busy::Refused(why)) => assert_eq!(why, "this node is shutting down"),
-                    Err(Busy::Same) => panic!("nothing was held"),
+                    Err(other) => panic!("nothing was held: {other:?}"),
                 }
             }
         }
