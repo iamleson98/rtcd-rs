@@ -702,6 +702,11 @@ impl Sfu {
             .update(now, engine.egress_budget_bps, engine.egress_budget_pps);
     }
 
+    /// Whether the node acts on the kernel's refusals, or only counts and reports them.
+    pub fn egress_adapts(&self) -> bool {
+        self.core.cfg.engine.egress.adapts()
+    }
+
     /// Whether the kernel is refusing datagrams now (or was a few seconds ago).
     pub fn egress_refusing(&self) -> bool {
         self.core.cfg.engine.egress.refusing(Instant::now())

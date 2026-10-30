@@ -680,7 +680,7 @@ fn a_node_whose_kernel_keeps_refusing_after_the_squeeze_forwards_the_loudest_voi
     let refused = Arc::new(AtomicU64::new(0));
     let mut w = World::with_config(EngineConfig {
         audio_loudest: 0,
-        ..config_with_refusals(&refused)
+        ..config_with_refusals(&refused, true)
     });
     let speakers: Vec<usize> = (0..4).map(|i| w.join(&format!("s{i}"), "call1")).collect();
     let listener = w.join("listener", "call1");
@@ -722,8 +722,9 @@ fn a_node_whose_kernel_keeps_refusing_after_the_squeeze_forwards_the_loudest_voi
         "the two loudest go on, the others are left out: {squeezed:?}"
     );
 
-    // Refusals that go on past the squeeze: the loudest voice only.
-    gained(&mut w, 3, 5_000, 4);
+    // An overload: refusals for fifteen seconds teach the ceiling, and refusals that go on through
+    // the squeeze it holds for five more leave the loudest voice only.
+    gained(&mut w, 15, 5_000, 4);
     let choked = gained(&mut w, 3, 5_000, 4);
     assert!(choked[0] > 100, "the loudest goes on: {choked:?}");
     assert!(
@@ -748,7 +749,7 @@ fn bursts_of_refusals_a_few_seconds_apart_leave_every_voice_and_video_alone() {
     let refused = Arc::new(AtomicU64::new(0));
     let mut w = World::with_config(EngineConfig {
         audio_loudest: 0,
-        ..config_with_refusals(&refused)
+        ..config_with_refusals(&refused, true)
     });
     let speakers: Vec<usize> = (0..4).map(|i| w.join(&format!("s{i}"), "call1")).collect();
     let listener = w.join("listener", "call1");
@@ -790,7 +791,7 @@ fn a_stall_of_the_card_on_a_steady_call_costs_voices_only_while_it_lasts() {
     let refused = Arc::new(AtomicU64::new(0));
     let mut w = World::with_config(EngineConfig {
         audio_loudest: 0,
-        ..config_with_refusals(&refused)
+        ..config_with_refusals(&refused, true)
     });
     let speakers: Vec<usize> = (0..4).map(|i| w.join(&format!("s{i}"), "call1")).collect();
     let listener = w.join("listener", "call1");
@@ -831,4 +832,43 @@ fn a_stall_of_the_card_on_a_steady_call_costs_voices_only_while_it_lasts() {
         after.iter().all(|&n| n >= 3 * 50 - 10),
         "everyone is back once the stall is over: {after:?}"
     );
+}
+
+#[test]
+fn a_node_that_does_not_adapt_forwards_every_voice_whatever_the_kernel_refuses() {
+    // The production release's behaviour: no refusal cuts a voice.
+    let refused = Arc::new(AtomicU64::new(0));
+    let mut w = World::with_config(EngineConfig {
+        audio_loudest: 0,
+        ..config_with_refusals(&refused, false)
+    });
+    let speakers: Vec<usize> = (0..4).map(|i| w.join(&format!("s{i}"), "call1")).collect();
+    let listener = w.join("listener", "call1");
+    wait_tracks(&mut w, listener, 0);
+    let levels = [25u8, 30, 90, 100];
+    let second = |w: &mut World, burst: u64| {
+        refused.fetch_add(burst, Ordering::Relaxed);
+        for _ in 0..50 {
+            for (&i, &level) in speakers.iter().zip(&levels) {
+                w.send_audio(i, level);
+            }
+            w.run_for(Duration::from_millis(20));
+        }
+    };
+    for _ in 0..3 {
+        second(&mut w, 0);
+    }
+    let before: Vec<usize> = (0..4)
+        .map(|i| w.browsers[listener].received_on(&format!("voice_session-s{i}")))
+        .collect();
+    for _ in 0..40 {
+        second(&mut w, 5_000);
+    }
+    for (i, before) in before.iter().enumerate() {
+        let gained = w.browsers[listener].received_on(&format!("voice_session-s{i}")) - before;
+        assert!(
+            gained >= 40 * 50 - 10,
+            "speaker {i} was heard {gained} times of 2000"
+        );
+    }
 }
