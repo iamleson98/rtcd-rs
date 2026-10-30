@@ -147,12 +147,18 @@ switch a receiver's own request makes); they go back up only after the rate has 
 for twenty seconds, so the drop itself does not release it. 0 (the default) sets no budget, and the
 node finds its own ceiling instead: when the kernel refuses datagrams (50 a second or 0.5 % of
 what is being sent, whichever is more) in three one-second windows in a row (a burst, a keyframe
-sent to a whole class, or a stall of the machine, is not a ceiling) the rate it was sending
-becomes the ceiling, at 90 % of that rate, the squeeze starts at once, and the ceiling is lifted by
-a tenth for every five minutes without a refusal (all of them at once after a long idle spell: a
-node idle all night starts the morning without it), so a node is held to what its network can carry
-now and not to its worst moment. A refusal at the
-ceiling teaches a lower one; one while squeezed well below it does not. A budget that is set
+sent to a whole class, or a stall of the machine, is not a ceiling) and the node was sending more
+than 1.1 times the most it carried without refusals in the last five to ten minutes, the rate it was
+sending becomes the ceiling, at 90 % of that rate, and the squeeze starts at once. Refusals at a rate
+the node has just carried cleanly are a stall of the machine or the card, not a rate that is too
+high: they squeeze video and voices only while they last, teach nothing and never choke. The ceiling
+is lifted by a tenth for every five minutes without a refusal and forgotten once it is twice what
+was taught (a node idle all night starts the morning without it), so a node is held to what its
+network can carry now and not to its worst moment; a refusal that finds the node not squeezed
+teaches the rate afresh, one while squeezed teaches only a lower rate (a refusal near or above the
+ceiling). A squeeze that comes back within two minutes of its release is released after twice the
+wait (up to five minutes), so a node whose demand is just over its ceiling does not switch layers
+and voices every twenty seconds. A budget that is set
 still applies, whichever is lower. `GET /system` reports `egress_bps`, `egress_squeezed` and the
 learned `egress_ceiling_bps` and `egress_ceiling_pps` (0 until the kernel has refused something),
 for whatever places new calls (`src/egress.rs`).
@@ -165,7 +171,9 @@ the first refusing window and is held twice as long (up to two minutes), so a st
 not cycle. Bursts that do not last never choke. While the kernel refuses (`egress_refusing`, which
 ends by itself ten seconds after the last refusal) recording uploads, which share the card and can
 wait, go at a quarter of their rate, unless the files waiting are half of
-`max_pending_bytes`. The rate is what the shards
+`max_pending_bytes` (checked every second, not only when the refusals start or stop). The
+service also brings the send figures up to date every second whether or not any session is left,
+so an idle node reports no squeeze and no rate. The rate is what the shards
 hand to their sockets, link-layer headers included: receiver reports, retransmissions, ICE and DTLS
 are in it with the media, as the card carries them. That makes `egress_bps` read higher than
 before, by up to half on voice-heavy traffic (every datagram now adds 52 bytes of headers and
