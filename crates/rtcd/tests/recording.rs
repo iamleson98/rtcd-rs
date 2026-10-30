@@ -552,10 +552,24 @@ async fn a_start_sent_again_after_its_end_was_lost_gets_the_end_again() {
         "{all:?}"
     );
 
-    // Numbers past the files it wrote are free at once.
+    // Numbers past the files it wrote are free at once: the start is taken, records, and its
+    // own end (not a refusal) comes when it is stopped.
     c.wa.send(&start(&c.lms, REC_ID, "call1", 402)).await;
-    c.speak(10).await;
-    let after = ends(&reports([&c.wa, &c.wb]), REC_ID);
-    assert_eq!(after.len(), 4, "taken, so it ends when it ends, not now");
+    c.speak(60).await;
+    c.wa.send(&ClientMessage::RecordStop(RecordStop {
+        recording_id: REC_ID.into(),
+    }))
+    .await;
+    c.until("the end of the start that was taken", |r| {
+        ends(r, REC_ID)
+            .iter()
+            .any(|e| e.file_base == 402 && e.reason == "stopped")
+    })
+    .await;
+    let taken = ends(&reports([&c.wa, &c.wb]), REC_ID)
+        .into_iter()
+        .find(|e| e.file_base == 402)
+        .unwrap();
+    assert_eq!(taken.files, 2, "{taken:?}");
     c.s.shutdown().await;
 }

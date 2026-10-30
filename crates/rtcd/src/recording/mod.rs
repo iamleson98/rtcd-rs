@@ -572,7 +572,10 @@ impl Recordings {
     /// Every start is answered once: `refused` at once when it is not taken, otherwise by the
     /// `record_ended` of its run, whatever order starts, stops, drains and ends come in. A start
     /// the node already holds (the same recording, call and first file number, running or over and
-    /// not reported yet) is not answered again: the end of that run answers it.
+    /// not reported yet) is not answered again: the end of that run answers it. Once that end has
+    /// been sent the numbers stay held for a while, and a resend (the server may not have got the
+    /// end) is answered with the end again; one for a different number inside the run's files
+    /// gets the end and also `refused` for itself. See [`Registry::begin`].
     pub fn start(&self, sfu: &Sfu, client_id: &str, req: RecordStart) {
         let Some(live) = &self.live else {
             return self.refuse(
