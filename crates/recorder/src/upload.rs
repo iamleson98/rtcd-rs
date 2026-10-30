@@ -19,6 +19,7 @@ use tracing::{info, warn};
 
 use crate::api::{Api, ApiError};
 use crate::media::Entry;
+use crate::throttle::Throttle;
 
 /// The most files the server takes in one request for URLs; the byte limit keeps a batch short
 /// enough that the next request comes well within the server's patience.
@@ -27,6 +28,15 @@ const BATCH_BYTES: u64 = 256 << 20;
 /// The slowest an upload may go before it is cut off (and retried): far below the cluster's capped
 /// 10 Mb/s.
 const UPLOAD_RATE: u64 = 256 << 10;
+
+/// How long a request of `size` bytes may take. When uploads are held to a node-wide rate they
+/// may be held to a share of it (a quarter while the node's own media needs the network), and a
+/// request started at the full rate can find the share cut under it: the allowance is that of the
+/// slowest share, or of the current one if that is slower still.
+fn request_timeout(size: u64, throttle: Option<&Throttle>) -> Duration {
+    let slow = throttle.map_or(1, |t| u64::from(1000 / t.share().clamp(1, 250)));
+    Duration::from_secs(60 + size / UPLOAD_RATE * slow)
+}
 /// How many files, and how many parts of one file, are in flight at once. One connection to
 /// storage carries a few MB/s, far below what the node's link does, and the recording is not
 /// watchable before the last byte is in.
@@ -427,7 +437,7 @@ impl Api {
                 let mut req = self
                     .uploads
                     .put(url)
-                    .timeout(Duration::from_secs(60 + size / UPLOAD_RATE))
+                    .timeout(request_timeout(size, self.throttle.as_deref()))
                     .header(CONTENT_LENGTH, size)
                     .body(Body::wrap_stream(stream));
                 if let Some(ct) = content_type {
@@ -466,6 +476,25 @@ impl Api {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_request_held_to_a_share_of_the_rate_is_given_the_time_the_share_takes() {
+        use super::*;
+        let size = 16 << 20;
+        let at_full = request_timeout(size, None).as_secs();
+        assert_eq!(at_full, 60 + 64);
+        let throttle = Throttle::new(1 << 20);
+        assert_eq!(
+            request_timeout(size, Some(&throttle)).as_secs(),
+            60 + 4 * 64,
+            "started at the full rate, it may be cut to a quarter"
+        );
+        throttle.set_share(100);
+        assert_eq!(
+            request_timeout(size, Some(&throttle)).as_secs(),
+            60 + 10 * 64
+        );
+    }
+
     use std::path::PathBuf;
 
     use serde_json::{Value, json};
