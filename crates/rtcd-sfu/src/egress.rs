@@ -33,10 +33,19 @@
 //! packet from a report, and a count of the media alone reads a third to a half low.
 //!
 //! Squeezing video takes the bits down, and voice, which is most of the packets, stays. So a
-//! refusal that goes on after the squeeze is answered a second time: past [`CHOKE_AFTER`] the
-//! node is *choked*, and calls forward the loudest voice only until the kernel has stopped
-//! refusing. Work that can wait (uploading recordings) stands aside for as long as the kernel
-//! refuses ([`Gauge::refusing`]).
+//! refusal that goes on after the squeeze is answered a second time: when the kernel has refused
+//! in [`CHOKE_AFTER`] windows in a row *while the node was squeezed*, the node is *choked*, and
+//! calls forward the loudest voice only until the kernel has accepted everything for
+//! [`CHOKE_HOLD`]. Under a steady overload that cycle would repeat (lift, overflow, wait, choke
+//! again), so a choke that returns within [`CHOKE_MEMORY`] of the last one begins at the first
+//! refusing window and is held twice as long, up to [`CHOKE_HOLD_MAX`]. Work that can wait
+//! (uploading recordings) stands aside for as long as the kernel refuses ([`Gauge::refusing`]).
+//!
+//! The ceiling is only ever *taught* by the kernel refusing in [`LEARN_AFTER`] windows in a row
+//! at a rate that matters against the traffic ([`REFUSAL_SHARE`] of the packets sent, with a
+//! floor): a stall of the machine lasting a fraction of a second straddles at most two windows,
+//! and a keyframe fanned out to a class is one. What it taught is forgotten gradually: it is
+//! lifted by a tenth for every [`GROW_AFTER`] without a refusal, however long the node sat idle.
 
 use std::net::SocketAddr;
 use std::sync::Mutex;
@@ -51,13 +60,18 @@ const RELEASE_BELOW: f64 = 0.65;
 const RELEASE_AFTER: Duration = Duration::from_secs(20);
 /// The rate is measured over windows of at least this long and smoothed over two of them.
 const WINDOW: Duration = Duration::from_secs(1);
-/// A window in which the kernel refused at least this many datagrams a second taught the node
-/// where its ceiling is (one stray refusal is not a ceiling).
+/// A window counts as refusing when the kernel refused at least this many datagrams a second...
 const DROPS_PER_SEC: f64 = 50.0;
-/// ...in this many windows in a row: a burst (a keyframe fanned out to a whole class) overflows the
-/// queue for a moment without the rate being too high, and a ceiling learned from it would hold
-/// calls back for the hour it takes to lift.
-const LEARN_AFTER: u32 = 2;
+/// ...and at least this share of the datagrams sent in it (a node sending 300 thousand a second
+/// that loses fifty is not at its ceiling). The kernel counts calls, not segments: with offload
+/// one refused call is up to 64 datagrams and counts as one, so the share is read low, which is
+/// the safe way.
+const REFUSAL_SHARE: f64 = 0.005;
+/// A ceiling is taught by this many refusing windows in a row: a burst (a keyframe fanned out to
+/// a whole class) or a stall of the machine overflows the queue for a moment, across at most two
+/// windows, without the rate being too high, and a ceiling learned from it would hold calls back
+/// for as long as it takes to lift.
+const LEARN_AFTER: u32 = 3;
 /// The learned ceiling is this share of the rate the node was sending when the kernel refused.
 const LEARNED_SHARE: f64 = 0.9;
 /// A refusal at a rate this close to the learned ceiling, or above it, teaches a lower one; below
@@ -66,9 +80,17 @@ const RELEARN_NEAR: f64 = 0.95;
 /// A learned ceiling is lifted by [`GROW_BY`] after this long without a refusal.
 const GROW_AFTER: Duration = Duration::from_secs(300);
 const GROW_BY: f64 = 1.1;
-/// The kernel refuses datagrams still, this long after the squeeze began (and it did not help):
-/// the node is choked.
-const CHOKE_AFTER: Duration = Duration::from_secs(5);
+/// At most this many notches at once: far beyond any ceiling, and finite.
+const MAX_GROW_STEPS: f64 = 100.0;
+/// The kernel refused in this many windows in a row while the node was squeezed (and the squeeze
+/// did not help): the node is choked.
+const CHOKE_AFTER: u32 = 5;
+/// A choke is lifted when the kernel has accepted everything for this long...
+const CHOKE_HOLD: Duration = Duration::from_secs(10);
+/// ...twice as long each time it returns within [`CHOKE_MEMORY`], up to this.
+const CHOKE_HOLD_MAX: Duration = Duration::from_secs(120);
+/// A choke returning within this long of the last one is the same overload.
+const CHOKE_MEMORY: Duration = Duration::from_secs(60);
 /// The kernel is taken to be refusing until a window this long has gone by without a refusal.
 const REFUSING_FOR: Duration = Duration::from_secs(10);
 /// The Ethernet header, which the network card's counters include; the IP header (20 bytes, 40
@@ -96,12 +118,18 @@ struct State {
     ceiling_at: Option<Instant>,
     /// The kernel's count when the node first read it: refusals before that were not ours.
     drops_base: Option<u64>,
-    /// Windows in a row in which the kernel refused enough datagrams to matter.
-    refusal_windows: u32,
-    /// The last window in which the kernel refused enough datagrams to matter, and the first of
-    /// the run of them it belongs to.
+    /// Windows in a row in which the kernel refused enough datagrams to matter, and of those how
+    /// many were while the node was squeezed.
+    run: u32,
+    squeezed_run: u32,
+    /// The last such window.
     refusing_at: Option<Instant>,
-    refusing_since: Option<Instant>,
+    /// Whether the node is choked, for how long a calm spell lifts it, when it last was lifted,
+    /// and how many times in a row it has come back soon after.
+    choked: bool,
+    choke_hold: Duration,
+    choke_lifted: Option<Instant>,
+    rechokes: u32,
 }
 
 /// Where the kernel's count of refused datagrams comes from.
@@ -119,9 +147,20 @@ impl std::fmt::Debug for DropsSource {
     }
 }
 
+/// The moment times are counted from in the gauge's atomics.
+#[derive(Debug)]
+struct Epoch(Instant);
+
+impl Default for Epoch {
+    fn default() -> Self {
+        Self(Instant::now())
+    }
+}
+
 /// What the shards of one node have sent, shared by all of them.
 #[derive(Debug, Default)]
 pub struct Gauge {
+    epoch: Epoch,
     drops_source: DropsSource,
     bytes: AtomicU64,
     packets: AtomicU64,
@@ -132,10 +171,11 @@ pub struct Gauge {
     squeezed: AtomicBool,
     /// Datagrams the kernel refused to queue since the node started (UDP `SndbufErrors`).
     kernel_drops: AtomicU64,
-    /// The kernel is refusing datagrams now, and has been, without a calm window, for how long
-    /// the two flags say.
-    refusing: AtomicBool,
-    choked: AtomicBool,
+    /// Until when the kernel counts as refusing and the node as choked, in nanoseconds after
+    /// `epoch` (0: not at all). Readers compare with the time they ask, so the answer ages by
+    /// itself when no session is left to update the gauge.
+    refusing_until: AtomicU64,
+    choked_until: AtomicU64,
     /// The ceilings the node learned (0 until the kernel has refused something).
     ceiling: AtomicU64,
     ceiling_packets: AtomicU64,
@@ -198,15 +238,19 @@ impl Gauge {
         self.squeezed.load(Ordering::Relaxed)
     }
 
-    /// Whether the kernel is refusing datagrams now (it was within [`REFUSING_FOR`]).
-    pub fn refusing(&self) -> bool {
-        self.refusing.load(Ordering::Relaxed)
+    /// Whether the kernel is refusing datagrams at `now` (it was within [`REFUSING_FOR`]).
+    pub fn refusing(&self, now: Instant) -> bool {
+        self.refusing_until.load(Ordering::Relaxed) > self.nanos(now)
     }
 
-    /// Whether it has been refusing for [`CHOKE_AFTER`] or more, squeeze or not: the bits fell
-    /// and the packets did not.
-    pub fn choked(&self) -> bool {
-        self.choked.load(Ordering::Relaxed)
+    /// Whether the node is choked at `now`: the kernel went on refusing after the squeeze, the
+    /// bits fell and the packets did not.
+    pub fn choked(&self, now: Instant) -> bool {
+        self.choked_until.load(Ordering::Relaxed) > self.nanos(now)
+    }
+
+    fn nanos(&self, t: Instant) -> u64 {
+        t.saturating_duration_since(self.epoch.0).as_nanos() as u64 + 1
     }
 
     /// Recomputes the rates and the decision; cheap to call often, it works at most once a window.
@@ -248,6 +292,7 @@ impl Gauge {
         }
         let secs = elapsed.as_secs_f64();
         let idle = elapsed >= IDLE_GAP;
+        let sent_pps = packets.saturating_sub(st.packets) as f64 / secs;
         let smooth = |old: f64, instant: f64| {
             if old == 0.0 || idle {
                 instant
@@ -279,13 +324,22 @@ impl Gauge {
 
         if idle {
             // The quiet was the calm spell: a class that starts now does not begin held to the
-            // small layers because the last one ended squeezed.
+            // small layers because the last one ended squeezed, or choked, or in the middle of a
+            // run of refusals.
             st.calm_since = Some(at);
+            st.run = 0;
+            st.squeezed_run = 0;
+            st.choked = false;
+            st.choke_lifted = None;
         }
-        learn(&mut st, now, refused as f64 / secs);
-        let (refusing, choked) = track_refusals(&mut st, now, refused as f64 / secs);
-        self.refusing.store(refusing, Ordering::Relaxed);
-        self.choked.store(choked, Ordering::Relaxed);
+        let refusing = refused as f64 / secs >= (REFUSAL_SHARE * sent_pps).max(DROPS_PER_SEC);
+        if refusing {
+            st.run += 1;
+            st.refusing_at = Some(now);
+        } else {
+            st.run = 0;
+        }
+        learn(&mut st, now, refusing);
         self.ceiling.store(st.learned_bps as u64, Ordering::Relaxed);
         self.ceiling_packets
             .store(st.learned_pps as u64, Ordering::Relaxed);
@@ -295,6 +349,16 @@ impl Gauge {
         );
         let squeezed = decide(&mut st, now, limit_bps, limit_pps);
         self.squeezed.store(squeezed, Ordering::Relaxed);
+        choke(&mut st, now, refusing, squeezed);
+        let until = |t: Option<Instant>, hold: Duration| t.map_or(0, |t| self.nanos(t + hold));
+        self.refusing_until
+            .store(until(st.refusing_at, REFUSING_FOR), Ordering::Relaxed);
+        let choked_until = if st.choked {
+            until(st.refusing_at, st.choke_hold)
+        } else {
+            0
+        };
+        self.choked_until.store(choked_until, Ordering::Relaxed);
     }
 }
 
@@ -325,13 +389,14 @@ fn lower_of(budget: u64, learned: f64) -> u64 {
     }
 }
 
-/// What the kernel's refusals teach, given how many it made a second during the window just
-/// measured: after [`LEARN_AFTER`] such windows in a row a ceiling where there was none or a lower
-/// one, with the squeeze at once, and a notch back up after a long quiet.
-fn learn(st: &mut State, now: Instant, refused_per_sec: f64) {
-    if refused_per_sec >= DROPS_PER_SEC {
-        st.refusal_windows += 1;
-        if st.refusal_windows < LEARN_AFTER {
+/// What the kernel's refusals teach, given whether the window just measured was a refusing one
+/// (`st.run` counts the refusing windows in a row up to it): after [`LEARN_AFTER`] of them a
+/// ceiling where there was none or a lower one, with the squeeze at once; and a notch back up for
+/// every [`GROW_AFTER`] spent without refusals, however many went by since it was last looked at
+/// (a node idle all night has its ceiling back by the morning).
+fn learn(st: &mut State, now: Instant, refusing: bool) {
+    if refusing {
+        if st.run < LEARN_AFTER {
             return;
         }
         let near = |rate: f64, learned: f64| learned == 0.0 || rate >= learned * RELEARN_NEAR;
@@ -342,37 +407,48 @@ fn learn(st: &mut State, now: Instant, refused_per_sec: f64) {
         st.squeezed = true;
         st.calm_since = None;
         st.ceiling_at = Some(now);
-    } else {
-        st.refusal_windows = 0;
-        if st.learned_bps > 0.0 || st.learned_pps > 0.0 {
-            let since = *st.ceiling_at.get_or_insert(now);
-            if now.saturating_duration_since(since) >= GROW_AFTER {
-                st.learned_bps *= GROW_BY;
-                st.learned_pps *= GROW_BY;
-                st.ceiling_at = Some(now);
-            }
+    } else if st.learned_bps > 0.0 || st.learned_pps > 0.0 {
+        let since = *st.ceiling_at.get_or_insert(now);
+        let steps = (now.saturating_duration_since(since).as_secs_f64() / GROW_AFTER.as_secs_f64())
+            .floor()
+            .min(MAX_GROW_STEPS);
+        if steps >= 1.0 {
+            let by = GROW_BY.powf(steps);
+            st.learned_bps *= by;
+            st.learned_pps *= by;
+            st.ceiling_at = Some(since + GROW_AFTER.mul_f64(steps));
         }
     }
 }
 
-/// Whether the kernel is refusing datagrams and has been for long enough that the squeeze did not
-/// answer it, given how many it refused a second in the window just measured.
-fn track_refusals(st: &mut State, now: Instant, refused_per_sec: f64) -> (bool, bool) {
-    if refused_per_sec >= DROPS_PER_SEC {
-        st.refusing_at = Some(now);
-        st.refusing_since.get_or_insert(now);
+/// Choked: the kernel refused in [`CHOKE_AFTER`] windows in a row while the node was squeezed,
+/// or in the first one when a choke was lifted only a short while ago ([`CHOKE_MEMORY`]: the
+/// overload it ended is still there). Lifted after [`st.choke_hold`](State) without a refusal.
+fn choke(st: &mut State, now: Instant, refusing: bool, squeezed: bool) {
+    st.squeezed_run = if refusing && squeezed {
+        st.squeezed_run + 1
+    } else {
+        0
+    };
+    if refusing && squeezed && !st.choked {
+        let soon = st
+            .choke_lifted
+            .is_some_and(|t| now.saturating_duration_since(t) < CHOKE_MEMORY);
+        if soon || st.squeezed_run >= CHOKE_AFTER {
+            st.rechokes = if soon { st.rechokes + 1 } else { 0 };
+            st.choke_hold = (CHOKE_HOLD * 2u32.saturating_pow(st.rechokes)).min(CHOKE_HOLD_MAX);
+            st.choked = true;
+        }
     }
-    let refusing = st
-        .refusing_at
-        .is_some_and(|t| now.saturating_duration_since(t) < REFUSING_FOR);
-    if !refusing {
-        st.refusing_since = None;
-    }
-    let choked = refusing
+    if st.choked
+        && !refusing
         && st
-            .refusing_since
-            .is_some_and(|t| now.saturating_duration_since(t) >= CHOKE_AFTER);
-    (refusing, choked)
+            .refusing_at
+            .is_none_or(|t| now.saturating_duration_since(t) >= st.choke_hold)
+    {
+        st.choked = false;
+        st.choke_lifted = Some(now);
+    }
 }
 
 /// The policy on its own: squeezed from the share of a budget it reaches, released after a calm
@@ -596,22 +672,21 @@ mod tests {
 
     #[test]
     fn one_burst_of_refusals_is_not_a_ceiling() {
-        let g = Gauge::default();
-        let mut now = Instant::now();
-        let mut refused = 0;
-        g.update_with(now, 0, 0, Some(refused));
+        let (g, mut now, mut refused) = based_gauge();
         run_refusing(&g, &mut now, 10, 300, &mut refused, 0);
         // A keyframe fanned out to a class: one window of refusals at a modest rate.
         run_refusing(&g, &mut now, 1, 300, &mut refused, 20_000);
         run_refusing(&g, &mut now, 10, 300, &mut refused, 0);
         assert_eq!(g.ceiling_bps(), 0);
         assert!(!g.squeezed());
-        // Two in a row are a ceiling, even with calm between the pairs.
-        run_refusing(&g, &mut now, 1, 600, &mut refused, 20_000);
-        run_refusing(&g, &mut now, 3, 600, &mut refused, 0);
-        run_refusing(&g, &mut now, 1, 600, &mut refused, 20_000);
+        // Windows that are not in a row do not add up, however many there are.
+        for _ in 0..4 {
+            run_refusing(&g, &mut now, 2, 600, &mut refused, 20_000);
+            run_refusing(&g, &mut now, 1, 600, &mut refused, 0);
+        }
         assert_eq!(g.ceiling_bps(), 0, "the windows were not in a row");
-        run_refusing(&g, &mut now, 1, 600, &mut refused, 20_000);
+        // Three in a row are a ceiling.
+        run_refusing(&g, &mut now, 3, 600, &mut refused, 20_000);
         assert!(g.ceiling_bps() > 0 && g.squeezed());
     }
 
@@ -733,42 +808,158 @@ mod tests {
         assert_eq!(g.packets.load(Ordering::Relaxed), 3);
     }
 
+    /// A gauge that has taken the kernel's count as its base (the first window only does that).
+    fn based_gauge() -> (Gauge, Instant, u64) {
+        let g = Gauge::default();
+        let now = Instant::now();
+        g.update_with(now, 0, 0, Some(0));
+        (g, now, 0)
+    }
+
     #[test]
     fn refusals_that_go_on_after_the_squeeze_choke_the_node() {
-        let g = Gauge::default();
-        let mut now = Instant::now();
-        let mut refused = 0;
-        g.update_with(now, 0, 0, Some(refused));
+        let (g, mut now, mut refused) = based_gauge();
+        run_refusing(&g, &mut now, 1, 700, &mut refused, 0);
         run_refusing(&g, &mut now, 3, 700, &mut refused, 5_000);
-        assert!(g.squeezed() && g.refusing());
-        assert!(!g.choked(), "the squeeze has had three seconds");
+        assert!(g.squeezed() && g.refusing(now));
+        assert!(!g.choked(now), "the squeeze has just begun");
         // The bits fell by half and the kernel refuses as many datagrams as before (voice).
         run_refusing(&g, &mut now, 4, 350, &mut refused, 5_000);
-        assert!(g.choked(), "seven seconds of refusals");
+        assert!(g.choked(now), "five windows of refusals while squeezed");
         // It stops refusing: the node stays choked until a calm spell has passed.
-        run_refusing(&g, &mut now, 5, 350, &mut refused, 0);
-        assert!(g.choked() && g.refusing());
-        run_refusing(&g, &mut now, 6, 350, &mut refused, 0);
+        run_refusing(&g, &mut now, 8, 350, &mut refused, 0);
+        assert!(g.choked(now) && g.refusing(now));
+        run_refusing(&g, &mut now, 3, 350, &mut refused, 0);
         assert!(
-            !g.choked() && !g.refusing(),
+            !g.choked(now) && !g.refusing(now),
             "ten seconds without a refusal"
         );
     }
 
     #[test]
-    fn a_short_burst_of_refusals_squeezes_without_choking() {
-        let g = Gauge::default();
-        let mut now = Instant::now();
-        let mut refused = 0;
+    fn two_bursts_a_few_seconds_apart_neither_squeeze_nor_choke() {
+        // A keyframe fanned out to a class overflows the queue for one window; joins and loss make
+        // them recur. None of it is a ceiling and none of it is a reason to silence voices.
+        for gap in [3, 5, 9] {
+            let (g, mut now, mut refused) = based_gauge();
+            run_refusing(&g, &mut now, 10, 300, &mut refused, 0);
+            for _ in 0..6 {
+                run_refusing(&g, &mut now, 1, 300, &mut refused, 20_000);
+                assert!(!g.choked(now));
+                run_refusing(&g, &mut now, gap, 300, &mut refused, 0);
+                assert!(!g.choked(now), "gap {gap}");
+            }
+            assert!(!g.squeezed(), "gap {gap}");
+            assert_eq!(g.ceiling_bps(), 0);
+        }
+    }
+
+    #[test]
+    fn a_stall_across_a_window_boundary_is_not_a_ceiling() {
+        // A fraction of a second of the machine not sending (steal, a full ring) refuses a great
+        // many datagrams, split by the window boundary into two windows.
+        let (g, mut now, mut refused) = based_gauge();
+        run_refusing(&g, &mut now, 10, 72, &mut refused, 0);
+        run_refusing(&g, &mut now, 2, 72, &mut refused, 30_000);
+        run_refusing(&g, &mut now, 10, 72, &mut refused, 0);
+        assert_eq!(g.ceiling_bps(), 0, "72 Mbit/s taught as a ceiling");
+        assert!(!g.squeezed());
+    }
+
+    #[test]
+    fn refusals_are_measured_against_what_is_sent() {
+        let (g, mut now, mut refused) = based_gauge();
+        // 300 thousand datagrams a second; the kernel refuses 600 of them (0.2 %).
+        for _ in 0..12 {
+            g.add(300_000 * 200, 300_000);
+            now += Duration::from_secs(1);
+            refused += 600;
+            g.update_with(now, 0, 0, Some(refused));
+        }
+        assert!(!g.refusing(now) && !g.squeezed());
+        // 3,000 a second is 1 %.
+        for _ in 0..4 {
+            g.add(300_000 * 200, 300_000);
+            now += Duration::from_secs(1);
+            refused += 3_000;
+            g.update_with(now, 0, 0, Some(refused));
+        }
+        assert!(g.refusing(now) && g.squeezed());
+    }
+
+    #[test]
+    fn a_steady_overload_does_not_cycle_between_choked_and_not() {
+        let (g, mut now, mut refused) = based_gauge();
+        run_refusing(&g, &mut now, 1, 700, &mut refused, 0);
+        run_refusing(&g, &mut now, 8, 700, &mut refused, 5_000);
+        assert!(g.choked(now));
+        // The choke lifts after ten calm seconds; the two voices that come back overflow again.
+        run_refusing(&g, &mut now, 11, 300, &mut refused, 0);
+        assert!(!g.choked(now));
+        run_refusing(&g, &mut now, 1, 400, &mut refused, 5_000);
+        assert!(
+            g.choked(now),
+            "back at the first refusing window, not five later"
+        );
+        // And is held twice as long this time.
+        run_refusing(&g, &mut now, 11, 300, &mut refused, 0);
+        assert!(g.choked(now), "held for twenty seconds the second time");
+        run_refusing(&g, &mut now, 10, 300, &mut refused, 0);
+        assert!(!g.choked(now));
+        // A long calm spell forgets it.
+        run_refusing(&g, &mut now, 70, 300, &mut refused, 0);
+        run_refusing(&g, &mut now, 1, 700, &mut refused, 5_000);
+        assert!(!g.choked(now), "a new overload starts from the beginning");
+    }
+
+    #[test]
+    fn what_the_kernel_refused_ages_without_anyone_updating_the_gauge() {
+        // The last session leaves while the kernel is refusing: nothing updates the gauge again,
+        // and whoever asks (recording uploads, /system) must not read a stale yes.
+        let (g, mut now, mut refused) = based_gauge();
+        run_refusing(&g, &mut now, 1, 700, &mut refused, 0);
+        run_refusing(&g, &mut now, 8, 700, &mut refused, 5_000);
+        assert!(g.refusing(now) && g.choked(now));
+        assert!(g.refusing(now + Duration::from_secs(9)));
+        assert!(!g.refusing(now + Duration::from_secs(11)));
+        assert!(!g.choked(now + Duration::from_secs(11)));
+    }
+
+    #[test]
+    fn a_ceiling_learned_before_a_long_idle_spell_is_gone_by_the_morning() {
+        let (g, mut now, mut refused) = based_gauge();
+        run_refusing(&g, &mut now, 1, 70, &mut refused, 0);
+        run_refusing(&g, &mut now, 4, 70, &mut refused, 5_000);
+        let learned = g.ceiling_bps();
+        assert!(learned > 0 && g.squeezed());
+        // Twelve hours with nobody in a call, then the first class.
+        now += Duration::from_secs(12 * 3600);
+        g.add(70 * MBIT, 70 * MBIT / 1_200);
         g.update_with(now, 0, 0, Some(refused));
-        // (The first window only takes the kernel's count as the base.)
-        run_refusing(&g, &mut now, 3, 700, &mut refused, 5_000);
+        assert!(
+            g.ceiling_bps() > 100 * learned,
+            "{} Mbit/s after a night, from {}",
+            g.ceiling_bps() / 1_000_000,
+            learned / 1_000_000
+        );
+        run_refusing(&g, &mut now, 30, 400, &mut refused, 0);
+        assert!(
+            !g.squeezed(),
+            "400 Mbit/s the next morning is not held back"
+        );
+    }
+
+    #[test]
+    fn a_short_run_of_refusals_squeezes_without_choking() {
+        let (g, mut now, mut refused) = based_gauge();
+        run_refusing(&g, &mut now, 1, 700, &mut refused, 0);
+        run_refusing(&g, &mut now, 4, 700, &mut refused, 5_000);
         run_refusing(&g, &mut now, 20, 300, &mut refused, 0);
         assert!(g.squeezed());
-        assert!(!g.choked());
-        assert!(!g.refusing());
-        // A second burst later is a new run, not a continuation of the first.
-        run_refusing(&g, &mut now, 3, 700, &mut refused, 5_000);
-        assert!(!g.choked());
+        assert!(!g.choked(now));
+        assert!(!g.refusing(now));
+        // A second run later is a new one, not a continuation of the first.
+        run_refusing(&g, &mut now, 4, 700, &mut refused, 5_000);
+        assert!(!g.choked(now));
     }
 }

@@ -711,7 +711,7 @@ fn a_node_whose_kernel_keeps_refusing_after_the_squeeze_forwards_the_loudest_voi
     assert!(calm.iter().all(|&n| n > 100), "everyone is heard: {calm:?}");
 
     // The first seconds of refusals: video is squeezed and two voices are forwarded.
-    gained(&mut w, 2, 5_000);
+    gained(&mut w, 3, 5_000);
     let squeezed = gained(&mut w, 2, 5_000);
     assert!(
         squeezed[0] > 50 && squeezed[1] > 50 && squeezed[2] < 30 && squeezed[3] < 30,
@@ -735,5 +735,46 @@ fn a_node_whose_kernel_keeps_refusing_after_the_squeeze_forwards_the_loudest_voi
     assert!(
         held[0] > 100 && held[1] > 100 && held[2] < 30 && held[3] < 30,
         "the two loudest are back: {held:?}"
+    );
+}
+
+#[test]
+fn bursts_of_refusals_a_few_seconds_apart_leave_every_voice_and_video_alone() {
+    // Keyframes fanned out to a class overflow the kernel's queue for a second, now and again.
+    let refused = Arc::new(AtomicU64::new(0));
+    let mut w = World::with_config(EngineConfig {
+        audio_loudest: 0,
+        ..config_with_refusals(&refused)
+    });
+    let speakers: Vec<usize> = (0..4).map(|i| w.join(&format!("s{i}"), "call1")).collect();
+    let listener = w.join("listener", "call1");
+    wait_tracks(&mut w, listener, 0);
+    let levels = [25u8, 30, 90, 100];
+    let second = |w: &mut World, burst: u64| {
+        refused.fetch_add(burst, Ordering::Relaxed);
+        for _ in 0..50 {
+            for (&i, &level) in speakers.iter().zip(&levels) {
+                w.send_audio(i, level);
+            }
+            w.run_for(Duration::from_millis(20));
+        }
+    };
+    let heard =
+        |w: &World, i: usize| w.browsers[listener].received_on(&format!("voice_session-s{i}"));
+    for _ in 0..3 {
+        second(&mut w, 0);
+    }
+    let before: Vec<usize> = (0..4).map(|i| heard(&w, i)).collect();
+    // A burst, five calm seconds, a burst, nine calm seconds, a burst.
+    for burst_then_calm in [5, 9, 6] {
+        second(&mut w, 20_000);
+        for _ in 0..burst_then_calm {
+            second(&mut w, 0);
+        }
+    }
+    let gained: Vec<usize> = (0..4).map(|i| heard(&w, i) - before[i]).collect();
+    assert!(
+        gained.iter().all(|&n| n >= 1_100), // 23 seconds of 50 packets
+        "every voice went on being heard through the bursts: {gained:?}"
     );
 }

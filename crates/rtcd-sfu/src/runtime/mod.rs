@@ -693,12 +693,12 @@ impl Sfu {
 
     /// Whether the kernel is refusing datagrams now (or was a few seconds ago).
     pub fn egress_refusing(&self) -> bool {
-        self.core.cfg.engine.egress.refusing()
+        self.core.cfg.engine.egress.refusing(Instant::now())
     }
 
     /// Whether it has gone on refusing after the squeeze: calls forward their loudest voice only.
     pub fn egress_choked(&self) -> bool {
-        self.core.cfg.engine.egress.choked()
+        self.core.cfg.engine.egress.choked(Instant::now())
     }
 
     /// How many threads serve sessions right now.

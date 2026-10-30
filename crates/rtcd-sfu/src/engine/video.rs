@@ -255,7 +255,7 @@ impl Engine {
             .egress
             .update(now, self.cfg.egress_budget_bps, self.cfg.egress_budget_pps);
         self.follow_budget(key, now);
-        self.follow_voice_limit(key);
+        self.follow_voice_limit(key, now);
         if !self.recordings.is_empty() {
             self.record_upkeep(key, now);
         }
@@ -287,9 +287,9 @@ impl Engine {
     /// Lets a call forward fewer voices while the node is shedding: a call with many open
     /// microphones asks for a packet for every listener from each of them, and the listener hears
     /// two or three.
-    fn follow_voice_limit(&mut self, key: SessionKey) {
+    fn follow_voice_limit(&mut self, key: SessionKey, now: Instant) {
         let configured = self.cfg.audio_loudest;
-        let limit = if self.load == Load::Saturated || self.cfg.egress.choked() {
+        let limit = if self.load == Load::Saturated || self.cfg.egress.choked(now) {
             SATURATED_VOICES
         } else if self.shedding() {
             match configured {
