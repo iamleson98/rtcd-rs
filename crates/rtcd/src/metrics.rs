@@ -7,8 +7,12 @@ use prometheus::{
     Counter, CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry,
     TextEncoder,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use rtcd_sfu::ids::TrackType;
 use rtcd_sfu::metrics::{Direction, Metrics as SfuMetrics, NetTraffic, ReceiverQuality};
+
+use crate::info::SystemStatus;
 
 const NAMESPACE: &str = "rtcd";
 const LATENCY_BUCKETS: [f64; 14] = [
@@ -33,9 +37,175 @@ const SETUP_BUCKETS: [f64; 14] = [
     0.001, 0.005, 0.0075, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.3, 0.4, 0.5, 0.75, 1.0,
 ];
 
+/// The node-level gauges, set from `GET /system`'s figures whenever the metrics are read: the
+/// machine, and what the media plane does about it.
+struct Node {
+    cpu_load: Gauge,
+    cpu_busiest: Gauge,
+    cpu_iowait: Gauge,
+    cpu_softirq: Gauge,
+    mem_used: Gauge,
+    mem_total: Gauge,
+    mem_available: Gauge,
+    rss_limit: Gauge,
+    tx_bps: Gauge,
+    tx_pps: Gauge,
+    tx_dropped_pps: Gauge,
+    sessions: Gauge,
+    shards: Gauge,
+    shards_pressured: Gauge,
+    shards_saturated: Gauge,
+    egress_bps: Gauge,
+    egress_pps: Gauge,
+    egress_ceiling_bps: Gauge,
+    egress_ceiling_pps: Gauge,
+    egress_squeezed: Gauge,
+    egress_refusing: Gauge,
+    egress_choked: Gauge,
+    kernel_send_drops: Counter,
+    /// What `kernel_send_drops` has counted so far (a counter is only ever added to).
+    kernel_send_drops_seen: AtomicU64,
+}
+
+/// A gauge with no subsystem: `rtcd_<name>`.
+fn node_gauge(r: &Registry, name: &str, help: &str) -> Gauge {
+    let g = Gauge::with_opts(Opts::new(name, help).namespace(NAMESPACE)).expect("valid metric");
+    r.register(Box::new(g.clone())).expect("unique metric");
+    g
+}
+
+impl Node {
+    fn new(r: &Registry) -> Self {
+        let g = |name, help| node_gauge(r, name, help);
+        Self {
+            cpu_load: g(
+                "host_cpu_load",
+                "Share of the machine's CPU time that was busy over the last few seconds (0 to 1; waiting for I/O counts as idle)",
+            ),
+            cpu_busiest: g(
+                "host_cpu_busiest",
+                "The same for the busiest single CPU: a core can be the limit while the average has room",
+            ),
+            cpu_iowait: g(
+                "host_cpu_iowait",
+                "Share of all CPU time spent waiting for I/O",
+            ),
+            cpu_softirq: g(
+                "host_cpu_softirq",
+                "Share of all CPU time the kernel spent on deferred work, which includes sending and receiving packets",
+            ),
+            mem_used: g(
+                "host_mem_used",
+                "Share of the machine's memory in use (0 to 1; what the kernel could hand out without swapping is not in use)",
+            ),
+            mem_total: g("host_mem_total_bytes", "Memory the machine has"),
+            mem_available: g(
+                "host_mem_available_bytes",
+                "Memory the kernel could hand out without swapping or killing anything",
+            ),
+            rss_limit: g(
+                "rss_limit_bytes",
+                "What this process's control group may hold in memory (0: no limit); its use is process_resident_memory_bytes",
+            ),
+            tx_bps: g(
+                "host_tx_bps",
+                "What the default network interface sends, in bits per second, link headers included, everything on the machine counted",
+            ),
+            tx_pps: g(
+                "host_tx_pps",
+                "What the default network interface sends, in packets per second",
+            ),
+            tx_dropped_pps: g(
+                "host_tx_dropped_pps",
+                "Packets per second the default interface's driver dropped for want of room",
+            ),
+            sessions: g("sessions", "Sessions running on this instance"),
+            shards: g("shards", "Threads serving sessions"),
+            shards_pressured: g(
+                "shards_pressured",
+                "Shards with no room left, shedding load (small video layers, fewer voices)",
+            ),
+            shards_saturated: g(
+                "shards_saturated",
+                "Shards at their limit: they refuse new sessions",
+            ),
+            egress_bps: g(
+                "egress_bps",
+                "What the instance hands to its sockets, in bits per second, headers up to the link layer included",
+            ),
+            egress_pps: g(
+                "egress_pps",
+                "What the instance hands to its sockets, in datagrams per second",
+            ),
+            egress_ceiling_bps: g(
+                "egress_ceiling_bps",
+                "The send rate in bits per second at which the kernel started refusing datagrams, as the node learned it (0 until it has)",
+            ),
+            egress_ceiling_pps: g("egress_ceiling_pps", "The same in datagrams per second"),
+            egress_squeezed: g(
+                "egress_squeezed",
+                "1 while receivers are held to the small video layers (a send budget or the learned ceiling is reached)",
+            ),
+            egress_refusing: g(
+                "egress_refusing",
+                "1 while the kernel refuses datagrams (and for a few seconds after): recording uploads slow down",
+            ),
+            egress_choked: g(
+                "egress_choked",
+                "1 while the kernel keeps refusing after the squeeze: calls forward their loudest voice only",
+            ),
+            kernel_send_drops: {
+                let c = Counter::with_opts(
+                    Opts::new(
+                        "kernel_send_drops_total",
+                        "Datagrams the kernel refused to queue (UDP SndbufErrors), counted from when the instance first read it",
+                    )
+                    .namespace(NAMESPACE),
+                )
+                .expect("valid metric");
+                r.register(Box::new(c.clone())).expect("unique metric");
+                c
+            },
+            kernel_send_drops_seen: AtomicU64::new(0),
+        }
+    }
+
+    fn observe(&self, s: &SystemStatus) {
+        let h = &s.host;
+        self.cpu_load.set(h.cpu_load);
+        self.cpu_busiest.set(h.cpu_busiest);
+        self.cpu_iowait.set(h.cpu_iowait);
+        self.cpu_softirq.set(h.cpu_softirq);
+        self.mem_used.set(h.mem_used);
+        self.mem_total.set(h.mem_total_bytes as f64);
+        self.mem_available.set(h.mem_available_bytes as f64);
+        self.rss_limit.set(h.rss_limit_bytes as f64);
+        self.tx_bps.set(h.host_tx_bps as f64);
+        self.tx_pps.set(h.host_tx_pps as f64);
+        self.tx_dropped_pps.set(h.host_tx_dropped_pps as f64);
+        self.sessions.set(s.sessions as f64);
+        self.shards.set(s.shards as f64);
+        self.shards_pressured.set(s.shards_pressured as f64);
+        self.shards_saturated.set(s.shards_saturated as f64);
+        self.egress_bps.set(s.egress_bps as f64);
+        self.egress_pps.set(s.egress_pps as f64);
+        self.egress_ceiling_bps.set(s.egress_ceiling_bps as f64);
+        self.egress_ceiling_pps.set(s.egress_ceiling_pps as f64);
+        self.egress_squeezed.set(f64::from(s.egress_squeezed));
+        self.egress_refusing.set(f64::from(s.egress_refusing));
+        self.egress_choked.set(f64::from(s.egress_choked));
+        let seen = self
+            .kernel_send_drops_seen
+            .fetch_max(s.kernel_send_drops, Ordering::Relaxed);
+        self.kernel_send_drops
+            .inc_by(s.kernel_send_drops.saturating_sub(seen) as f64);
+    }
+}
+
 /// The service's metrics.
 pub struct Metrics {
     registry: Registry,
+    node: Node,
     rtp_tracks: GaugeVec,
     /// One counter per track type, resolved once: a label lookup on every packet would show.
     rtp_bytes_sent: [Counter; 4],
@@ -191,6 +361,7 @@ impl Metrics {
         }
         let r = &registry;
         Self {
+            node: Node::new(r),
             rtp_tracks: gauge(
                 r,
                 "rtc",
@@ -533,6 +704,11 @@ impl Metrics {
             .inc();
     }
 
+    /// Sets the node-level gauges (see [`SystemStatus`]); call it just before `render`.
+    pub fn observe_system(&self, status: &SystemStatus) {
+        self.node.observe(status);
+    }
+
     /// The metrics in the Prometheus text exposition format.
     pub fn render(&self) -> String {
         let mut out = Vec::new();
@@ -782,6 +958,61 @@ mod tests {
         ] {
             assert!(text.contains(name), "missing {name} in\n{text}");
         }
+    }
+
+    #[test]
+    fn the_node_figures_are_exported_under_the_names_of_system() {
+        let m = Metrics::new();
+        let mut status = SystemStatus {
+            sessions: 1500,
+            shards: 4,
+            shards_pressured: 3,
+            shards_saturated: 1,
+            egress_bps: 540_000_000,
+            egress_pps: 105_000,
+            kernel_send_drops: 7_000,
+            egress_squeezed: true,
+            egress_choked: true,
+            egress_ceiling_bps: 700_000_000,
+            egress_ceiling_pps: 117_000,
+            ..SystemStatus::default()
+        };
+        status.host.cpu_load = 0.75;
+        status.host.cpu_busiest = 1.0;
+        status.host.mem_used = 0.5;
+        status.host.mem_total_bytes = 8 << 30;
+        status.host.rss_limit_bytes = 3 << 30;
+        status.host.host_tx_bps = 1_200_000_000;
+        m.observe_system(&status);
+        let text = m.render();
+        for line in [
+            "rtcd_sessions 1500",
+            "rtcd_shards 4",
+            "rtcd_shards_pressured 3",
+            "rtcd_shards_saturated 1",
+            "rtcd_egress_bps 540000000",
+            "rtcd_egress_pps 105000",
+            "rtcd_egress_ceiling_bps 700000000",
+            "rtcd_egress_ceiling_pps 117000",
+            "rtcd_egress_squeezed 1",
+            "rtcd_egress_refusing 0",
+            "rtcd_egress_choked 1",
+            "rtcd_kernel_send_drops_total 7000",
+            "rtcd_host_cpu_load 0.75",
+            "rtcd_host_cpu_busiest 1",
+            "rtcd_host_mem_used 0.5",
+            "rtcd_host_mem_total_bytes 8589934592",
+            "rtcd_rss_limit_bytes 3221225472",
+            "rtcd_host_tx_bps 1200000000",
+        ] {
+            assert!(text.lines().any(|l| l == line), "missing {line} in\n{text}");
+        }
+        // The drop counter only adds what is new, and never goes back.
+        status.kernel_send_drops = 7_500;
+        m.observe_system(&status);
+        status.kernel_send_drops = 100;
+        m.observe_system(&status);
+        assert!(m.render().contains("rtcd_kernel_send_drops_total 7500\n"));
     }
 
     #[test]

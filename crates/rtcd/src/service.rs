@@ -18,7 +18,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::auth::AuthService;
 use crate::config::Config;
-use crate::info::SystemMonitor;
+use crate::info::{SystemMonitor, SystemStatus};
 use crate::metrics::Metrics;
 use crate::recording::{Recordings, Reports};
 
@@ -135,6 +135,26 @@ impl Service {
                 }
                 self.recordings.yield_to_media(yielding);
             }
+        }
+    }
+
+    /// What `GET /system` reports and `/metrics` exports about the node.
+    pub fn status(&self) -> SystemStatus {
+        let sfu = &self.sfu;
+        SystemStatus {
+            host: self.system.info(),
+            sessions: sfu.session_count(),
+            shards: sfu.shard_count(),
+            shards_pressured: sfu.shards_pressured(),
+            shards_saturated: sfu.shards_saturated(),
+            egress_bps: sfu.egress_bps(),
+            egress_pps: sfu.egress_pps(),
+            kernel_send_drops: sfu.kernel_send_drops(),
+            egress_squeezed: sfu.egress_squeezed(),
+            egress_refusing: sfu.egress_refusing(),
+            egress_choked: sfu.egress_choked(),
+            egress_ceiling_bps: sfu.egress_ceiling_bps(),
+            egress_ceiling_pps: sfu.egress_ceiling_pps(),
         }
     }
 

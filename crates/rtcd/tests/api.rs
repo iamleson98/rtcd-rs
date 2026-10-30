@@ -51,6 +51,24 @@ async fn the_system_info_carries_the_load_of_the_instance() {
     assert!(v["cpu_load"].is_number(), "{v}");
     assert_eq!(v["sessions"], 0, "{v}");
     assert!(v["shards"].as_u64().unwrap() >= 1, "{v}");
+    // What the Go server will admit recordings by, besides the CPU.
+    for key in [
+        "cpu_busiest",
+        "cpu_iowait",
+        "cpu_softirq",
+        "mem_used",
+        "mem_total_bytes",
+        "mem_available_bytes",
+        "rss_bytes",
+        "rss_limit_bytes",
+        "host_tx_bps",
+        "host_tx_pps",
+        "host_tx_dropped_pps",
+        "egress_refusing",
+        "egress_choked",
+    ] {
+        assert!(!v[key].is_null(), "{key} missing in {v}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -372,5 +390,17 @@ async fn the_metrics_endpoint_serves_prometheus_text() {
             .unwrap()
             .starts_with("text/plain")
     );
+    let text = r.text().await.unwrap();
+    for name in [
+        "rtcd_shards ",
+        "rtcd_shards_pressured ",
+        "rtcd_shards_saturated ",
+        "rtcd_sessions ",
+        "rtcd_egress_ceiling_bps ",
+        "rtcd_kernel_send_drops_total ",
+        "rtcd_host_cpu_load ",
+    ] {
+        assert!(text.contains(name), "{name} missing in\n{text}");
+    }
     s.shutdown().await;
 }
