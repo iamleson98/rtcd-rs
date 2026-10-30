@@ -59,6 +59,7 @@ struct Node {
     egress_pps: Gauge,
     egress_ceiling_bps: Gauge,
     egress_ceiling_pps: Gauge,
+    egress_adapt: Gauge,
     egress_squeezed: Gauge,
     egress_refusing: Gauge,
     egress_choked: Gauge,
@@ -142,17 +143,21 @@ impl Node {
                 "The send rate in bits per second at which the kernel started refusing datagrams, as the node learned it (0 until it has)",
             ),
             egress_ceiling_pps: g("egress_ceiling_pps", "The same in datagrams per second"),
+            egress_adapt: g(
+                "egress_adapt",
+                "1 when the node acts on the kernel's refusals (RTCD_RTC_EGRESSADAPT), 0 when it only counts and reports them",
+            ),
             egress_squeezed: g(
                 "egress_squeezed",
-                "1 while receivers are held to the small video layers (a send budget or the learned ceiling is reached)",
+                "1 while receivers are held to the small video layers and calls to two voices: a send budget is reached, or, with egress_adapt, the kernel is refusing datagrams (until ten seconds after) or the learned ceiling is reached",
             ),
             egress_refusing: g(
                 "egress_refusing",
-                "1 while the kernel refuses datagrams (and for a few seconds after): recording uploads slow down",
+                "1 while the kernel refuses datagrams (two refusing seconds in a row, and ten seconds after); with egress_adapt recording uploads slow down meanwhile",
             ),
             egress_choked: g(
                 "egress_choked",
-                "1 while the kernel keeps refusing after the squeeze: calls forward their loudest voice only",
+                "With egress_adapt, 1 while the kernel keeps refusing through a squeeze the node decided on: calls forward their loudest voice only (always 0 without it)",
             ),
             kernel_send_drops: {
                 let c = Counter::with_opts(
@@ -191,6 +196,7 @@ impl Node {
         self.egress_pps.set(s.egress_pps as f64);
         self.egress_ceiling_bps.set(s.egress_ceiling_bps as f64);
         self.egress_ceiling_pps.set(s.egress_ceiling_pps as f64);
+        self.egress_adapt.set(f64::from(s.egress_adapt));
         self.egress_squeezed.set(f64::from(s.egress_squeezed));
         self.egress_refusing.set(f64::from(s.egress_refusing));
         self.egress_choked.set(f64::from(s.egress_choked));
@@ -971,6 +977,7 @@ mod tests {
             egress_bps: 540_000_000,
             egress_pps: 105_000,
             kernel_send_drops: 7_000,
+            egress_adapt: true,
             egress_squeezed: true,
             egress_choked: true,
             egress_ceiling_bps: 700_000_000,
@@ -994,6 +1001,7 @@ mod tests {
             "rtcd_egress_pps 105000",
             "rtcd_egress_ceiling_bps 700000000",
             "rtcd_egress_ceiling_pps 117000",
+            "rtcd_egress_adapt 1",
             "rtcd_egress_squeezed 1",
             "rtcd_egress_refusing 0",
             "rtcd_egress_choked 1",

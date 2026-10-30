@@ -30,13 +30,14 @@ const BATCH_BYTES: u64 = 256 << 20;
 const UPLOAD_RATE: u64 = 256 << 10;
 
 /// How long a request of `size` bytes may take. Held to a node-wide rate shared by every request in
-/// flight, a request gets a share of it, and it may be held to a share of that (a quarter while the
-/// node's own media needs the network) that a request started at the full rate finds cut under it:
-/// the allowance is for the slowest of the two, the quarter or the current share, divided among the
-/// requests in flight, and twice what it takes (the number in flight may grow while it is sent).
+/// flight, a request gets a share of it; and where uploads may stand aside for the node's own media
+/// (the throttle says to what share) a request started at the full rate can find the share cut under
+/// it. The allowance is for the slowest share a request may meet, divided among the requests in
+/// flight, and twice what it takes (the number in flight may grow while it is sent). Where uploads
+/// never stand aside the slowest share is the current one, and the allowance is production's.
 fn request_timeout(size: u64, throttle: Option<&Throttle>) -> Duration {
     let rate = throttle.map_or(UPLOAD_RATE as f64, |t| {
-        (UPLOAD_RATE as f64).min(t.fair_rate(t.share().min(250)) / 2.0)
+        (UPLOAD_RATE as f64).min(t.fair_rate(t.slowest_share()) / 2.0)
     });
     Duration::from_secs(60 + (size as f64 / rate) as u64)
 }
@@ -489,6 +490,9 @@ mod tests {
         // A node-wide rate of 1 MiB/s: started at the full rate, a request may find the throttle
         // cut to a quarter (256 KiB/s) under it, and wants twice the time that takes.
         let throttle = std::sync::Arc::new(Throttle::new(1 << 20));
+        // Where uploads never stand aside, a throttle faster than the slowest link changes nothing.
+        assert_eq!(request_timeout(size, Some(&throttle)).as_secs(), 60 + 64);
+        throttle.may_yield_to(250);
         assert_eq!(request_timeout(size, Some(&throttle)).as_secs(), 60 + 128);
         // Eight requests share it: 32 KiB/s each at the quarter, twice the time for 16 MiB.
         let flights: Vec<_> = (0..8).map(|_| throttle.enter()).collect();

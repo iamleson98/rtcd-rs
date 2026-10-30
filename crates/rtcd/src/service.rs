@@ -121,7 +121,12 @@ impl Service {
         metrics: Arc<Metrics>,
     ) -> Arc<Self> {
         let reports = Arc::new(Reports::new(metrics.clone()));
-        let recordings = Recordings::new(&cfg.record, reports.clone(), metrics.clone());
+        let recordings = Recordings::new(
+            &cfg.record,
+            cfg.rtc.egress_adapt,
+            reports.clone(),
+            metrics.clone(),
+        );
         Arc::new(Self {
             cfg,
             auth,
@@ -177,6 +182,7 @@ impl Service {
             egress_bps: sfu.egress_bps(),
             egress_pps: sfu.egress_pps(),
             kernel_send_drops: sfu.kernel_send_drops(),
+            egress_adapt: sfu.egress_adapts(),
             egress_squeezed: sfu.egress_squeezed(),
             egress_refusing: sfu.egress_refusing(),
             egress_choked: sfu.egress_choked(),
@@ -390,7 +396,7 @@ mod tests {
             max_pending_bytes: 4 << 30,
             ..RecordConfig::default()
         };
-        let r = Recordings::new(&cfg, Arc::new(Reports::new(metrics.clone())), metrics);
+        let r = Recordings::new(&cfg, true, Arc::new(Reports::new(metrics.clone())), metrics);
         (r, dir)
     }
 

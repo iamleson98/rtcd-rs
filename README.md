@@ -169,8 +169,10 @@ refused at least 50 datagrams a second and 0.5 % of those sent.
 3. Fifteen in a row are an overload, not a stall. If the node sends at least the *learn floor*
    (`RTCD_RTC_EGRESSLEARNMINMBPS`, default 400, or `RTCD_RTC_EGRESSLEARNMINPPS`, default 80000: about
    half of what the OVH video VPS's card was measured to take; below it refusals are never taken for
-   an overload) the ceiling becomes 90 % of the most it sent in the run, before the squeeze took it
-   down (`egress_ceiling_bps`, `_pps`), and the squeeze is held by it from then on, released after
+   an overload) each limit's ceiling becomes 90 % of the most the card took in the run (what was
+   handed to the sockets less what the kernel refused, before the squeeze took it down;
+   `egress_ceiling_bps`, `_pps`, each taught only while that limit is the one being met), and the
+   squeeze is held by it from then on, released after
    twenty seconds under 65 % of it (twice as long when it keeps coming back). The ceiling is lifted
    by a tenth for every five minutes without a refusal and forgotten once it is twice what was taught
    (a node idle all night starts the morning without it). An overload that finds the node not
@@ -183,6 +185,11 @@ refused at least 50 datagrams a second and 0.5 % of those sent.
    falls in a squeeze from a real ceiling and lasts five windows costs one voice per call for ten
    seconds.
 
+Refusals teach by what the card *took*, so a demand at twice the card's limit learns the limit, not
+twice it. The gauge cannot tell a stall from an overload except by how long it lasts and how much the
+card took: a stall that took everything teaches nothing, one that took at least the floor for fifteen
+windows is taken for an overload, so the longest real stall has to be measured on the card.
+
 The service also brings these figures up to date every second whether or not any session is left,
 and a window in which nothing was sent clears the squeeze and the choke, so an idle node reports no
 squeeze and no rate. The rate is what the shards hand to their sockets, link-layer headers included:
@@ -191,6 +198,24 @@ That makes `egress_bps` read higher than before, by up to half on voice-heavy tr
 datagram now adds 52 bytes of headers and encryption to a payload of about 100): during a rollout,
 with old and new instances side by side, the two are on different scales, and a server that compares
 them (its placement margin) compares unlike numbers.
+
+### Changes since 0357b0d (for whoever takes this release)
+
+- `GET /system` `cpu_load` is the busy share over the last five seconds (it was the last second);
+  anything that admits work on it (the Go server's recording admission) sees a steadier figure.
+- `kernel_send_drops` counts from when rtcd first read the kernel (it read the machine's count since
+  boot), IPv4 and IPv6 together, and never goes back; `rtcd_kernel_send_drops_total` is its counter,
+  and the rate of that is what a dashboard wants.
+- `egress_squeezed` and the learned ceiling were set by one window of 50 refusals even though nothing
+  acted on them, and stayed set after the last session left (a server that skips squeezed nodes then
+  skipped the node for good). They are set by refusals only with `RTCD_RTC_EGRESSADAPT`; otherwise
+  only a send budget sets `egress_squeezed`, and an empty node clears it. `egress_adapt` and
+  `rtcd_egress_adapt` say which it is.
+- `egress_bps` and `egress_pps` count every datagram handed to a socket, headers up to the link layer
+  included (receiver reports, retransmissions, ICE and DTLS too): they read 30 to 50 % higher than
+  before for the same traffic, so a configured send budget trips earlier than it did. Where a budget
+  is set, raise it by that much, and compare `rtcd_egress_bps` with `rtcd_host_tx_bps`.
+- New fields and metrics: see the table above (`cpu_busiest`, `mem_*`, `host_tx_*`, `egress_*`).
 
 The card has a second ceiling, in packets: `RTCD_RTC_EGRESSBUDGETPPS=N` (`rtc.egress_budget_pps`)
 is the same rule for packets per second, and either budget squeezes. Voice packets are about 100

@@ -34,8 +34,10 @@ struct State {
 pub struct Throttle {
     /// Bytes per second.
     rate: f64,
-    /// How much of `rate` is let through, in thousandths (see [`Throttle::set_share`]).
+    /// How much of `rate` is let through, in thousandths (see [`Throttle::set_share`]), and the
+    /// least it may be set to (see [`Throttle::may_yield_to`]).
     share: AtomicU32,
+    floor: AtomicU32,
     state: Mutex<State>,
     /// The rate no longer applies (see [`Throttle::lift`]).
     lifted: AtomicBool,
@@ -60,6 +62,7 @@ impl Throttle {
         Self {
             rate,
             share: AtomicU32::new(FULL),
+            floor: AtomicU32::new(FULL),
             state: Mutex::new(State {
                 allowed: rate * BURST,
                 reserved: 0.0,
@@ -89,6 +92,18 @@ impl Throttle {
     /// loses packets costs a class.
     pub fn set_share(&self, permille: u32) {
         self.share.store(permille.clamp(1, FULL), Ordering::Relaxed);
+    }
+
+    /// Says that the share may be set as low as `permille` thousandths later (by whoever makes
+    /// uploads stand aside), so that [`Throttle::slowest_share`] allows for it.
+    pub fn may_yield_to(&self, permille: u32) {
+        self.floor.store(permille.clamp(1, FULL), Ordering::Relaxed);
+    }
+
+    /// The slowest share a request sent now may find itself held to: the current one, or the
+    /// lowest it may be set to if that is lower.
+    pub fn slowest_share(&self) -> u32 {
+        self.share().min(self.floor.load(Ordering::Relaxed))
     }
 
     /// How much of the rate is let through now, in thousandths.

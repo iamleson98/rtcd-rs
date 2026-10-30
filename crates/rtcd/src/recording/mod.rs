@@ -272,7 +272,15 @@ const YIELD_SHARE: u32 = 250;
 impl Recordings {
     /// Sets recording up as the configuration says. Must be called inside the runtime (the
     /// uploader is a task of it).
-    pub fn new(cfg: &RecordConfig, reports: Arc<Reports>, metrics: Arc<Metrics>) -> Self {
+    ///
+    /// `yields`: uploads may be made to stand aside later (`yield_to_media`), which the upload
+    /// time allowance has to allow for.
+    pub fn new(
+        cfg: &RecordConfig,
+        yields: bool,
+        reports: Arc<Reports>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         if !cfg.enabled {
             return Self {
                 live: None,
@@ -310,9 +318,14 @@ impl Recordings {
                 pending,
                 registry: Arc::new(Registry::default()),
                 clients: HttpClients::new(),
-                throttle: Arc::new(Throttle::new(
-                    (cfg.upload_mbps.max(1) as u64).saturating_mul(125_000),
-                )),
+                throttle: {
+                    let throttle =
+                        Throttle::new((cfg.upload_mbps.max(1) as u64).saturating_mul(125_000));
+                    if yields {
+                        throttle.may_yield_to(YIELD_SHARE);
+                    }
+                    Arc::new(throttle)
+                },
                 runs: AtomicU64::new(0),
                 data_dir,
                 max_bytes: cfg.max_bytes.max(1) as u64,
@@ -557,7 +570,7 @@ mod tests {
             data_dir: dir.to_string_lossy().into_owned(),
             ..RecordConfig::default()
         };
-        let r = Recordings::new(&cfg, Arc::new(Reports::new(metrics.clone())), metrics);
+        let r = Recordings::new(&cfg, true, Arc::new(Reports::new(metrics.clone())), metrics);
         assert_eq!(r.upload_share(), Some(1000));
         r.yield_to_media(true);
         assert_eq!(r.upload_share(), Some(250));
@@ -575,6 +588,7 @@ mod tests {
         assert_eq!(
             Recordings::new(
                 &RecordConfig::default(),
+                false,
                 Arc::new(Reports::new(Arc::new(Metrics::new()))),
                 Arc::new(Metrics::new())
             )

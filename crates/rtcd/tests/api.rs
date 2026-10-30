@@ -64,6 +64,7 @@ async fn the_system_info_carries_the_load_of_the_instance() {
         "host_tx_bps",
         "host_tx_pps",
         "host_tx_dropped_pps",
+        "egress_adapt",
         "egress_refusing",
         "egress_choked",
     ] {
@@ -398,6 +399,7 @@ async fn the_metrics_endpoint_serves_prometheus_text() {
         "rtcd_sessions ",
         "rtcd_egress_ceiling_bps ",
         "rtcd_kernel_send_drops_total ",
+        "rtcd_egress_adapt ",
         "rtcd_host_cpu_load ",
     ] {
         assert!(text.contains(name), "{name} missing in\n{text}");

@@ -104,13 +104,19 @@ pub struct SystemStatus {
     pub egress_pps: u64,
     /// Datagrams the kernel refused to queue since the instance started reading the count.
     pub kernel_send_drops: u64,
-    /// Receivers are held to the small video layers: a send budget or the node's own learned
-    /// ceiling is reached.
+    /// Whether the node acts on the kernel's refusals (`RTCD_RTC_EGRESSADAPT`). Off, only a send
+    /// budget squeezes, `egress_choked` is never set and uploads are never slowed; the refusals
+    /// are counted and `egress_refusing` is reported all the same.
+    pub egress_adapt: bool,
+    /// Receivers are held to the small video layers and calls to two voices: a send budget is
+    /// reached, or, with `egress_adapt`, the kernel is refusing datagrams (a squeeze that ends ten
+    /// seconds after the last refusal) or the ceiling the node learned is reached.
     pub egress_squeezed: bool,
-    /// The kernel is refusing datagrams now (or was a few seconds ago): recording uploads slow
-    /// down.
+    /// The kernel is refusing datagrams now (two windows in a row, or a few seconds ago). With
+    /// `egress_adapt` recording uploads slow down meanwhile.
     pub egress_refusing: bool,
-    /// It went on refusing after the squeeze: calls forward their loudest voice only.
+    /// With `egress_adapt`: it went on refusing through a squeeze it decided on, and calls forward
+    /// their loudest voice only.
     pub egress_choked: bool,
     /// The send rate at which the kernel started refusing datagrams, as the node learned it, in
     /// bits and in packets per second (0 until it has).

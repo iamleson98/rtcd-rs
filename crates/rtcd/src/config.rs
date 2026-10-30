@@ -199,14 +199,15 @@ pub struct RtcConfig {
     pub audio_ptime_ms: i64,
     /// The most this node should send, in megabits per second. Near it every receiver's cameras
     /// and screen shares fall back to their small layer, so the node slows down evenly instead of
-    /// losing packets for everyone. 0 (the default) sets no budget: the node learns its own ceiling
-    /// from the kernel refusing datagrams. The rate is reported on `GET /system` either way.
+    /// losing packets for everyone. 0 (the default) sets no budget: nothing squeezes video except
+    /// `egress_adapt`, which learns a ceiling from the kernel refusing datagrams. The rate is
+    /// reported on `GET /system` either way.
     pub egress_budget_mbps: i64,
     /// The most this node should send, in packets per second: the same fall back for the other
     /// ceiling. A virtual network card takes a limited number of packets however small they are,
     /// and voice packets are small: the OVH video VPS sends 150 to 200 thousand a second and then
     /// its transmit ring stays full. Set it to about 80 % of what the card was measured to take.
-    /// 0 (the default) sets no budget, and the node learns its own ceiling.
+    /// 0 (the default) sets no budget, and nothing squeezes on packets except `egress_adapt`.
     pub egress_budget_pps: i64,
     /// Whether the node acts on the kernel refusing its datagrams (`RTCD_RTC_EGRESSADAPT`). Off,
     /// the default, it counts and reports them (`GET /system`, `/metrics`) and squeezes video
