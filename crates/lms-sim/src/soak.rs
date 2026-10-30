@@ -104,7 +104,7 @@ pub async fn run(args: impl Iterator<Item = String>, assets: std::path::PathBuf)
         })
         .await,
     );
-    let lms = Lms::start(Some(rtcd.clone()), a.out.join("lms")).await;
+    let lms = Lms::start(a.out.join("lms")).await;
     let control = rtcd.connect().await;
     let mut rows: Vec<Value> = Vec::new();
     for class_no in 0..a.classes {
@@ -122,9 +122,6 @@ pub async fn run(args: impl Iterator<Item = String>, assets: std::path::PathBuf)
         let ready = Instant::now();
         while rtcd.sessions() < a.people as usize && ready.elapsed() < Duration::from_secs(20) {
             tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        for p in &people {
-            lms.person_joined(&p.session_id, &p.user_id);
         }
         if record {
             control.send(ClientMessage::RecordStart(RecordStart {
@@ -162,7 +159,6 @@ pub async fn run(args: impl Iterator<Item = String>, assets: std::path::PathBuf)
             }
         }
         for p in people {
-            lms.person_left(&p.session_id);
             p.leave().await;
         }
         let gone = Instant::now();
