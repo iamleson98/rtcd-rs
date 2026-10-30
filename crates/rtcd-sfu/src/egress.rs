@@ -26,7 +26,19 @@
 //! The rate is also what a placement decision wants to know, so it is readable whether or not a
 //! budget is set. The kernel's own count of datagrams it refused to queue is kept too: UDP
 //! reports those to nobody, so without it a node that drops half its packets sees none of them.
+//!
+//! What is counted is what the shards hand to their sockets, one datagram at a time, headers up
+//! to the link layer included: media after encryption, receiver reports, retransmissions, ICE
+//! and DTLS, all of it, as the network card carries it. The send queue does not tell a voice
+//! packet from a report, and a count of the media alone reads a third to a half low.
+//!
+//! Squeezing video takes the bits down, and voice, which is most of the packets, stays. So a
+//! refusal that goes on after the squeeze is answered a second time: past [`CHOKE_AFTER`] the
+//! node is *choked*, and calls forward the loudest voice only until the kernel has stopped
+//! refusing. Work that can wait (uploading recordings) stands aside for as long as the kernel
+//! refuses ([`Gauge::refusing`]).
 
+use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -50,6 +62,14 @@ const RELEARN_NEAR: f64 = 0.95;
 /// A learned ceiling is lifted by [`GROW_BY`] after this long without a refusal.
 const GROW_AFTER: Duration = Duration::from_secs(300);
 const GROW_BY: f64 = 1.1;
+/// The kernel refuses datagrams still, this long after the squeeze began (and it did not help):
+/// the node is choked.
+const CHOKE_AFTER: Duration = Duration::from_secs(5);
+/// The kernel is taken to be refusing until a window this long has gone by without a refusal.
+const REFUSING_FOR: Duration = Duration::from_secs(10);
+/// The Ethernet header, which the network card's counters include; the IP header (20 bytes, 40
+/// for IPv6) and the UDP (8) or TCP (20) one are added per datagram.
+const LINK_OVERHEAD: u64 = 14;
 /// The gauge is updated by the sessions' upkeep, so while no session exists it is not. A gap this
 /// long between two updates was a quiet node: what it held before says nothing about now.
 const IDLE_GAP: Duration = Duration::from_secs(10);
@@ -70,11 +90,33 @@ struct State {
     last_drops: Option<u64>,
     /// When the ceiling was last taught or lifted.
     ceiling_at: Option<Instant>,
+    /// The kernel's count when the node first read it: refusals before that were not ours.
+    drops_base: Option<u64>,
+    /// The last window in which the kernel refused enough datagrams to matter, and the first of
+    /// the run of them it belongs to.
+    refusing_at: Option<Instant>,
+    refusing_since: Option<Instant>,
+}
+
+/// Where the kernel's count of refused datagrams comes from.
+struct DropsSource(Box<dyn Fn() -> Option<u64> + Send + Sync>);
+
+impl Default for DropsSource {
+    fn default() -> Self {
+        Self(Box::new(udp_send_errors))
+    }
+}
+
+impl std::fmt::Debug for DropsSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DropsSource")
+    }
 }
 
 /// What the shards of one node have sent, shared by all of them.
 #[derive(Debug, Default)]
 pub struct Gauge {
+    drops_source: DropsSource,
     bytes: AtomicU64,
     packets: AtomicU64,
     state: Mutex<State>,
@@ -84,12 +126,34 @@ pub struct Gauge {
     squeezed: AtomicBool,
     /// Datagrams the kernel refused to queue since the node started (UDP `SndbufErrors`).
     kernel_drops: AtomicU64,
+    /// The kernel is refusing datagrams now, and has been, without a calm window, for how long
+    /// the two flags say.
+    refusing: AtomicBool,
+    choked: AtomicBool,
     /// The ceilings the node learned (0 until the kernel has refused something).
     ceiling: AtomicU64,
     ceiling_packets: AtomicU64,
 }
 
 impl Gauge {
+    /// A gauge that reads the count of refused datagrams from `source` instead of the system's
+    /// (`None`: it does not say), for a platform that keeps the count elsewhere and for tests,
+    /// which cannot make a kernel refuse.
+    pub fn with_kernel_drops(source: impl Fn() -> Option<u64> + Send + Sync + 'static) -> Self {
+        Self {
+            drops_source: DropsSource(Box::new(source)),
+            ..Self::default()
+        }
+    }
+
+    /// Counts a datagram of `len` bytes handed to a socket for `peer`, with the headers it will
+    /// carry on the wire. `tcp`: a segment of a TCP stream, not a UDP datagram.
+    pub fn add_datagram(&self, len: usize, peer: SocketAddr, tcp: bool) {
+        let ip = if peer.is_ipv6() { 40 } else { 20 };
+        let transport = if tcp { 20 } else { 8 };
+        self.add(len as u64 + LINK_OVERHEAD + ip + transport, 1);
+    }
+
     /// Counts what was put on the wire: `bytes` (headers included) in `packets` datagrams.
     pub fn add(&self, bytes: u64, packets: u64) {
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -106,8 +170,8 @@ impl Gauge {
         self.rate_packets.load(Ordering::Relaxed)
     }
 
-    /// How many datagrams the kernel has refused to queue since the node started: what was handed
-    /// to the socket and never left (0 where the system does not say).
+    /// How many datagrams the kernel has refused to queue since this process read the count first:
+    /// what was handed to the socket and never left (0 where the system does not say).
     pub fn kernel_send_drops(&self) -> u64 {
         self.kernel_drops.load(Ordering::Relaxed)
     }
@@ -128,10 +192,34 @@ impl Gauge {
         self.squeezed.load(Ordering::Relaxed)
     }
 
+    /// Whether the kernel is refusing datagrams now (it was within [`REFUSING_FOR`]).
+    pub fn refusing(&self) -> bool {
+        self.refusing.load(Ordering::Relaxed)
+    }
+
+    /// Whether it has been refusing for [`CHOKE_AFTER`] or more, squeeze or not: the bits fell
+    /// and the packets did not.
+    pub fn choked(&self) -> bool {
+        self.choked.load(Ordering::Relaxed)
+    }
+
     /// Recomputes the rates and the decision; cheap to call often, it works at most once a window.
     /// A budget of 0 is not set: the node's learned ceiling stands in for it.
     pub fn update(&self, now: Instant, budget_bps: u64, budget_pps: u64) {
-        self.update_with(now, budget_bps, budget_pps, udp_send_errors());
+        // Every session calls this once a second, and the kernel's count is a file to read and
+        // parse: only the call that finds a window over pays for it.
+        if !self.due(now) {
+            return;
+        }
+        self.update_with(now, budget_bps, budget_pps, (self.drops_source.0)());
+    }
+
+    /// Whether a window has gone by since the last update (and nobody is updating just now).
+    fn due(&self, now: Instant) -> bool {
+        self.state.try_lock().is_ok_and(|st| {
+            st.at
+                .is_none_or(|at| now.saturating_duration_since(at) >= WINDOW)
+        })
     }
 
     /// [`Gauge::update`] with the kernel's count of refused datagrams given (`None` where the
@@ -176,7 +264,9 @@ impl Gauge {
         self.rate_packets
             .store(st.rate_pps as u64, Ordering::Relaxed);
         let refused = drops.map_or(0, |d| {
-            self.kernel_drops.store(d, Ordering::Relaxed);
+            let base = *st.drops_base.get_or_insert(d);
+            self.kernel_drops
+                .store(d.saturating_sub(base), Ordering::Relaxed);
             let before = st.last_drops.replace(d).unwrap_or(d);
             d.saturating_sub(before)
         });
@@ -187,6 +277,9 @@ impl Gauge {
             st.calm_since = Some(at);
         }
         learn(&mut st, now, refused as f64 / secs);
+        let (refusing, choked) = track_refusals(&mut st, now, refused as f64 / secs);
+        self.refusing.store(refusing, Ordering::Relaxed);
+        self.choked.store(choked, Ordering::Relaxed);
         self.ceiling.store(st.learned_bps as u64, Ordering::Relaxed);
         self.ceiling_packets
             .store(st.learned_pps as u64, Ordering::Relaxed);
@@ -247,6 +340,26 @@ fn learn(st: &mut State, now: Instant, refused_per_sec: f64) {
             st.ceiling_at = Some(now);
         }
     }
+}
+
+/// Whether the kernel is refusing datagrams and has been for long enough that the squeeze did not
+/// answer it, given how many it refused a second in the window just measured.
+fn track_refusals(st: &mut State, now: Instant, refused_per_sec: f64) -> (bool, bool) {
+    if refused_per_sec >= DROPS_PER_SEC {
+        st.refusing_at = Some(now);
+        st.refusing_since.get_or_insert(now);
+    }
+    let refusing = st
+        .refusing_at
+        .is_some_and(|t| now.saturating_duration_since(t) < REFUSING_FOR);
+    if !refusing {
+        st.refusing_since = None;
+    }
+    let choked = refusing
+        && st
+            .refusing_since
+            .is_some_and(|t| now.saturating_duration_since(t) >= CHOKE_AFTER);
+    (refusing, choked)
 }
 
 /// The policy on its own: squeezed from the share of a budget it reaches, released after a calm
@@ -450,7 +563,11 @@ mod tests {
             "a little under the 700 Mbit/s it sent: {ceiling}"
         );
         assert!(g.ceiling_pps() > 0);
-        assert_eq!(g.kernel_send_drops(), refused);
+        assert_eq!(
+            g.kernel_send_drops(),
+            3 * 5_000,
+            "what was refused since the node first looked, not since the machine booted"
+        );
     }
 
     #[test]
@@ -548,5 +665,75 @@ mod tests {
             *now += Duration::from_secs(1);
             g.update_with(*now, 300_000_000, 0, Some(*refused));
         }
+    }
+
+    #[test]
+    fn the_kernels_count_is_read_once_a_window_not_once_a_call() {
+        let reads = std::sync::Arc::new(AtomicU64::new(0));
+        let counter = reads.clone();
+        let g = Gauge::with_kernel_drops(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Some(0)
+        });
+        let mut now = Instant::now();
+        // 1,500 sessions calling in the same second, ten seconds in a row.
+        for _ in 0..10 {
+            for _ in 0..1_500 {
+                g.update(now, 0, 0);
+            }
+            now += Duration::from_secs(1);
+        }
+        let reads = reads.load(Ordering::Relaxed);
+        assert!((10..=11).contains(&reads), "{reads} reads");
+    }
+
+    #[test]
+    fn datagrams_are_counted_with_the_headers_the_card_carries() {
+        let g = Gauge::default();
+        let v4: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:5000".parse().unwrap();
+        g.add_datagram(100, v4, false);
+        g.add_datagram(100, v6, false);
+        g.add_datagram(100, v4, true);
+        assert_eq!(g.bytes.load(Ordering::Relaxed), 142 + 162 + 154);
+        assert_eq!(g.packets.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn refusals_that_go_on_after_the_squeeze_choke_the_node() {
+        let g = Gauge::default();
+        let mut now = Instant::now();
+        let mut refused = 0;
+        g.update_with(now, 0, 0, Some(refused));
+        run_refusing(&g, &mut now, 3, 700, &mut refused, 5_000);
+        assert!(g.squeezed() && g.refusing());
+        assert!(!g.choked(), "the squeeze has had three seconds");
+        // The bits fell by half and the kernel refuses as many datagrams as before (voice).
+        run_refusing(&g, &mut now, 4, 350, &mut refused, 5_000);
+        assert!(g.choked(), "seven seconds of refusals");
+        // It stops refusing: the node stays choked until a calm spell has passed.
+        run_refusing(&g, &mut now, 5, 350, &mut refused, 0);
+        assert!(g.choked() && g.refusing());
+        run_refusing(&g, &mut now, 6, 350, &mut refused, 0);
+        assert!(
+            !g.choked() && !g.refusing(),
+            "ten seconds without a refusal"
+        );
+    }
+
+    #[test]
+    fn a_short_burst_of_refusals_squeezes_without_choking() {
+        let g = Gauge::default();
+        let mut now = Instant::now();
+        let mut refused = 0;
+        g.update_with(now, 0, 0, Some(refused));
+        run_refusing(&g, &mut now, 2, 700, &mut refused, 5_000);
+        run_refusing(&g, &mut now, 20, 300, &mut refused, 0);
+        assert!(g.squeezed());
+        assert!(!g.choked());
+        assert!(!g.refusing());
+        // A second burst later is a new run, not a continuation of the first.
+        run_refusing(&g, &mut now, 3, 700, &mut refused, 5_000);
+        assert!(!g.choked());
     }
 }

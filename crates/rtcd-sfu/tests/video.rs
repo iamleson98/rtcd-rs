@@ -2,13 +2,15 @@
 
 mod support;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rtcd_proto::MessageType;
 use rtcd_sfu::config::EngineConfig;
 use rtcd_sfu::engine::Load;
 use rtcd_sfu::ids::{TrackType, parse_track_id};
-use support::{Layer, World, describe, engine_config};
+use support::{Layer, World, config_with_refusals, describe, engine_config};
 
 const BOTH: [Layer; 2] = [Layer::Low, Layer::High];
 
@@ -575,4 +577,34 @@ fn a_shard_with_room_keeps_the_large_layer() {
     let tail = tail_layers_with(engine_config(), Load::Ok, 8.0);
     assert!(!tail.is_empty());
     assert!(tail.iter().all(|l| *l == Layer::High));
+}
+
+#[test]
+fn a_node_with_no_budget_squeezes_video_when_the_kernel_refuses_datagrams() {
+    // No budget is set: the node's own ceiling, learned from the refusals, is all there is.
+    let refused = Arc::new(AtomicU64::new(0));
+    let mut w = World::with_config(config_with_refusals(&refused));
+    let a = w.join_with_camera("alice", "call1");
+    let b = w.join("bob", "call1");
+    let tail = |w: &World| {
+        let all = video_of(w, b, "video_");
+        let last = all.len().saturating_sub(30);
+        all[last..].iter().map(|(l, _)| *l).collect::<Vec<_>>()
+    };
+    w.stream_video(a, false, 3.0, 30, &BOTH);
+    assert!(
+        tail(&w).iter().all(|l| *l == Layer::High),
+        "nothing refused"
+    );
+
+    for _ in 0..6 {
+        refused.fetch_add(5_000, Ordering::Relaxed);
+        w.stream_video(a, false, 1.0, 30, &BOTH);
+    }
+    let tail = tail(&w);
+    assert!(!tail.is_empty());
+    assert!(
+        tail.iter().all(|l| *l == Layer::Low),
+        "still on the large layer while the kernel refuses 5,000 datagrams a second"
+    );
 }

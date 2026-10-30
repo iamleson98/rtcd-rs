@@ -3,7 +3,7 @@
 mod support;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rtcd_proto::MessageType;
@@ -12,7 +12,7 @@ use rtcd_sfu::config::EngineConfig;
 use rtcd_sfu::engine::{CloseReason, Load};
 use rtcd_sfu::ids::{TrackType, parse_track_id};
 use rtcd_sfu::metrics::{Metrics, ReceiverQuality};
-use support::{World, engine_config};
+use support::{World, config_with_refusals, engine_config};
 
 /// Waits until browser `i` has received `n` tracks.
 fn wait_tracks(w: &mut World, i: usize, n: usize) {
@@ -672,5 +672,68 @@ fn a_shard_with_no_room_left_forwards_two_voices_at_most_and_gives_them_back() {
     assert!(
         (0..4).all(|i| heard(&w, i) - before[i] > 60),
         "everyone is heard again"
+    );
+}
+
+#[test]
+fn a_node_whose_kernel_keeps_refusing_after_the_squeeze_forwards_the_loudest_voice_only() {
+    let refused = Arc::new(AtomicU64::new(0));
+    let mut w = World::with_config(EngineConfig {
+        audio_loudest: 0,
+        ..config_with_refusals(&refused)
+    });
+    let speakers: Vec<usize> = (0..4).map(|i| w.join(&format!("s{i}"), "call1")).collect();
+    let listener = w.join("listener", "call1");
+    wait_tracks(&mut w, listener, 0);
+    // The level is minus dBov: the smaller, the louder.
+    let levels = [25u8, 30, 90, 100];
+    // One second of everyone talking while the kernel has refused `per_second` more datagrams.
+    let second = |w: &mut World, per_second: u64| {
+        refused.fetch_add(per_second, Ordering::Relaxed);
+        for _ in 0..50 {
+            for (&i, &level) in speakers.iter().zip(&levels) {
+                w.send_audio(i, level);
+            }
+            w.run_for(Duration::from_millis(20));
+        }
+    };
+    let heard =
+        |w: &World, i: usize| w.browsers[listener].received_on(&format!("voice_session-s{i}"));
+    let gained = |w: &mut World, seconds: usize, per_second: u64| {
+        let before: Vec<usize> = (0..4).map(|i| heard(w, i)).collect();
+        for _ in 0..seconds {
+            second(w, per_second);
+        }
+        (0..4).map(|i| heard(w, i) - before[i]).collect::<Vec<_>>()
+    };
+
+    let calm = gained(&mut w, 3, 0);
+    assert!(calm.iter().all(|&n| n > 100), "everyone is heard: {calm:?}");
+
+    // The first seconds of refusals: video is squeezed and two voices are forwarded.
+    gained(&mut w, 2, 5_000);
+    let squeezed = gained(&mut w, 2, 5_000);
+    assert!(
+        squeezed[0] > 50 && squeezed[1] > 50 && squeezed[2] < 30 && squeezed[3] < 30,
+        "the two loudest go on, the others are left out: {squeezed:?}"
+    );
+
+    // Refusals that go on past the squeeze: the loudest voice only.
+    gained(&mut w, 3, 5_000);
+    let choked = gained(&mut w, 3, 5_000);
+    assert!(choked[0] > 100, "the loudest goes on: {choked:?}");
+    assert!(
+        choked[1] < 30 && choked[2] < 30 && choked[3] < 30,
+        "the others are left out: {choked:?}"
+    );
+
+    // Once the kernel has accepted everything for a while the choke is over. The node does not
+    // go back to what it sent when the kernel first refused (that is its ceiling now, lifted a
+    // notch every few quiet minutes), so two voices are still forwarded.
+    gained(&mut w, 30, 0);
+    let held = gained(&mut w, 3, 0);
+    assert!(
+        held[0] > 100 && held[1] > 100 && held[2] < 30 && held[3] < 30,
+        "the two loudest are back: {held:?}"
     );
 }

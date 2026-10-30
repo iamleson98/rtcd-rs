@@ -278,11 +278,10 @@ impl Engine {
     }
 
     /// Whether the node is asked for more than it can send, or the shard for more than it can do:
-    /// a send budget (bits or packets) is nearly used, or the shard's thread has no room left.
+    /// a send budget (bits or packets) is nearly used, the kernel refuses datagrams (the node's own
+    /// ceiling, learned), or the shard's thread has no room left.
     fn shedding(&self) -> bool {
-        let budgeted = (self.cfg.egress_budget_bps > 0 || self.cfg.egress_budget_pps > 0)
-            && self.cfg.egress.squeezed();
-        budgeted || self.load != Load::Ok
+        self.cfg.egress.squeezed() || self.load != Load::Ok
     }
 
     /// Lets a call forward fewer voices while the node is shedding: a call with many open
@@ -290,7 +289,7 @@ impl Engine {
     /// two or three.
     fn follow_voice_limit(&mut self, key: SessionKey) {
         let configured = self.cfg.audio_loudest;
-        let limit = if self.load == Load::Saturated {
+        let limit = if self.load == Load::Saturated || self.cfg.egress.choked() {
             SATURATED_VOICES
         } else if self.shedding() {
             match configured {

@@ -685,9 +685,20 @@ impl Sfu {
         self.core.cfg.engine.egress.ceiling_pps()
     }
 
-    /// Whether receivers are held to the small video layers because a send budget is reached.
+    /// Whether receivers are held to the small video layers because a send budget is reached or
+    /// the kernel refuses datagrams.
     pub fn egress_squeezed(&self) -> bool {
         self.core.cfg.engine.egress.squeezed()
+    }
+
+    /// Whether the kernel is refusing datagrams now (or was a few seconds ago).
+    pub fn egress_refusing(&self) -> bool {
+        self.core.cfg.engine.egress.refusing()
+    }
+
+    /// Whether it has gone on refusing after the squeeze: calls forward their loudest voice only.
+    pub fn egress_choked(&self) -> bool {
+        self.core.cfg.engine.egress.choked()
     }
 
     /// How many threads serve sessions right now.
