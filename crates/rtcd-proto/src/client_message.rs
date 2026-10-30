@@ -51,6 +51,10 @@ pub struct RecordStart {
     pub t0: i64,
     /// The index the first file is numbered from, so that nodes and restarts never reuse one.
     pub file_base: u32,
+    /// The most files this start may write: the run ends (`file_limit`) once it has numbered
+    /// `file_base + max_files` of them, so that it never takes an index of the range beyond. Zero,
+    /// which an older server sends, is no limit.
+    pub max_files: u32,
     /// Where files are uploaded to.
     pub site_url: String,
     /// Authenticates the uploads. Never printed or logged.
@@ -64,6 +68,7 @@ impl fmt::Debug for RecordStart {
             .field("call_id", &self.call_id)
             .field("t0", &self.t0)
             .field("file_base", &self.file_base)
+            .field("max_files", &self.max_files)
             .field("site_url", &self.site_url)
             .field("token", &"<redacted>")
             .finish()
@@ -99,7 +104,10 @@ pub struct RecordFile {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RecordEnded {
     pub recording_id: String,
-    /// Why: `stopped`, `call_ended`, `disk_full`, `failed` or `refused`.
+    /// Why: `stopped`, `call_ended`, `disk_full`, `file_limit`, `failed` or `refused`. A start
+    /// that was not taken (the node is draining, the recording is held for another call or
+    /// number, the call has another recording) is answered `refused` at once, with no files; one
+    /// that was taken is answered once, when its capture is over and its files are in.
     pub reason: String,
     /// The index the first file was numbered from (the `file_base` of the start).
     pub file_base: u32,
@@ -194,11 +202,12 @@ impl ClientMessage {
             }
             Self::Rtc(m) | Self::Vad(m) => m.encode(&mut out),
             Self::RecordStart(r) => {
-                rmp::encode::write_map_len(&mut out, 6).expect("vec write");
+                rmp::encode::write_map_len(&mut out, 7).expect("vec write");
                 write_str_entry(&mut out, "recordingID", &r.recording_id);
                 write_str_entry(&mut out, "callID", &r.call_id);
                 write_int_entry(&mut out, "t0", r.t0);
                 write_uint_entry(&mut out, "fileBase", r.file_base.into());
+                write_uint_entry(&mut out, "maxFiles", r.max_files.into());
                 write_str_entry(&mut out, "siteURL", &r.site_url);
                 write_str_entry(&mut out, "token", &r.token);
             }
@@ -272,6 +281,7 @@ impl ClientMessage {
                     call_id: lookup_string(map, "callID"),
                     t0: lookup_i64(map, "t0"),
                     file_base: lookup_u32(map, "fileBase"),
+                    max_files: lookup_u32(map, "maxFiles"),
                     site_url: lookup_string(map, "siteURL"),
                     token: lookup_string(map, "token"),
                 })
@@ -357,6 +367,7 @@ mod tests {
             call_id: "c".into(),
             t0: 1_793_000_000_123,
             file_base: 100,
+            max_files: 20_000,
             site_url: "https://lms.example".into(),
             token: "s3cr3t-token".into(),
         }
@@ -562,6 +573,22 @@ mod tests {
         assert_eq!(start.recording_id, "r1");
         assert_eq!((start.t0, start.file_base), (0, 0));
         assert_eq!(start.token, "");
+    }
+
+    #[test]
+    fn a_record_start_without_a_file_limit_is_one_without_a_limit() {
+        // What a server from before the limit sends: no `maxFiles` at all.
+        let mut frame = Vec::new();
+        rmp::encode::write_str(&mut frame, "record_start").unwrap();
+        rmp::encode::write_map_len(&mut frame, 2).unwrap();
+        rmp::encode::write_str(&mut frame, "recordingID").unwrap();
+        rmp::encode::write_str(&mut frame, "r1").unwrap();
+        rmp::encode::write_str(&mut frame, "fileBase").unwrap();
+        rmp::encode::write_uint(&mut frame, 40_000).unwrap();
+        let ClientMessage::RecordStart(start) = ClientMessage::unpack(&frame).unwrap() else {
+            panic!("not a record_start")
+        };
+        assert_eq!((start.file_base, start.max_files), (40_000, 0));
     }
 
     #[test]

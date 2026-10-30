@@ -135,6 +135,7 @@ pub async fn run(args: impl Iterator<Item = String>, assets: std::path::PathBuf)
                     .unwrap()
                     .as_millis() as i64,
                 file_base: 0,
+                max_files: 0,
                 site_url: lms.url.clone(),
                 token: "bot-token".into(),
             }));

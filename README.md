@@ -358,7 +358,12 @@ participant: the server sends `record_start` over the websocket, each published 
 to a writer thread (`rtcd_sfu::record`), the files are the recorder crate's, rotated every two minutes
 (bounding what a node shutting down still holds) and numbered from the start's `fileBase` in the order they close, and each is uploaded as it closes
 through the endpoints the bot uses, then reported (`record_file`) and deleted. `record_ended` follows
-once every file is stored. Settings: `RTCD_RECORD_DATADIR`, `_MAXBYTES` (one recording's total),
+once every file is stored. Every `record_start` is answered once: `refused` at
+once when it is not taken (the node is draining and holds nothing of it, the recording is held for another
+call or first file number, the call has another recording, or the numbers reach those of a capture whose
+end is not sent yet), otherwise by the one `record_ended` of its run. The start a node already holds is
+not answered again, draining or not. An optional `maxFiles` in `record_start` bounds the run: it never
+opens more files than that, and ends as `file_limit` once the last is closed (absent or zero: no limit). Settings: `RTCD_RECORD_DATADIR`, `_MAXBYTES` (what one capture may write, 16 GiB by default: the most the server keeps of a recording),
 `_MAXPENDINGBYTES` (closed files waiting for upload, all recordings; above it packets are left out and
 counted, not the recording ended) and `_UPLOADMBPS` (the node's upload rate, so uploads never compete
 with media). Files a dead process left in the data directory are removed at start. Metrics:

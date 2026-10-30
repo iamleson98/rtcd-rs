@@ -151,6 +151,7 @@ impl Class {
                 .unwrap()
                 .as_millis() as i64,
             file_base,
+            max_files: 0,
             site_url: self.lms.url.clone(),
             token: "bot-token".into(),
         }));

@@ -53,6 +53,9 @@ pub struct Run {
     pub call_id: String,
     /// The index the run's first file gets.
     pub file_base: u32,
+    /// The most files the run may write (zero: no limit): it ends, as `file_limit`, once it has
+    /// numbered `file_base + max_files` of them.
+    pub max_files: u32,
     /// Where the run's files are written until they are uploaded.
     pub dir: PathBuf,
     /// Calls the server with the recording's bot session.
@@ -99,13 +102,25 @@ pub enum Cmd {
 /// stops the recording. `failed` would end the capture for good.
 pub const SHUTDOWN_REASON: &str = "call_ended";
 
-/// Why a recording could not be registered.
+/// Why a start was not registered.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Busy {
-    /// This recording is captured already.
+    /// This very start (the same recording, client, call and first file number) is held: running,
+    /// or over with its `record_ended` not sent yet. That one end answers it, so nothing more is
+    /// said.
     Same,
-    /// Another recording of the same call is.
-    Other,
+    /// The start is not taken and is answered `refused`; the text is for the log.
+    Refused(&'static str),
+}
+
+/// What a start asks for, as the registry compares it with what it holds.
+#[derive(Debug, Clone, Copy)]
+pub struct Want<'a> {
+    pub recording_id: &'a str,
+    pub client_id: &'a str,
+    pub call_id: &'a str,
+    pub file_base: u32,
+    pub max_files: u32,
 }
 
 #[derive(Debug)]
@@ -113,75 +128,182 @@ struct Active {
     run: u64,
     client_id: String,
     call_id: String,
+    file_base: u32,
 }
 
-/// The captures running on this node.
+/// A capture that is over and whose `record_ended` has not been sent: its files are still being
+/// uploaded, and the numbers they took are not to be taken again.
+#[derive(Debug)]
+struct Over {
+    run: u64,
+    client_id: String,
+    call_id: String,
+    file_base: u32,
+    /// The indexes the files took, counted from `file_base`.
+    files: u32,
+}
+
+impl Over {
+    /// Whether file number `n` is one this run took, or would have been the next to take.
+    fn holds(&self, n: u32) -> bool {
+        n >= self.file_base
+            && u64::from(n) < u64::from(self.file_base) + u64::from(self.files.max(1))
+    }
+}
+
+#[derive(Debug, Default)]
+struct Held {
+    active: HashMap<String, Active>,
+    over: HashMap<String, Vec<Over>>,
+}
+
+/// The captures running on this node, and those over and not reported yet.
+///
+/// Every start is answered once. One that is taken is answered by the `record_ended` of its run,
+/// and is not taken again, whoever sends it again, until that end has been sent. One that is not
+/// taken is answered `refused` at once. Both are decided here, under one lock, so that two senders
+/// and a node that starts draining at the same time cannot both be right.
 #[derive(Debug, Default)]
 pub struct Registry {
-    active: Mutex<HashMap<String, Active>>,
+    held: Mutex<Held>,
 }
 
 impl Registry {
-    pub fn begin(
-        &self,
-        recording_id: &str,
-        client_id: &str,
-        call_id: &str,
-        run: u64,
-    ) -> Result<(), Busy> {
-        let mut active = self.active.lock();
-        if active.contains_key(recording_id) {
-            return Err(Busy::Same);
+    /// Registers the start as run `run`, unless something held says otherwise. What is already
+    /// held comes first, so a resend of a start the node holds is never answered `refused`
+    /// because the node is draining.
+    pub fn begin(&self, want: Want<'_>, run: u64, draining: &AtomicBool) -> Result<(), Busy> {
+        let mut held = self.held.lock();
+        if let Some(a) = held.active.get(want.recording_id) {
+            return if a.client_id == want.client_id
+                && a.call_id == want.call_id
+                && a.file_base == want.file_base
+            {
+                Err(Busy::Same)
+            } else {
+                Err(Busy::Refused(
+                    "the recording is captured for another call or from another file number",
+                ))
+            };
         }
-        if active
+        for o in held.over.get(want.recording_id).into_iter().flatten() {
+            if o.holds(want.file_base) {
+                return if o.client_id == want.client_id
+                    && o.call_id == want.call_id
+                    && o.file_base == want.file_base
+                {
+                    Err(Busy::Same)
+                } else {
+                    Err(Busy::Refused(
+                        "the file numbers are those of a capture that is not reported yet",
+                    ))
+                };
+            }
+            // A run that would number its way into a capture that is not reported yet.
+            if want.max_files > 0
+                && o.file_base > want.file_base
+                && o.file_base - want.file_base < want.max_files
+            {
+                return Err(Busy::Refused(
+                    "the file numbers reach those of a capture that is not reported yet",
+                ));
+            }
+        }
+        if draining.load(Ordering::Acquire) {
+            return Err(Busy::Refused("this node is shutting down"));
+        }
+        if held
+            .active
             .values()
-            .any(|a| a.client_id == client_id && a.call_id == call_id)
+            .any(|a| a.client_id == want.client_id && a.call_id == want.call_id)
         {
-            return Err(Busy::Other);
+            return Err(Busy::Refused("the call has another recording"));
         }
-        active.insert(
-            recording_id.to_owned(),
+        held.active.insert(
+            want.recording_id.to_owned(),
             Active {
                 run,
-                client_id: client_id.to_owned(),
-                call_id: call_id.to_owned(),
+                client_id: want.client_id.to_owned(),
+                call_id: want.call_id.to_owned(),
+                file_base: want.file_base,
             },
         );
         Ok(())
     }
 
-    /// The capture is over (only if `run` is the one registered).
+    /// The run never began (only if `run` is the one registered).
     pub fn remove(&self, recording_id: &str, run: u64) {
-        let mut active = self.active.lock();
-        if active.get(recording_id).is_some_and(|a| a.run == run) {
-            active.remove(recording_id);
+        let mut held = self.held.lock();
+        if held.active.get(recording_id).is_some_and(|a| a.run == run) {
+            held.active.remove(recording_id);
+        }
+    }
+
+    /// The capture is over, with `files` indexes taken (only if `run` is the one registered): it
+    /// no longer takes a stop, and its numbers stay taken until [`reported`](Self::reported).
+    pub fn finish(&self, recording_id: &str, run: u64, files: u32) {
+        let mut held = self.held.lock();
+        if !held.active.get(recording_id).is_some_and(|a| a.run == run) {
+            return;
+        }
+        if let Some(a) = held.active.remove(recording_id) {
+            held.over
+                .entry(recording_id.to_owned())
+                .or_default()
+                .push(Over {
+                    run,
+                    client_id: a.client_id,
+                    call_id: a.call_id,
+                    file_base: a.file_base,
+                    files,
+                });
+        }
+    }
+
+    /// The end of the run has been sent (or there was nothing to say): its numbers are free.
+    pub fn reported(&self, recording_id: &str, run: u64) {
+        let mut held = self.held.lock();
+        if let Some(over) = held.over.get_mut(recording_id) {
+            over.retain(|o| o.run != run);
+            if over.is_empty() {
+                held.over.remove(recording_id);
+            }
         }
     }
 
     /// The call a client's recording captures.
     pub fn call_of(&self, client_id: &str, recording_id: &str) -> Option<String> {
-        self.active
+        self.held
             .lock()
+            .active
             .get(recording_id)
             .filter(|a| a.client_id == client_id)
             .map(|a| a.call_id.clone())
     }
 
-    /// Every capture as (client, recording, call).
+    /// Every capture running as (client, recording, call).
     pub fn all(&self) -> Vec<(String, String, String)> {
-        self.active
+        self.held
             .lock()
+            .active
             .iter()
             .map(|(id, a)| (a.client_id.clone(), id.clone(), a.call_id.clone()))
             .collect()
     }
 
+    /// Captures running.
     pub fn len(&self) -> usize {
-        self.active.lock().len()
+        self.held.lock().active.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Captures that are over and not reported yet.
+    #[cfg(test)]
+    pub(crate) fn unreported(&self) -> usize {
+        self.held.lock().over.values().map(Vec::len).sum()
     }
 }
 
@@ -301,12 +423,14 @@ impl Recordings {
             metrics.clone(),
         ));
         let unfinished = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(Registry::default());
         let uploads = uploader::spawn(uploader::Deps {
             reports: reports.clone(),
             pending: pending.clone(),
             metrics: metrics.clone(),
             policy: uploader::Policy::default(),
             unfinished: unfinished.clone(),
+            registry: registry.clone(),
         });
         // The writers only append to files; a few threads serve every recording.
         let cores = std::thread::available_parallelism().map_or(1, usize::from);
@@ -316,7 +440,7 @@ impl Recordings {
                 writers: WriterPool::start((cores / 2).clamp(1, 4), &metrics),
                 uploads,
                 pending,
-                registry: Arc::new(Registry::default()),
+                registry,
                 clients: HttpClients::new(),
                 throttle: {
                     let throttle =
@@ -352,6 +476,11 @@ impl Recordings {
     }
 
     /// Starts capturing the call `req` names, for the client that asked.
+    ///
+    /// Every start is answered once: `refused` at once when it is not taken, otherwise by the
+    /// `record_ended` of its run, whatever order starts, stops, drains and ends come in. A start
+    /// the node already holds (the same recording, call and first file number, running or over and
+    /// not reported yet) is not answered again: the end of that run answers it.
     pub fn start(&self, sfu: &Sfu, client_id: &str, req: RecordStart) {
         let Some(live) = &self.live else {
             return self.refuse(
@@ -361,9 +490,6 @@ impl Recordings {
                 "recording is not enabled on this node",
             );
         };
-        if live.draining.load(Ordering::Acquire) {
-            return self.refuse(client_id, &req, "refused", "this node is shutting down");
-        }
         if !valid_id(&req.recording_id) || req.call_id.is_empty() {
             return self.refuse(
                 client_id,
@@ -381,18 +507,20 @@ impl Recordings {
             );
         }
         let run_no = live.runs.fetch_add(1, Ordering::Relaxed) + 1;
-        match live
-            .registry
-            .begin(&req.recording_id, client_id, &req.call_id, run_no)
-        {
+        let want = Want {
+            recording_id: &req.recording_id,
+            client_id,
+            call_id: &req.call_id,
+            file_base: req.file_base,
+            max_files: req.max_files,
+        };
+        match live.registry.begin(want, run_no, &live.draining) {
             Ok(()) => {}
             Err(Busy::Same) => {
-                debug!(recording = %req.recording_id, "asked again to record what is being recorded");
+                debug!(recording = %req.recording_id, file_base = req.file_base, "asked again to record what this node holds");
                 return;
             }
-            Err(Busy::Other) => {
-                return self.refuse(client_id, &req, "refused", "the call has another recording");
-            }
+            Err(Busy::Refused(why)) => return self.refuse(client_id, &req, "refused", why),
         }
         let dir = live
             .data_dir
@@ -417,6 +545,7 @@ impl Recordings {
             client_id: client_id.to_owned(),
             call_id: req.call_id.clone(),
             file_base: req.file_base,
+            max_files: req.max_files,
             dir,
             api,
             t0,
@@ -438,11 +567,18 @@ impl Recordings {
         self.metrics.record_capture(1);
         live.unfinished.fetch_add(1, Ordering::AcqRel);
         live.writers.add(job);
-        info!(recording = %req.recording_id, call = %req.call_id, file_base = req.file_base, "recording a call");
+        info!(recording = %req.recording_id, call = %req.call_id, file_base = req.file_base, max_files = req.max_files, "recording a call");
         // If the SFU cannot take the recording it drops the sink, which the writer takes for a
         // recording that failed and reports.
         if let Err(e) = sfu.record_start(client_id, &req.call_id, &req.recording_id, t0, sink) {
             error!(recording = %req.recording_id, error = %e, "the SFU would not start the recording");
+        }
+        // The drain stopped the captures it found; this one may have been registered after it
+        // looked and handed to the SFU after it stopped them.
+        if live.draining.load(Ordering::Acquire)
+            && let Err(e) = sfu.record_stop(client_id, &req.call_id, &req.recording_id)
+        {
+            warn!(recording = %req.recording_id, error = %e, "the SFU would not stop a recording for the shutdown");
         }
     }
 
@@ -598,14 +734,33 @@ mod tests {
         );
     }
 
+    fn want<'a>(recording: &'a str, client: &'a str, call: &'a str, base: u32) -> Want<'a> {
+        Want {
+            recording_id: recording,
+            client_id: client,
+            call_id: call,
+            file_base: base,
+            max_files: 0,
+        }
+    }
+
+    static SERVING: AtomicBool = AtomicBool::new(false);
+
     #[test]
     fn a_call_has_one_recording_and_a_recording_one_capture() {
         let r = Registry::default();
-        assert_eq!(r.begin("rec1", "mm", "call", 1), Ok(()));
-        assert_eq!(r.begin("rec1", "mm", "call", 2), Err(Busy::Same));
-        assert_eq!(r.begin("rec2", "mm", "call", 3), Err(Busy::Other));
+        assert_eq!(r.begin(want("rec1", "mm", "call", 0), 1, &SERVING), Ok(()));
         assert_eq!(
-            r.begin("rec2", "other", "call", 4),
+            r.begin(want("rec1", "mm", "call", 0), 2, &SERVING),
+            Err(Busy::Same),
+            "the same start again is the one held"
+        );
+        assert!(matches!(
+            r.begin(want("rec2", "mm", "call", 0), 3, &SERVING),
+            Err(Busy::Refused(_))
+        ));
+        assert_eq!(
+            r.begin(want("rec2", "other", "call", 0), 4, &SERVING),
             Ok(()),
             "another client's call is another call"
         );
@@ -614,6 +769,126 @@ mod tests {
             r.call_of("other", "rec1"),
             None,
             "a client stops only its own"
+        );
+    }
+
+    #[test]
+    fn a_start_for_another_call_or_number_than_the_one_held_is_refused() {
+        let r = Registry::default();
+        assert_eq!(r.begin(want("rec1", "mm", "call", 40), 1, &SERVING), Ok(()));
+        for other in [
+            want("rec1", "mm", "call2", 40),
+            want("rec1", "mm", "call", 41),
+            want("rec1", "mm", "call", 0),
+            want("rec1", "other", "call", 40),
+        ] {
+            assert!(
+                matches!(r.begin(other, 9, &SERVING), Err(Busy::Refused(_))),
+                "{other:?}"
+            );
+        }
+        assert_eq!(r.len(), 1, "the one held is undisturbed");
+        assert_eq!(r.call_of("mm", "rec1").as_deref(), Some("call"));
+    }
+
+    #[test]
+    fn what_a_draining_node_holds_is_answered_by_its_end_and_nothing_else_is_taken() {
+        let r = Registry::default();
+        let draining = AtomicBool::new(false);
+        assert_eq!(
+            r.begin(want("rec1", "mm", "call", 40), 1, &draining),
+            Ok(())
+        );
+        draining.store(true, Ordering::SeqCst);
+        // The resend of the start it holds is not a refusal (the server would write one as the
+        // start's end); another start is, and so is a new recording.
+        assert_eq!(
+            r.begin(want("rec1", "mm", "call", 40), 2, &draining),
+            Err(Busy::Same)
+        );
+        assert!(matches!(
+            r.begin(want("rec1", "mm", "call2", 20_040), 3, &draining),
+            Err(Busy::Refused(_))
+        ));
+        assert!(matches!(
+            r.begin(want("rec9", "mm", "call9", 0), 4, &draining),
+            Err(Busy::Refused("this node is shutting down"))
+        ));
+        // Once its run is over and not reported, the resend is still the one start.
+        r.finish("rec1", 1, 3);
+        assert_eq!(
+            r.begin(want("rec1", "mm", "call", 40), 5, &draining),
+            Err(Busy::Same)
+        );
+        r.reported("rec1", 1);
+        assert!(matches!(
+            r.begin(want("rec1", "mm", "call", 40), 6, &draining),
+            Err(Busy::Refused(_))
+        ));
+        assert_eq!(r.unreported(), 0);
+    }
+
+    #[test]
+    fn a_run_that_ended_keeps_its_numbers_until_its_end_is_sent() {
+        let r = Registry::default();
+        assert_eq!(
+            r.begin(want("rec1", "mm", "call", 100), 1, &SERVING),
+            Ok(())
+        );
+        r.finish("rec1", 1, 4);
+        assert!(r.is_empty(), "a stop has nothing to stop");
+        assert_eq!(r.call_of("mm", "rec1"), None);
+        assert_eq!(r.unreported(), 1);
+
+        // The same start again is answered by the end that is coming.
+        assert_eq!(
+            r.begin(want("rec1", "mm", "call", 100), 2, &SERVING),
+            Err(Busy::Same)
+        );
+        // Numbers it took (or would take next) are not given to another start.
+        for base in [101, 103, 100] {
+            let other = Want {
+                call_id: "call2",
+                ..want("rec1", "mm", "call", base)
+            };
+            assert!(
+                matches!(r.begin(other, 3, &SERVING), Err(Busy::Refused(_))),
+                "{base}"
+            );
+        }
+        assert!(matches!(
+            r.begin(want("rec1", "mm", "call", 101), 3, &SERVING),
+            Err(Busy::Refused(_))
+        ));
+        // A run that would number its way into them is not taken either.
+        let reaching = Want {
+            max_files: 10,
+            ..want("rec1", "mm", "call", 95)
+        };
+        assert!(matches!(
+            r.begin(reaching, 4, &SERVING),
+            Err(Busy::Refused(_))
+        ));
+        let before = Want {
+            max_files: 5,
+            ..want("rec1", "mm", "call", 95)
+        };
+        assert_eq!(
+            r.begin(before, 5, &SERVING),
+            Ok(()),
+            "a run that ends before them is fine"
+        );
+        r.remove("rec1", 5);
+        assert_eq!(
+            r.begin(want("rec1", "mm", "call2", 104), 6, &SERVING),
+            Ok(()),
+            "the numbers after the last one it took are free"
+        );
+        r.remove("rec1", 6);
+        r.reported("rec1", 1);
+        assert_eq!(
+            r.begin(want("rec1", "mm", "call", 100), 7, &SERVING),
+            Ok(())
         );
     }
 

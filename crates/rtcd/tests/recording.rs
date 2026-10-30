@@ -38,9 +38,23 @@ fn start(lms: &Lms, recording: &str, call: &str, file_base: u32) -> ClientMessag
         call_id: call.into(),
         t0: now_ms(),
         file_base,
+        max_files: 0,
         site_url: lms.url.clone(),
         token: "bot-token".into(),
     })
+}
+
+fn start_limited(
+    lms: &Lms,
+    recording: &str,
+    call: &str,
+    file_base: u32,
+    max_files: u32,
+) -> ClientMessage {
+    let ClientMessage::RecordStart(start) = start(lms, recording, call, file_base) else {
+        unreachable!()
+    };
+    ClientMessage::RecordStart(RecordStart { max_files, ..start })
 }
 
 /// A report of any recording, read from the connections the participants use.
@@ -345,4 +359,155 @@ async fn what_a_dead_process_left_behind_is_removed_at_start() {
     let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
     assert!(left.is_empty(), "{left:?}");
     s.shutdown().await;
+}
+
+fn ends(all: &[ClientMessage], recording: &str) -> Vec<RecordEnded> {
+    all.iter()
+        .filter_map(|m| match m {
+            ClientMessage::RecordEnded(e) if e.recording_id == recording => Some(e.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_for_another_number_or_call_than_the_one_held_is_refused_and_its_resend_is_not() {
+    let (mut c, _) = call_of_two("held").await;
+    c.wa.send(&start(&c.lms, REC_ID, "call1", 20_000)).await;
+    c.speak(30).await;
+    // The same start twice more (two senders), then one for another number, one for another call.
+    c.wa.send(&start(&c.lms, REC_ID, "call1", 20_000)).await;
+    c.wb.send(&start(&c.lms, REC_ID, "call1", 20_000)).await;
+    c.wa.send(&start(&c.lms, REC_ID, "call1", 20_007)).await;
+    c.wa.send(&start(&c.lms, REC_ID, "call2", 40_000)).await;
+    c.until("both refusals", |r| {
+        ends(r, REC_ID)
+            .iter()
+            .filter(|e| e.reason == "refused")
+            .count()
+            == 2
+    })
+    .await;
+    let refused: Vec<_> = ends(&reports([&c.wa, &c.wb]), REC_ID)
+        .into_iter()
+        .map(|e| (e.reason, e.file_base, e.files))
+        .collect();
+    assert!(
+        refused.contains(&("refused".into(), 20_007, 0)),
+        "{refused:?}"
+    );
+    assert!(
+        refused.contains(&("refused".into(), 40_000, 0)),
+        "{refused:?}"
+    );
+
+    // The run goes on undisturbed and ends once, with its files from its own number.
+    c.speak(60).await;
+    c.wa.send(&ClientMessage::RecordStop(RecordStop {
+        recording_id: REC_ID.into(),
+    }))
+    .await;
+    c.until("the end", |r| {
+        ends(r, REC_ID).iter().any(|e| e.reason == "stopped")
+    })
+    .await;
+    c.speak(10).await;
+    let all = reports([&c.wa, &c.wb]);
+    let real: Vec<_> = ends(&all, REC_ID)
+        .into_iter()
+        .filter(|e| e.reason != "refused")
+        .collect();
+    assert_eq!(real.len(), 1, "one end for the one start taken: {all:?}");
+    assert_eq!((real[0].file_base, real[0].files), (20_000, 2));
+    assert_eq!(
+        files(&all, REC_ID)
+            .iter()
+            .map(|f| f.index)
+            .collect::<Vec<_>>(),
+        [20_000, 20_001]
+    );
+    c.s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_call_started_while_the_old_run_ends_is_answered_and_taken_when_sent_again() {
+    let (mut c, _) = call_of_two("reopen").await;
+    c.wa.send(&start(&c.lms, REC_ID, "call1", 0)).await;
+    c.speak(30).await;
+    // The class reconnects: the next call's start comes before the old run has ended, and is
+    // answered at once instead of being dropped.
+    c.wa.send(&start(&c.lms, REC_ID, "call2", 20_000)).await;
+    c.until("the refusal", |r| {
+        ends(r, REC_ID).iter().any(|e| e.reason == "refused")
+    })
+    .await;
+    let refused = ends(&reports([&c.wa, &c.wb]), REC_ID);
+    assert_eq!(
+        (refused[0].file_base, refused[0].files),
+        (20_000, 0),
+        "{refused:?}"
+    );
+
+    // The old call ends; its run says so; the start sent again is taken.
+    c.wa.leave("session-alice").await;
+    c.wb.leave("session-bob").await;
+    c.until("the old run's end", |r| {
+        ends(r, REC_ID).iter().any(|e| e.reason == "call_ended")
+    })
+    .await;
+    let mut wa = c.s.connect("mm").await;
+    let mut wb = c.s.connect("mm").await;
+    let a = common::Participant::join(&mut wa, c.s.media, "alice", "call2", 7003).await;
+    let b = common::Participant::join(&mut wb, c.s.media, "bob", "call2", 7004).await;
+    c.wa = wa;
+    c.wb = wb;
+    c.a = a;
+    c.b = b;
+    c.wa.send(&start(&c.lms, REC_ID, "call2", 20_000)).await;
+    c.speak(60).await;
+    c.wa.send(&ClientMessage::RecordStop(RecordStop {
+        recording_id: REC_ID.into(),
+    }))
+    .await;
+    c.until("the new run's end", |r| {
+        ends(r, REC_ID).iter().any(|e| e.reason == "stopped")
+    })
+    .await;
+    let all = reports([&c.wa, &c.wb]);
+    let stopped = ends(&all, REC_ID)
+        .into_iter()
+        .find(|e| e.reason == "stopped")
+        .unwrap();
+    assert_eq!((stopped.file_base, stopped.files), (20_000, 2), "{all:?}");
+    c.s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_never_takes_a_number_past_its_file_limit() {
+    let (mut c, _) = call_of_two("limit").await;
+    // Room for one file: alice's voice takes it, bob's has none and is left out.
+    c.wa.send(&start_limited(&c.lms, REC_ID, "call1", 300, 1))
+        .await;
+    c.speak(150).await;
+    c.wa.send(&ClientMessage::RecordStop(RecordStop {
+        recording_id: REC_ID.into(),
+    }))
+    .await;
+    c.until("the end", |r| ends(r, REC_ID).len() == 1).await;
+    let all = reports([&c.wa, &c.wb]);
+    let end = ends(&all, REC_ID).remove(0);
+    assert_eq!((end.file_base, end.files), (300, 1), "{end:?}");
+    let got = files(&all, REC_ID);
+    assert_eq!(got.iter().map(|f| f.index).collect::<Vec<_>>(), [300]);
+    let uploads = c
+        .lms
+        .state
+        .lock()
+        .unwrap()
+        .uploads
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(uploads, ["300"], "nothing was uploaded past the limit");
+    c.s.shutdown().await;
 }

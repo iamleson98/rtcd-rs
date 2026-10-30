@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 
 use super::pending::Pending;
 use super::reports::Reports;
-use super::{Cmd, Ended, Run};
+use super::{Cmd, Ended, Registry, Run};
 use crate::metrics::Metrics;
 
 /// How a file's upload is retried, beyond the retries inside each request.
@@ -56,6 +56,8 @@ pub struct Deps {
     /// Captures started and not yet over for the server: counted up when one starts, down here
     /// when its end has been reported. A node that is shutting down waits for it to reach zero.
     pub unfinished: Arc<AtomicUsize>,
+    /// Told when a run's end has been sent, which frees the file numbers it took.
+    pub registry: Arc<Registry>,
 }
 
 /// A recording's progress through the uploader.
@@ -166,6 +168,7 @@ async fn finish(run: &Run, ended: Ended, deps: &Deps) {
         // Only if no later run of the recording is using it.
         let _ = tokio::fs::remove_dir(parent).await;
     }
+    deps.registry.reported(&run.recording_id, run.id);
     let _ = deps
         .unfinished
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -265,6 +268,7 @@ mod tests {
         metrics: Arc<Metrics>,
         dir: PathBuf,
         unfinished: Arc<AtomicUsize>,
+        registry: Arc<Registry>,
     }
 
     fn harness(tag: &str, policy: Policy) -> Harness {
@@ -277,15 +281,18 @@ mod tests {
         reports.attach("c1", ConnHandle::new("mm".into(), tx));
         let pending = Arc::new(Pending::new(u64::MAX, metrics.clone()));
         let unfinished = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(Registry::default());
         let cmds = spawn(Deps {
             reports,
             pending: pending.clone(),
             metrics: metrics.clone(),
             policy,
             unfinished: unfinished.clone(),
+            registry: registry.clone(),
         });
         Harness {
             unfinished,
+            registry,
             cmds,
             out,
             pending,
@@ -310,6 +317,7 @@ mod tests {
                 client_id: "mm".into(),
                 call_id: "call".into(),
                 file_base,
+                max_files: 0,
                 dir: self.dir.join("run"),
                 api,
                 t0: std::time::Instant::now(),
@@ -615,6 +623,49 @@ mod tests {
             })
             .unwrap();
         h.quiet().await;
+    }
+
+    #[tokio::test]
+    async fn the_numbers_of_a_run_are_free_once_its_end_has_been_sent_not_before() {
+        let lms = Lms::start().await;
+        let mut h = harness("numbers", quick());
+        let run = h.run(lms.api(), 500);
+        let draining = std::sync::atomic::AtomicBool::new(false);
+        let want = super::super::Want {
+            recording_id: REC_ID,
+            client_id: "mm",
+            call_id: "call",
+            file_base: 500,
+            max_files: 0,
+        };
+        h.registry.begin(want, run.id, &draining).unwrap();
+        h.registry.finish(REC_ID, run.id, 1);
+        let file = h.file(&run, "00001-voice.webm", b"voice-bytes", "voice");
+        // The file is handed over and the end follows once it is in.
+        h.cmds
+            .send(Cmd::File {
+                run: run.clone(),
+                index: 500,
+                entry: file,
+            })
+            .unwrap();
+        h.cmds
+            .send(Cmd::Ended {
+                run: run.clone(),
+                ended: ended("stopped", 1),
+            })
+            .unwrap();
+        let ClientMessage::RecordFile(_) = h.next().await else {
+            panic!("the file first")
+        };
+        let ClientMessage::RecordEnded(e) = h.next().await else {
+            panic!("then the end")
+        };
+        assert_eq!(e.file_base, 500);
+        h.quiet().await;
+        assert_eq!(h.registry.unreported(), 0, "free once the end is sent");
+        // And the same start, sent again after its end, is a new one.
+        assert_eq!(h.registry.begin(want, 2, &draining), Ok(()));
     }
 
     #[tokio::test]
