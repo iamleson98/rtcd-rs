@@ -149,6 +149,22 @@ wg0\t00000000\t0100000A\t0003\t0\t0\t50\t00000000\t0\t0\t0\n";
     }
 
     #[test]
+    fn a_real_linux_route_and_dev_are_read() {
+        // As a container on Linux 6 prints them: padded with tabs and spaces.
+        let route = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT   \n\
+eth0\t00000000\t010011AC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
+eth0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n";
+        let dev = "Inter-|   Receive                                                |  Transmit\n\
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n\
+    lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n\
+  eth0:     274       3    0    0    0     0          0         0       42       1    0    0    0     0       0          0\n";
+        let name = default_interface(route).unwrap();
+        assert_eq!(name, "eth0");
+        let c = parse_counters(dev, &name).unwrap();
+        assert_eq!((c.tx_bytes, c.tx_packets, c.tx_dropped), (42, 1, 0));
+    }
+
+    #[test]
     fn the_transmit_columns_of_the_interface_are_read() {
         assert_eq!(
             parse_counters(DEV, "ens3"),

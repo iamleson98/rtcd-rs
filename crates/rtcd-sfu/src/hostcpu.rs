@@ -275,6 +275,30 @@ mod tests {
     }
 
     #[test]
+    fn a_real_linux_stat_is_read() {
+        // The head of /proc/stat of a six-CPU Linux 6 machine (ten columns, guest times last).
+        let s = parse_stat(
+            "cpu  3106856 10039 1252472 41942962 62754 0 88280 0 0 0\n\
+cpu0 509306 0 211509 6972055 8061 0 40776 0 0 0\n\
+cpu1 510417 8523 207477 6988661 11063 0 16623 0 0 0\n\
+cpu2 519627 0 208260 6996534 11353 0 10548 0 0 0\n\
+cpu3 522141 0 208508 6995443 10677 0 7840 0 0 0\n\
+cpu4 519467 252 208464 6998809 10747 0 6584 0 0 0\n\
+cpu5 525896 1263 208252 6991458 10851 0 5906 0 0 0\n\
+intr 835191919 0 9566571\n",
+        )
+        .unwrap();
+        assert_eq!(s.cores.len(), 6);
+        assert_eq!(s.all.idle, 41_942_962 + 62_754);
+        assert_eq!(s.all.iowait, 62_754);
+        assert_eq!(s.all.softirq, 88_280);
+        assert_eq!(
+            s.cores[0].total,
+            509_306 + 211_509 + 6_972_055 + 8_061 + 40_776
+        );
+    }
+
+    #[test]
     fn the_cpus_are_the_per_cpu_lines() {
         let s =
             parse_stat("cpu  1 2 3 4 5\ncpu0 1 2 3 4 5\ncpu1 1 2 3 4 5\nintr 5\ncpufoo 1 2 3 4 5")
