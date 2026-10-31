@@ -15,8 +15,8 @@ calls itself. The crate kept its name to keep the history and the imports.)
   open (its last picture held) until the person turns it off, the SFU removes the track, or the call ends;
   a camera that vanishes without saying so is closed after 5 s, a screen after 30 s. A picture that changes
   size starts a file of its own with no hole, so each header tells the truth. Video files open on a
-  keyframe, which the stream recorder asks for while it waits and every 20 s after, so the player seeks
-  quickly. Files carry cues and a duration, so browsers seek in them. Packets that arrive out of order
+  keyframe, which the stream recorder asks for while it waits, and again whenever 10 s pass without
+  one (keyframes a viewer's loss brings count), so a seek decodes at most 10 s of picture. Files carry cues and a duration, so browsers seek in them. Packets that arrive out of order
   wait in a reorder ring for a retransmission (300 ms for video, 120 ms for voice), then the gap is given
   up. The length of each Opus packet is read from the packet, so any packet time is recorded right.
 - **Log**: one line when a file opens and one when it closes, with why (`silent`, `the track was removed`,
