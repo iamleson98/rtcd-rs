@@ -214,7 +214,26 @@ impl Engine {
             }
             TrackType::ScreenAudio => true,
             TrackType::Screen | TrackType::Video => {
-                src.rate.push(now, packet.marshal_size());
+                let size = packet.marshal_size();
+                src.rate.push(now, size);
+                if let Some(t) = src.temporal_rates.as_mut() {
+                    t.count_keyframe(
+                        packet.header.timestamp,
+                        size,
+                        vp8::is_keyframe(&packet.payload),
+                        packet.header.marker,
+                    );
+                    if let Some(layer) =
+                        vp8::Descriptor::parse(&packet.payload).and_then(|d| d.temporal)
+                    {
+                        t.seen = true;
+                        match layer.tid {
+                            0 => t.base.push(now, size),
+                            1 => t.second.push(now, size),
+                            _ => {}
+                        }
+                    }
+                }
                 true
             }
         }
@@ -320,6 +339,10 @@ impl Engine {
         s.up.by_ssrc.insert(init.ssrc, id);
         let window = Duration::from_secs(if layer == Layer::High { 2 } else { 5 });
         let is_vp8 = codec.mime_type.eq_ignore_ascii_case("video/vp8");
+        // The base temporal layer has a frame in four, a keyframe among them now and then: it is
+        // measured over longer, so one keyframe does not read as a rate.
+        let temporal_rates = (is_vp8 && ty == TrackType::Screen)
+            .then(|| super::session::TemporalRates::new(window * 2));
         s.up.sources.push(Source {
             id,
             ssrc: init.ssrc,
@@ -331,6 +354,7 @@ impl Engine {
             receiver: init.receiver_id,
             out_track_id,
             rate: RateMonitor::new(window),
+            temporal_rates,
             last_packet: Some(now),
             last_pli: None,
             gap: false,
@@ -538,6 +562,7 @@ impl Engine {
             source: (!video).then_some(source),
             target: video.then_some(source),
             rewrite: Rewriter::new(ssrc, 0, is_vp8),
+            temporal: Default::default(),
         };
         let Some(r) = self.sessions.get_mut(receiver) else {
             return;
@@ -618,6 +643,11 @@ impl Engine {
             let size = packet.marshal_size() as u64;
             let mut sent = [0u64; 4];
             let mut switched = Vec::new();
+            // A screen share's frames go to each receiver as far as its temporal layers allow.
+            let frame = (fan.vp8 && fan.ty == TrackType::Screen).then(|| Frame {
+                descriptor: vp8::Descriptor::parse(&packet.payload),
+                key: vp8::is_keyframe(&packet.payload),
+            });
 
             // Receivers waiting for this stream join it at a keyframe (any packet, for codecs whose
             // keyframes are not recognised).
@@ -626,6 +656,7 @@ impl Engine {
                     let Some(r) = self.sessions.get_mut(sub.session) else {
                         continue;
                     };
+                    let limit = r.down.screen_level.temporal_limit();
                     let Some(ds) = r.down.get_mut(sub.stream) else {
                         continue;
                     };
@@ -633,7 +664,13 @@ impl Engine {
                         continue;
                     }
                     ds.rewrite.switch_to(&packet);
-                    if write_down(r, sub, &packet, now, &mut self.dirty) {
+                    // The new source starts at a keyframe, in the temporal layers of the receiver's
+                    // rung.
+                    ds.temporal.restart();
+                    if ds.ty == TrackType::Screen {
+                        ds.temporal.set_limit(limit);
+                    }
+                    if write_down(r, sub, &packet, frame.as_ref(), now, &mut self.dirty) {
                         sent[type_slot(
                             r.down.get(sub.stream).map_or(TrackType::Video, |d| d.ty),
                         )] += size;
@@ -652,7 +689,7 @@ impl Engine {
                 if resume && let Some(ds) = r.down.get_mut(sub.stream) {
                     ds.rewrite.resume_after_gap(&packet);
                 }
-                let wrote = write_down(r, sub, &packet, now, &mut self.dirty);
+                let wrote = write_down(r, sub, &packet, frame.as_ref(), now, &mut self.dirty);
                 let ty = r.down.get(sub.stream).map_or(TrackType::Voice, |d| d.ty);
                 if wrote {
                     sent[type_slot(ty)] += size;
@@ -805,12 +842,21 @@ fn type_slot(ty: TrackType) -> usize {
     }
 }
 
-/// Writes `packet` to the receiver's copy of the stream, rewritten for it. Returns whether it was
+/// What the forwarder reads once of a packet of a screen share, for every receiver's temporal
+/// layers.
+struct Frame {
+    descriptor: Option<vp8::Descriptor>,
+    key: bool,
+}
+
+/// Writes `packet` to the receiver's copy of the stream, rewritten for it, unless it is of a
+/// temporal layer the receiver is not sent (`frame`, for a screen share). Returns whether it was
 /// accepted for sending.
 fn write_down(
     r: &mut Session,
     sub: SubRef,
     packet: &rtc::rtp::Packet,
+    frame: Option<&Frame>,
     now: Instant,
     dirty: &mut Vec<SessionKey>,
 ) -> bool {
@@ -819,6 +865,13 @@ fn write_down(
     };
     if ds.phase != DownPhase::Active {
         return false;
+    }
+    if let Some(f) = frame {
+        let temporal = f.descriptor.and_then(|d| d.temporal);
+        if !ds.temporal.admit(packet.header.timestamp, temporal, f.key) {
+            ds.rewrite.leave_out(packet, f.descriptor.as_ref());
+            return false;
+        }
     }
     let Some(sender_id) = ds.sender else {
         return false;
@@ -840,7 +893,9 @@ fn write_down(
         ds.payload_type_known = true;
     }
     let mut out = packet.clone();
-    ds.rewrite.rewrite(&mut out);
+    if !ds.rewrite.rewrite(&mut out) {
+        return false;
+    }
     let ok = sender.write_rtp(now, out).is_ok();
     if ok && !r.dirty {
         r.dirty = true;

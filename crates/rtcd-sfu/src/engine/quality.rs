@@ -1,6 +1,9 @@
 //! What the media plane learns about how well receivers are served: the feedback they send, the
-//! packets sent again, the loss and delay they report, and the bandwidth estimate. Read from the
-//! connection's statistics every few seconds, per session with video, as metrics.
+//! packets sent again, the loss they report, the round trip, and the bandwidth estimate. Read from
+//! the connection's statistics every few seconds, per session with video, as metrics.
+//!
+//! The round trip is the one the receiver's transport feedback gives (see `bwe`): the library's
+//! statistics leave the receiver reports' round trip at zero.
 
 use std::time::{Duration, Instant};
 
@@ -36,17 +39,17 @@ impl Engine {
             rtx_packets += o.retransmitted_packets_sent;
             rtx_bytes += o.retransmitted_bytes_sent;
         }
-        let (mut loss, mut rtt, mut n) = (0.0, 0.0, 0u32);
+        let (mut loss, mut n) = (0.0, 0u32);
         for r in report.iter().filter_map(|e| match e {
             rtc::statistics::report::RTCStatsReportEntry::RemoteInboundRtp(r) => Some(r),
             _ => None,
         }) {
             if r.round_trip_time_measurements > 0 {
                 loss += r.fraction_lost;
-                rtt += r.round_trip_time;
                 n += 1;
             }
         }
+        let estimate = s.estimate.snapshot();
         let m = &mut s.quality;
         let quality = ReceiverQuality {
             nacks: nacks.saturating_sub(m.nacks),
@@ -55,14 +58,13 @@ impl Engine {
             retransmitted_packets: rtx_packets.saturating_sub(m.retransmitted_packets),
             retransmitted_bytes: rtx_bytes.saturating_sub(m.retransmitted_bytes),
             loss: (n > 0).then(|| loss / f64::from(n)),
-            rtt: (n > 0).then(|| Duration::from_secs_f64((rtt / f64::from(n)).max(0.0))),
+            rtt: estimate.rtt.map(|r| Duration::from_secs_f64(r.max(0.0))),
         };
         (m.nacks, m.plis, m.firs) = (nacks, plis, firs);
         (m.retransmitted_packets, m.retransmitted_bytes) = (rtx_packets, rtx_bytes);
-        let estimate = s.estimate.snapshot().target;
         self.metrics.receiver_quality(quality);
-        if estimate > 0.0 {
-            self.metrics.bandwidth_estimate(estimate);
+        if estimate.target > 0.0 {
+            self.metrics.bandwidth_estimate(estimate.target);
         }
     }
 }

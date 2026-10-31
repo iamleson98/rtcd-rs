@@ -366,7 +366,7 @@ impl Engine {
                         RtpCodecKind::Video
                     };
                     let track = MediaStreamTrack::new(
-                        slot.publisher_session_id.clone(),
+                        crate::ids::stream_id(slot.ty, &slot.publisher_session_id),
                         slot.out_track_id.clone(),
                         slot.out_track_id.clone(),
                         kind,

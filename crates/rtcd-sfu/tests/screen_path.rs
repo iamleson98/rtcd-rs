@@ -1,10 +1,11 @@
 //! Which layer of a shared screen a viewer is sent over paths that lose, delay and limit packets,
-//! with the bandwidth estimator the node runs. The sharer sends a screen at the rates of the web
-//! client (500 kbit/s at 5 frames a second small, 2.5 Mbit/s at 15 large); the viewer is a long way
-//! off (a round trip of 230 ms).
+//! with what the node reads of each path from its feedback. The sharer sends a screen at the rates
+//! of the web client (500 kbit/s at 5 frames a second small, 2.5 Mbit/s at 15 large), here without
+//! temporal layers (as a browser that sends none does; `screen_congestion` has them); the viewer is
+//! a long way off (a round trip of 230 ms).
 //!
-//! The estimate starts at its floor and takes about half a minute to climb past what the large
-//! layer needs, so each run lasts 90 s and the end of it is what is judged.
+//! A viewer starts on the small layer and is trusted with more as its path stays clear, so the
+//! large layer comes a few tens of seconds in; each run lasts 90 s and the end of it is judged.
 
 mod support;
 
@@ -89,19 +90,19 @@ fn far(loss: f64, rate_bps: Option<u64>) -> Path {
 }
 
 #[test]
-fn a_viewer_a_long_way_off_gets_the_large_layer_once_the_estimate_has_climbed() {
+fn a_viewer_a_long_way_off_gets_the_large_layer_once_its_path_has_shown_it_is_clear() {
     let run = share(far(0.0, None));
     assert_eq!(run.large_share(40), 1.0);
     assert!(
         run.large_share(RUN as usize) < 1.0,
-        "the estimate starts low"
+        "a viewer starts on the small layer"
     );
 }
 
 #[test]
 fn a_viewer_whose_path_loses_a_few_per_cent_at_random_gets_it_too() {
-    // The loss half of the estimate never leaves its floor on such a path: 3% or more kept the
-    // viewer on the small layer for good.
+    // The loss half of the bandwidth estimate never leaves its floor on such a path: when it
+    // decided, 3% or more kept the viewer on the small layer for good.
     for loss in [0.01, 0.03, 0.05, 0.08] {
         let run = share(far(loss, None));
         assert!(
@@ -122,7 +123,8 @@ fn a_viewer_whose_path_loses_a_sixth_of_the_packets_stays_on_the_small_layer() {
 
 #[test]
 fn a_viewer_behind_a_link_that_cannot_carry_the_large_layer_is_kept_on_the_small_one() {
-    // The large layer is tried when the estimate says so, and taken away when it does not arrive.
+    // The large layer is not tried where the narrowest link cannot carry it, and is taken away
+    // when it does not fit.
     for rate in [1_000_000, 1_800_000] {
         let run = share(far(0.0, Some(rate)));
         assert!(
