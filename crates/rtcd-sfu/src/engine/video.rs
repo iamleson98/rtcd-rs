@@ -17,13 +17,17 @@ use tracing::{debug, warn};
 use super::session::{DownPhase, SessionKey, SourceKey, SubRef};
 use super::{Engine, Load};
 use crate::ids::TrackType;
-use crate::layers::{Layer, ScreenInputs, WATCH_EVERY};
+use crate::layers::{Ladder, Layer, LayerRates, ScreenInputs, WATCH_EVERY};
 
 /// The most cameras one receiver may name.
 pub const MAX_VIDEO_SUBSCRIPTIONS: usize = 100;
 /// At most one keyframe request per stream per this long: a sender asked too often spends its
 /// bandwidth on keyframes.
 const KEYFRAME_INTERVAL: Duration = Duration::from_secs(1);
+/// Between the once-a-second reviews, a receiver's screen share is looked at again as soon as its
+/// feedback says its path is congested, at most this often: a queue that builds for a second
+/// before anything is done holds the voice back with it.
+const SCREEN_REVIEW_MIN: Duration = Duration::from_millis(250);
 /// How many voices of a call are forwarded while the node is shedding load, whatever the
 /// configured limit is (a smaller configured limit stays).
 const SHEDDING_VOICES: usize = 2;
@@ -264,7 +268,7 @@ impl Engine {
         if self.has_video(key) {
             self.watch_camera(key, now);
             self.retry_keyframes(key, now);
-            self.review_screen_level(key, now);
+            self.review_screen_level(key, now, true);
             self.report_quality(key, now);
         }
     }
@@ -366,46 +370,123 @@ impl Engine {
         }
     }
 
-    /// Decides, from the receiver's bandwidth estimate, which layer of a screen share it gets.
-    pub(super) fn review_screen_level(&mut self, key: SessionKey, now: Instant) {
+    /// Looks at a receiver's screen share again when its feedback says the path is congested,
+    /// without waiting for the next once-a-second review (see [`SCREEN_REVIEW_MIN`]).
+    pub(super) fn watch_screen_path(&mut self, key: SessionKey, now: Instant) {
         let Some(s) = self.sessions.get(key) else {
             return;
         };
-        let Some(sharer) = s
+        if s.down
+            .screen_review
+            .is_some_and(|t| now.saturating_duration_since(t) < SCREEN_REVIEW_MIN)
+        {
+            return;
+        }
+        let e = s.estimate.snapshot();
+        let path = ScreenInputs {
+            queue: e.queue,
+            queue_trend: e.queue_trend,
+            acked: e.acked,
+            capacity: e.capacity,
+            delivery: e.delivery,
+            other: 0.0,
+        };
+        if path.congested() {
+            self.review_screen_level(key, now, false);
+        }
+    }
+
+    /// Decides, from what the receiver's feedback says of its path, which rung of a screen share
+    /// it gets: the simulcast layer (moved at the next keyframe of the other one) and how many of
+    /// its temporal layers (from the next frame). `tick` is the once-a-second review, which the
+    /// layer time is counted on.
+    pub(super) fn review_screen_level(&mut self, key: SessionKey, now: Instant, tick: bool) {
+        let Some(s) = self.sessions.get(key) else {
+            return;
+        };
+        let Some((stream, sharer, source)) = s
             .down
             .iter()
             .find(|(_, d)| d.ty == TrackType::Screen)
-            .map(|(_, d)| d.publisher)
+            .map(|(id, d)| (id, d.publisher, d.source))
         else {
             return;
         };
         let Some(p) = self.sessions.get(sharer) else {
             return;
         };
-        let high_rate =
-            p.up.sources
-                .iter()
-                .find(|x| x.ty == TrackType::Screen && x.layer == Layer::High)
-                .and_then(|x| x.rate.rate(now));
+        let rates = |layer: Layer| {
+            let src =
+                p.up.sources
+                    .iter()
+                    .find(|x| x.ty == TrackType::Screen && x.layer == layer)?;
+            let temporal = src.temporal_rates.as_ref();
+            Some(LayerRates {
+                total: src.rate.rate(now),
+                temporal: temporal
+                    .filter(|t| t.seen)
+                    .map(|t| [t.base.rate(now), t.second.rate(now)]),
+                keyframe_bits: temporal
+                    .and_then(|t| t.keyframe_bytes)
+                    .map(|b| b as f64 * 8.0),
+            })
+        };
+        let ladder = Ladder::new(rates(Layer::Low), rates(Layer::High));
+        let serving = source
+            .and_then(|id| p.up.sources.iter().find(|x| x.id == id))
+            .map(|x| x.layer);
         let estimate = s.estimate.snapshot();
+        let inputs = ScreenInputs {
+            queue: estimate.queue,
+            queue_trend: estimate.queue_trend,
+            acked: estimate.acked,
+            capacity: estimate.capacity,
+            delivery: estimate.delivery,
+            other: self.other_video_rate(key, now),
+        };
         let before = s.down.screen_level.level();
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
-        let after = s.down.screen_level.decide(
-            now,
-            ScreenInputs {
-                capacity: estimate.delay_based,
-                delivery: estimate.delivery,
-                high_rate,
-            },
-        );
-        self.metrics
-            .screen_layer_time(after == Layer::High, Self::tick_interval());
-        if after != before {
-            debug!(session = %s.cfg.session_id, ?after, target = estimate.target, "screen share layer changed");
+        s.down.screen_review = Some(now);
+        let rung = s.down.screen_level.decide(now, inputs, &ladder);
+        // While the receiver waits for the keyframe of a smaller layer, it gets only the base of
+        // the larger: what it was sent is what congested its path.
+        let limit = match serving {
+            Some(layer) if layer != rung.layer && rung.layer == Layer::Low => Some(0),
+            Some(layer) if layer != rung.layer => {
+                s.down.get(stream).and_then(|d| d.temporal.limit())
+            }
+            _ => rung.tid,
+        };
+        if let Some(ds) = s.down.get_mut(stream) {
+            ds.temporal.set_limit(limit);
+        }
+        if tick {
+            self.metrics
+                .screen_layer_time(rung.layer == Layer::High, Self::tick_interval());
+        }
+        if rung.layer != before {
+            debug!(session = %s.cfg.session_id, ?rung, queue = ?inputs.queue, acked = ?inputs.acked, capacity = ?inputs.capacity, "screen share layer changed");
             self.sync_stream(key, sharer, TrackType::Screen, now);
         }
+    }
+
+    /// Bits per second of the cameras a receiver is sent now: they share its path with the
+    /// screen.
+    fn other_video_rate(&self, key: SessionKey, now: Instant) -> f64 {
+        let Some(s) = self.sessions.get(key) else {
+            return 0.0;
+        };
+        s.down
+            .iter()
+            .filter(|(_, d)| d.ty == TrackType::Video)
+            .filter_map(|(_, d)| {
+                let p = self.sessions.get(d.publisher)?;
+                let src = p.up.sources.iter().find(|x| Some(x.id) == d.source)?;
+                src.rate.rate(now)
+            })
+            .sum::<u64>() as f64
     }
 
     /// Whether a session has media to look after once a second: video (its layers, keyframes,

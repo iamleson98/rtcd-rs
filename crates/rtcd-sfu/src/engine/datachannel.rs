@@ -108,9 +108,9 @@ impl Engine {
             DcMessage::SharpScreen(on) => {
                 if let Some(s) = self.sessions.get_mut(key) {
                     debug!(session = %s.cfg.session_id, on, "the receiver wants the sharp screen layer");
-                    s.down.screen_level.pin_high(on, now);
+                    s.down.screen_level.pin_high(on);
                 }
-                self.review_screen_level(key, now);
+                self.review_screen_level(key, now, false);
             }
             DcMessage::LossRate(v) => self.metrics.client_loss_rate(&group, v),
             DcMessage::RoundTripTime(v) => self.metrics.client_rtt(&group, v),

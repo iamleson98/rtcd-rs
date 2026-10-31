@@ -43,7 +43,7 @@ What the receivers experience, read from the connection statistics of each sessi
 |---|---|
 | `rtcd_rtc_receiver_feedback_total{type}` | retransmission (`nack`), keyframe (`pli`) and full intra (`fir`) requests receivers sent |
 | `rtcd_rtc_retransmitted_packets_total`, `_bytes_total` | what was sent again over a separate RTX stream because they asked. rtcd offers no RTX: it answers a `nack` by sending the packet again on its own stream, which the connection statistics cannot tell from a first send, so these stay 0; the `nack` count above shows how often receivers ask |
-| `rtcd_rtc_receiver_loss_ratio`, `rtcd_rtc_receiver_rtt` | histograms of the loss fraction and round trip time receivers report |
+| `rtcd_rtc_receiver_loss_ratio`, `rtcd_rtc_receiver_rtt` | histograms of the loss fraction receivers report, and of the round trip from a packet leaving to the transport feedback that reports it (the library leaves the receiver reports' round trip at zero) |
 | `rtcd_rtc_bandwidth_estimate_bps` | histogram of the receivers' bandwidth estimates |
 | `rtcd_rtc_screen_layer_seconds_total{layer}` | seconds receivers spent on the small and the large layer of a shared screen (`rate()` is the number of receivers on each) |
 | `rtcd_rtc_keyframe_requests_total{result}` | keyframes asked of senders, `sent` or `held_back` (asked a moment ago) |
@@ -67,18 +67,39 @@ counter; the host figures average the last five seconds):
 What is spent on the wire: only video takes part in the bandwidth estimate, so voice packets carry no
 transport-wide sequence number (8 bytes on a 65-byte packet, both ways) and nobody reports on them.
 
-## Which layer of a shared screen a viewer gets
+## What of a shared screen a viewer gets
 
-A viewer starts on the small layer and is moved to the large one (`layers.rs`) once the delay half of its
-bandwidth estimate says its path can carry the large layer's measured rate and at least 90% of the video
-sent to it is reported as arrived (`bwe.rs` counts it over the last three seconds). The loss half of the
-estimate is not used: it grows only while under 2% of the packets are lost, so on a path that loses a few
-per cent at random it stays at its floor for good, and the viewer never got the large layer. Lost packets
-are sent again on request, so what such a path leaves missing is next to nothing (tested: under 0.1% at 15%
-loss). The large layer is a trial that is judged by what arrives: a viewer is moved back to the small one
-when less than 75% of what is sent arrives, or the delay says the path cannot carry it while packets also go
-missing, for two seconds; each change lengthens the wait before the next try (10 s up to 5 min). A path
-that loses more than a tenth of the packets stays on the small layer.
+A browser sends a shared screen as two simulcast layers (500 kbit/s at 5 frames a second and 2.5 Mbit/s at
+15, from lms-web), each in three temporal layers (`L1T3`, what Chrome does unasked): the base layer has every
+fourth frame and about two fifths of the bits, the second the frames halfway between and a fifth more. A
+viewer is sent one rung of that ladder (`layers.rs`): the small layer's base, its base and second, all of it,
+then the same of the large layer, so a path that carries 1 to 2 Mbit/s gets the full picture at a quarter or
+half the frame rate instead of the small picture. Leaving temporal layers out costs nothing and needs no
+keyframe (`temporal.rs`; the frames after them are numbered on without a gap, `rewrite.rs`); moving between
+the small and the large layer costs a keyframe of the other.
+
+What decides is what the viewer's transport feedback says of its path (`bwe.rs`):
+
+- the queue that stands on it: the one-way delay of the first packet of each burst above the lowest of the
+  last half minute. A path given more than it carries holds the excess there (a home router or a mobile
+  network buffers seconds of it), and the voice on the same link waits behind it; the delay-based bandwidth
+  estimate reads only a queue that grows, and a full one does not;
+- what it delivers (the bytes that arrived over the last second), what it loses (of the packets sent the
+  first time: a packet sent again finds its first copy there and is dropped unreported), and what its
+  narrowest link carries (a burst leaves at once and arrives spread out by it).
+
+A queue of 150 ms that lasts a second without shrinking (a keyframe's queue shrinks once it has gone in), one
+that grows fast, one of 1.5 s, or a sixth of what is sent lost, is congestion, pinned viewers included: the
+viewer is moved at once to the rung that what the path delivered carries with room to drain the queue within
+seconds. While the path stays clear the rung above is tried, one at a time, once it fits the narrowest link
+with room to spare (with the keyframe a move onto the large layer costs drained within 2.5 s); a rung that
+brought congestion waits 20 s, then twice as long each time (up to 5 min) before it is tried again. A path
+that loses more than a tenth of the packets at random is given nothing more. Lost packets are sent again on
+request, and lms-web plays a shared screen a second late, so the repair lands before the frame is due: the
+picture neither stops nor breaks (`tests/screen_congestion.rs` runs viewers behind 1 to 4 Mbit/s links that
+buffer 2 s, 230 ms away, losing 1 to 2 % at random). A screen share and its sound go to viewers in a stream
+of their own: a browser keeps one video of a stream in step with its audio, which is to be the camera with the
+voice, not the share played a second late.
 
 ## Running several instances
 

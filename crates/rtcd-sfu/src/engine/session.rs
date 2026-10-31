@@ -21,6 +21,7 @@ use crate::ids::TrackType;
 use crate::layers::{Layer, ScreenLevel, StallWatch};
 use crate::rate::RateMonitor;
 use crate::rewrite::Rewriter;
+use crate::temporal::TemporalFilter;
 use crate::vad::Monitor;
 
 /// Names a session in the engine: an index that is reused after the session ends, and a
@@ -60,6 +61,9 @@ pub(crate) struct Source {
     /// The id receivers see this stream under; layers of one camera share it.
     pub out_track_id: String,
     pub rate: RateMonitor,
+    /// For a VP8 screen share: what its base and second temporal layers bring, for the rungs a
+    /// receiver is offered (see `layers::Ladder`).
+    pub temporal_rates: Option<TemporalRates>,
     /// When a packet of this stream last arrived.
     pub last_packet: Option<Instant>,
     /// When a keyframe was last asked of the sender for this stream.
@@ -68,6 +72,48 @@ pub(crate) struct Source {
     /// was last forwarded: the receivers' sequence numbers must then carry on from where they
     /// were (see `Rewriter::resume_after_gap`).
     pub gap: bool,
+}
+
+/// The rates of the lower temporal layers of a screen share's layer, measured as for the whole
+/// layer, and how big its keyframes are: a receiver moved onto the layer is sent one first.
+#[derive(Debug)]
+pub(crate) struct TemporalRates {
+    pub base: RateMonitor,
+    pub second: RateMonitor,
+    /// Whether the stream's frames say which temporal layer they are in.
+    pub seen: bool,
+    /// Bytes of the last keyframe, and of the one arriving (by its RTP timestamp).
+    pub keyframe_bytes: Option<usize>,
+    keyframe: Option<(u32, usize)>,
+}
+
+impl TemporalRates {
+    pub fn new(window: std::time::Duration) -> Self {
+        Self {
+            base: RateMonitor::new(window),
+            second: RateMonitor::new(window),
+            seen: false,
+            keyframe_bytes: None,
+            keyframe: None,
+        }
+    }
+
+    /// Counts a packet of the stream: `key` for the first packet of a keyframe, `last` for the
+    /// last packet of a frame.
+    pub fn count_keyframe(&mut self, ts: u32, size: usize, key: bool, last: bool) {
+        if key {
+            self.keyframe = Some((ts, 0));
+        }
+        if let Some((at, bytes)) = self.keyframe.as_mut()
+            && *at == ts
+        {
+            *bytes += size;
+            if last {
+                self.keyframe_bytes = Some(*bytes);
+                self.keyframe = None;
+            }
+        }
+    }
 }
 
 /// What a participant sends.
@@ -123,6 +169,8 @@ pub(crate) struct DownStream {
     /// The source the stream is waiting to be moved onto, at its next keyframe.
     pub target: Option<u32>,
     pub rewrite: Rewriter,
+    /// Which temporal layers of a screen share the receiver is sent.
+    pub temporal: TemporalFilter,
 }
 
 /// What the SFU sends a participant.
@@ -142,6 +190,8 @@ pub(crate) struct Downlink {
     pub changed: bool,
     /// Which layer of a screen share this receiver is sent.
     pub screen_level: ScreenLevel,
+    /// When the screen share's layer was last decided.
+    pub screen_review: Option<Instant>,
 }
 
 impl Downlink {

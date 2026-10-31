@@ -6,7 +6,9 @@
 //! so a whole call runs in milliseconds and every run is the same.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+pub mod watch;
+
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -64,6 +66,11 @@ pub struct VideoSender {
     seq: [u16; 2],
     ts: [u32; 2],
     picture_id: [u8; 2],
+    /// For frames sent with temporal layers (`send_screen_frame`): the 15-bit picture id, the
+    /// TL0PICIDX and where in the pattern of temporal layers each layer is.
+    wide_picture_id: [u16; 2],
+    tl0: [u8; 2],
+    pattern: [usize; 2],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +146,14 @@ pub struct Browser {
     pub path: Option<Path>,
     /// When the downlink has sent everything queued on it.
     link_free: Instant,
+    /// How long each datagram to the browser waited in the downlink's queue, by when it entered,
+    /// and how many the full queue turned away.
+    pub queue_waits: Vec<(Instant, Duration)>,
+    pub queue_drops: Vec<Instant>,
+    /// The screen share as the browser plays it.
+    pub screen_watch: watch::ScreenWatch,
+    /// The voice frames heard (see `World::send_voice`): their number and when they arrived.
+    pub voice_heard: HashMap<u32, Instant>,
     pub connected: bool,
     pub signaling_conflicts: usize,
     /// Descriptions the SFU sent that the browser has not applied yet (it was mid-offer).
@@ -165,6 +180,8 @@ impl Browser {
 
 pub struct World {
     pub now: Instant,
+    /// When the world began: the clock `send_screen_frame` stamps packets with counts from it.
+    pub epoch: Instant,
     pub engine: Engine,
     /// The node's send gauge, which the shards would feed from their sockets: the world is the
     /// engine's only socket.
@@ -189,6 +206,10 @@ pub struct World {
     /// Called just before the world calls into the engine, with `"datagram"` or `"timeout"` and
     /// `true`, and just after with `false`: for tests that measure the engine alone.
     pub around_engine: fn(&'static str, bool),
+    /// How browsers joining from now on ask for lost packets again: every this long, this many
+    /// times at most, as a browser does once a round trip (libwebrtc's `NackRequester`, ten
+    /// tries). `None` keeps the library's: every 100 ms, for as long as the packet is missing.
+    pub nack_retry: Option<(Duration, u16)>,
 }
 
 /// A node with no send budget whose kernel refuses the number of datagrams `refused` says it has
@@ -252,8 +273,10 @@ impl World {
         cfg.validate().unwrap();
         let cfg_server = cfg.addresses[0].advertised_udp();
         let egress = cfg.egress.clone();
+        let now = Instant::now();
         World {
-            now: Instant::now(),
+            now,
+            epoch: now,
             egress,
             engine: Engine::new(Arc::new(cfg), metrics, Rng::seeded(7)),
             server: cfg_server,
@@ -270,6 +293,7 @@ impl World {
             payload_pad: 0,
             engine_spent: Duration::ZERO,
             around_engine: |_, _| {},
+            nack_retry: None,
         }
     }
 
@@ -338,7 +362,16 @@ impl World {
             None,
         )
         .unwrap();
-        let registry = rtc::peer_connection::configuration::interceptor_registry::configure_keyframe_request_forwarding(register_default_interceptors(Registry::new(), &mut me).unwrap());
+        let mut registry = rtc::peer_connection::configuration::interceptor_registry::configure_keyframe_request_forwarding(register_default_interceptors(Registry::new(), &mut me).unwrap());
+        if let Some((interval, tries)) = self.nack_retry {
+            registry = registry.with(
+                rtc::interceptor::Slot::NackGenerator,
+                rtc::interceptor::NackGeneratorBuilder::new()
+                    .with_interval(interval)
+                    .with_max_nacks_per_packet(tries)
+                    .build(),
+            );
+        }
         let mut pc = RTCPeerConnectionBuilder::new()
             .with_configuration(RTCConfigurationBuilder::new().build())
             .with_media_engine(me)
@@ -422,6 +455,14 @@ impl World {
             unreachable: false,
             path: None,
             link_free: self.now,
+            queue_waits: Vec::new(),
+            queue_drops: Vec::new(),
+            screen_watch: {
+                let mut w = watch::ScreenWatch::default();
+                w.set_epoch(self.epoch);
+                w
+            },
+            voice_heard: HashMap::new(),
             connected: false,
             signaling_conflicts: 0,
             remote_candidates_seen: 0,
@@ -501,6 +542,19 @@ impl World {
     }
 
     pub fn send_audio(&mut self, i: usize, level: u8) {
+        self.send_audio_payload(i, level, Bytes::from_static(&[0xfc, 1, 2, 3, 4, 5, 6, 7]));
+    }
+
+    /// Sends voice frame number `n` of browser `i`, a loud one of the size Opus gives speech at
+    /// 32 kbit/s, numbered so the receiver can tell which arrived (see `voice_number`).
+    pub fn send_voice(&mut self, i: usize, n: u32) {
+        let mut payload = vec![0xfc, b'V'];
+        payload.extend_from_slice(&n.to_le_bytes());
+        payload.resize(80, 0x55);
+        self.send_audio_payload(i, 20, Bytes::from(payload));
+    }
+
+    fn send_audio_payload(&mut self, i: usize, level: u8, payload: Bytes) {
         let now = self.now;
         let b = &mut self.browsers[i];
         let (ext_id, pt) = {
@@ -534,13 +588,7 @@ impl World {
         b.mic_seq = b.mic_seq.wrapping_add(1);
         b.pc.rtp_sender(b.mic)
             .unwrap()
-            .write_rtp(
-                now,
-                rtc::rtp::packet::Packet {
-                    header,
-                    payload: Bytes::from_static(&[0xfc, 1, 2, 3, 4, 5, 6, 7]),
-                },
-            )
+            .write_rtp(now, rtc::rtp::packet::Packet { header, payload })
             .expect("write_rtp");
     }
 
@@ -631,9 +679,12 @@ impl World {
         let mut leaves = now;
         if let Some(bps) = path.rate_bps {
             let start = b.link_free.max(now);
-            if start.saturating_duration_since(now) > path.queue {
+            let wait = start.saturating_duration_since(now);
+            if wait > path.queue {
+                b.queue_drops.push(now);
                 return;
             }
+            b.queue_waits.push((now, wait));
             b.link_free = start + Duration::from_secs_f64(data.len() as f64 * 8.0 / bps as f64);
             leaves = b.link_free;
         }
@@ -821,7 +872,17 @@ impl World {
             let Some(m) = b.pc.poll_read() else { break };
             moved = true;
             match m.message {
-                RTCMessage::RtpPacket(track, packet) => b.rtp.push((track.to_string(), packet)),
+                RTCMessage::RtpPacket(track, packet) => {
+                    let track = track.to_string();
+                    if track.starts_with("screen_") {
+                        b.screen_watch.on_packet(now, &packet);
+                    } else if track.starts_with("voice_")
+                        && let Some(n) = voice_number(&packet.payload)
+                    {
+                        b.voice_heard.entry(n).or_insert(now);
+                    }
+                    b.rtp.push((track, packet));
+                }
                 RTCMessage::RtcpPacket(_, packets) => {
                     for p in &packets {
                         b.rtcp_seen
@@ -1143,6 +1204,198 @@ impl World {
         self.payload_pad = pad;
     }
 
+    /// Sends one frame of browser `i`'s screen share on `layer`, as a browser's VP8 encoder does:
+    /// 15-bit picture ids, and with `temporal` three temporal layers in its pattern (0, 2, 1, 2,
+    /// starting again at every keyframe) with the layer sync bit where it sets it (every frame of
+    /// layer 1 and the first of layer 2 after the base refer to the base only). Every packet ends
+    /// with when it was sent (see `watch::sent_at`) and the layer marker `describe` reads.
+    pub fn send_screen_frame(
+        &mut self,
+        i: usize,
+        layer: Layer,
+        key: bool,
+        packets: usize,
+        temporal: bool,
+    ) {
+        let now = self.now;
+        let sent = (now - self.epoch).as_micros() as u64;
+        let b = &mut self.browsers[i];
+        let v = b.screen.as_mut().expect("a screen share");
+        let l = layer as usize;
+        let (pt, mid_ext, rid_ext) = {
+            let mut s = b.pc.rtp_sender(v.sender).expect("sender");
+            let p = s.get_parameters();
+            let ext = |uri: &str| {
+                p.rtp_parameters
+                    .header_extensions
+                    .iter()
+                    .find(|e| e.uri == uri)
+                    .map(|e| e.id as u8)
+            };
+            (
+                p.rtp_parameters
+                    .codecs
+                    .iter()
+                    .find(|c| c.rtp_codec.mime_type.eq_ignore_ascii_case("video/vp8"))
+                    .map_or(96, |c| c.payload_type),
+                ext("urn:ietf:params:rtp-hdrext:sdes:mid"),
+                ext("urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id"),
+            )
+        };
+        let mid =
+            b.pc.rtp_transceiver(usize::from(v.sender))
+                .and_then(|t| t.mid().clone())
+                .expect("the sender has a mid");
+        if key {
+            v.pattern[l] = 0;
+        }
+        let step = v.pattern[l] % 4;
+        let tid = [0u8, 2, 1, 2][step];
+        let sync = !key && (tid == 1 || step == 1);
+        v.pattern[l] += 1;
+        if tid == 0 {
+            v.tl0[l] = v.tl0[l].wrapping_add(1);
+        }
+        v.wide_picture_id[l] = (v.wide_picture_id[l] + 1) & 0x7fff;
+        let pid = v.wide_picture_id[l];
+        v.ts[l] = v.ts[l].wrapping_add(if layer == Layer::High { 6000 } else { 18_000 });
+        for n in 0..packets {
+            let first = n == 0;
+            let mut payload = vec![
+                0x80 | if first { 0x10 } else { 0 },
+                if temporal { 0xe0 } else { 0x80 },
+                0x80 | (pid >> 8) as u8,
+                pid as u8,
+            ];
+            if temporal {
+                payload.push(v.tl0[l]);
+                payload.push(tid << 6 | u8::from(sync) << 5);
+            }
+            if first {
+                payload.push(if key { 0x00 } else { 0x01 });
+            }
+            payload.resize(payload.len() + 1000, 0xcc);
+            payload.extend_from_slice(&sent.to_le_bytes());
+            payload.extend_from_slice(&[layer as u8 + 1, 0xaa, 0xbb, 0xcc]);
+            let mut header = rtc::rtp::header::Header {
+                version: 2,
+                marker: n == packets - 1,
+                payload_type: pt,
+                sequence_number: v.seq[l],
+                timestamp: v.ts[l],
+                ssrc: v.ssrcs[l],
+                ..Default::default()
+            };
+            if let Some(id) = mid_ext {
+                header
+                    .set_extension(id, Bytes::from(mid.clone().into_bytes()))
+                    .unwrap();
+            }
+            if let Some(id) = rid_ext {
+                header
+                    .set_extension(id, Bytes::from(if layer == Layer::Low { "l" } else { "h" }))
+                    .unwrap();
+            }
+            v.seq[l] = v.seq[l].wrapping_add(1);
+            b.pc.rtp_sender(v.sender)
+                .unwrap()
+                .write_rtp(
+                    now,
+                    rtc::rtp::packet::Packet {
+                        header,
+                        payload: Bytes::from(payload),
+                    },
+                )
+                .expect("write_rtp");
+        }
+    }
+
+    /// Browser `i` shares its screen as `plan` says, in steps of 10 ms: the small layer at 5 frames
+    /// a second and the large at 15, each frame of the size that makes up its layer's rate (with
+    /// temporal layers the base frames twice the others, as a browser's encoder spends it), a
+    /// keyframe (six times a frame of the large layer, four of the small) at the start and whenever
+    /// the SFU asks; the viewers named in the plan ask for a keyframe as a browser does when their
+    /// picture is stuck. `each_step` runs before every step, with the time shared so far, to change
+    /// the network. Returns when each voice frame was sent.
+    pub fn stream_screen_live(
+        &mut self,
+        i: usize,
+        plan: &ScreenPlan,
+        mut each_step: impl FnMut(&mut World, Duration),
+    ) -> Vec<Instant> {
+        const STEP: Duration = Duration::from_millis(10);
+        let mut voice_sent = Vec::new();
+        let mut next = [Duration::ZERO; 2];
+        let interval = [Duration::from_millis(200), Duration::from_micros(66_667)];
+        let rates = [plan.low_bps, plan.high_bps];
+        let mut first = [true; 2];
+        let steps = (plan.seconds * 100.0) as usize;
+        for step in 0..steps {
+            let elapsed = STEP * step as u32;
+            each_step(self, elapsed);
+            if plan.voice && step % 2 == 0 {
+                let n = voice_sent.len() as u32;
+                voice_sent.push(self.now);
+                self.send_voice(i, n);
+            }
+            for layer in [Layer::Low, Layer::High] {
+                let l = layer as usize;
+                if elapsed < next[l] {
+                    continue;
+                }
+                next[l] += interval[l];
+                let ssrc = self.browsers[i].screen.as_ref().expect("a screen").ssrcs[l];
+                let asked = self.browsers[i].keyframe_requests.contains(&ssrc);
+                self.browsers[i].keyframe_requests.retain(|&r| r != ssrc);
+                let key = asked || std::mem::take(&mut first[l]);
+                let frame = rates[l] as f64 / 8.0 * interval[l].as_secs_f64();
+                let step_in = self.browsers[i].screen.as_ref().unwrap().pattern[l] % 4;
+                let share = match (key, plan.temporal) {
+                    (true, _) => [4.0, 6.0][l],
+                    (false, true) if step_in == 0 => 1.6,
+                    (false, true) => 0.8,
+                    (false, false) => 1.0,
+                };
+                let packets = ((frame * share / 1050.0).ceil() as usize).max(1);
+                self.send_screen_frame(i, layer, key, packets, plan.temporal);
+            }
+            for &v in &plan.viewers {
+                let now = self.now;
+                if self.browsers[v].screen_watch.wants_keyframe(now)
+                    && let Some(ssrc) = self.browsers[v]
+                        .tracks
+                        .iter()
+                        .find(|t| t.track_id.starts_with("screen_"))
+                        .map(|t| t.ssrc)
+                {
+                    self.write_keyframe_request(v, ssrc);
+                }
+            }
+            self.run_for(STEP);
+        }
+        voice_sent
+    }
+
+    /// Browser `i` asks for a keyframe of the stream it receives with `ssrc`, without waiting.
+    fn write_keyframe_request(&mut self, i: usize, ssrc: u32) {
+        let now = self.now;
+        let b = &mut self.browsers[i];
+        let Some(receiver) = b.pc.get_receivers().next() else {
+            return;
+        };
+        if let Some(mut rx) = b.pc.rtp_receiver(receiver) {
+            let _ = rx.write_rtcp(
+                now,
+                vec![Box::new(
+                    rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication {
+                        sender_ssrc: 0,
+                        media_ssrc: ssrc,
+                    },
+                )],
+            );
+        }
+    }
+
     /// Browser `i` asks for a keyframe of the stream received with `ssrc`.
     pub fn request_keyframe(&mut self, i: usize, ssrc: u32) {
         let now = self.now;
@@ -1174,6 +1427,27 @@ impl World {
             .position(|b| b.name == name)
             .expect("no such browser")
     }
+}
+
+/// How `World::stream_screen_live` shares a screen.
+#[derive(Debug, Clone)]
+pub struct ScreenPlan {
+    pub seconds: f64,
+    pub low_bps: u64,
+    pub high_bps: u64,
+    /// Frames carry three temporal layers, as a browser's VP8 encoder sends a screen.
+    pub temporal: bool,
+    /// The sharer talks all along: a voice frame every 20 ms.
+    pub voice: bool,
+    /// Browsers that ask for a keyframe when their picture is stuck, as a browser does.
+    pub viewers: Vec<usize>,
+}
+
+/// The number `World::send_voice` put in a voice frame.
+pub fn voice_number(payload: &[u8]) -> Option<u32> {
+    (payload.get(1) == Some(&b'V'))
+        .then(|| Some(u32::from_le_bytes(payload.get(2..6)?.try_into().ok()?)))
+        .flatten()
 }
 
 fn video_sender(
@@ -1221,6 +1495,9 @@ fn video_sender(
         seq: [100, 5000],
         ts: [1000, 900_000],
         picture_id: [10, 90],
+        wide_picture_id: [1000, 20_000],
+        tl0: [3, 200],
+        pattern: [0, 0],
     }
 }
 

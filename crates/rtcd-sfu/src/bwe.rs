@@ -27,6 +27,8 @@ use rtc::interceptor::{BandwidthEstimator, EstimatorStats, Gcc, PacketReport};
 
 /// How far back the feedback is looked at for what arrived.
 const DELIVERY_WINDOW: Duration = Duration::from_secs(3);
+/// Packets remembered by stream and sequence number, to tell a packet sent again from the first.
+const SENT_REMEMBERED: usize = 4096;
 /// Less than this sent in the window is too little to say what share of it arrived.
 const DELIVERY_MIN_BYTES: u64 = 30_000;
 /// How far back the lowest one-way delay is looked for: long enough to have seen the path with
@@ -58,8 +60,8 @@ pub struct Estimate {
     delay_based: AtomicU64,
     loss_based: AtomicU64,
     loss: AtomicU64,
-    /// The share of the bytes sent in the window that the receiver reported, as bits of an `f64`;
-    /// NaN while too little was sent to say.
+    /// The share of the bytes sent the first time in the window that the receiver reported, as
+    /// bits of an `f64`; NaN while too little was sent to say.
     delivery: AtomicU64,
     /// Seconds what is sent waits in a queue on the path, bits per second the path delivered, and
     /// the round trip in seconds; NaN while unknown.
@@ -77,8 +79,9 @@ pub struct EstimateSnapshot {
     pub delay_based: f64,
     pub loss_based: f64,
     pub average_loss: f64,
-    /// The share (0..1) of the video bytes sent to the receiver over the last seconds that its
-    /// feedback says arrived, `None` when too little was sent to say.
+    /// The share (0..1) of the video bytes sent to the receiver the first time over the last
+    /// seconds that its feedback says arrived (what the path loses), `None` when too little was
+    /// sent to say.
     pub delivery: Option<f64>,
     /// Seconds of what is sent to the receiver that stand queued on its path (see the module).
     pub queue: Option<f64>,
@@ -141,6 +144,9 @@ pub struct SharedGcc {
     /// What the feedback of the last [`DELIVERY_WINDOW`] said of each packet: when it was
     /// reported, how big it was, whether it arrived.
     window: VecDeque<(Instant, usize, bool)>,
+    /// The packets reported on lately, by stream and sequence number.
+    reported: std::collections::HashSet<u64>,
+    reported_order: VecDeque<u64>,
     path: PathMeter,
 }
 
@@ -337,6 +343,8 @@ impl SharedGcc {
                 inner,
                 out: out.clone(),
                 window: VecDeque::new(),
+                reported: Default::default(),
+                reported_order: VecDeque::new(),
                 path: PathMeter::default(),
             },
             out,
@@ -352,8 +360,21 @@ impl SharedGcc {
 impl BandwidthEstimator for SharedGcc {
     fn on_reports(&mut self, now: Instant, reports: &[PacketReport]) {
         self.inner.on_reports(now, reports);
-        self.window
-            .extend(reports.iter().map(|r| (now, r.size, r.arrived)));
+        // What arrives says what the path loses only of packets sent the first time: a packet sent
+        // again (the SFU sends one again each time the receiver asks) that finds the first copy
+        // there is thrown away by the receiver before its feedback counts it, and reads as lost.
+        for r in reports {
+            let key = u64::from(r.ssrc) << 16 | u64::from(r.rtp_sequence_number);
+            if !self.reported.insert(key) {
+                continue;
+            }
+            self.reported_order.push_back(key);
+            if self.reported_order.len() > SENT_REMEMBERED {
+                let old = self.reported_order.pop_front().expect("over the limit");
+                self.reported.remove(&old);
+            }
+            self.window.push_back((now, r.size, r.arrived));
+        }
         while self
             .window
             .front()
@@ -450,6 +471,27 @@ mod tests {
         assert_eq!(estimate.snapshot().delivery, None, "too little to say");
         gcc.on_reports(t, &batch(90, 20, t));
         let share = estimate.snapshot().delivery.expect("enough was sent");
+        assert!((share - 0.95).abs() < 1e-9, "{share}");
+    }
+
+    #[test]
+    fn a_packet_sent_again_does_not_count_for_what_the_path_loses() {
+        let (mut gcc, estimate) = SharedGcc::new(300_000.0, 100_000.0, 4_000_000.0);
+        let t = Instant::now();
+        let numbered = |seq: u16, arrived: bool| PacketReport {
+            rtp_sequence_number: seq,
+            ..report(1000, arrived, t)
+        };
+        // 100 packets, 5 lost; each lost one sent again three times, and the copies that find the
+        // packet already there are dropped by the receiver.
+        let mut reports: Vec<_> = (0..100).map(|s| numbered(s, s % 20 != 0)).collect();
+        reports.extend(
+            (0..100)
+                .step_by(20)
+                .flat_map(|s| [numbered(s, true), numbered(s, false), numbered(s, false)]),
+        );
+        gcc.on_reports(t, &reports);
+        let share = estimate.snapshot().delivery.unwrap();
         assert!((share - 0.95).abs() < 1e-9, "{share}");
     }
 

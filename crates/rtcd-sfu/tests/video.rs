@@ -327,15 +327,11 @@ fn a_screen_share_reaches_everyone_and_ends_cleanly() {
 /// it cannot decode.
 #[test]
 fn a_retransmission_that_comes_late_is_accepted() {
-    // An estimate above what the large layer needs, so the large layer is what bob gets.
-    let cfg = rtcd_sfu::config::EngineConfig {
-        min_bitrate: 3_000_000,
-        max_bitrate: 8_000_000,
-        ..support::engine_config()
-    };
-    let mut w = World::with_config(cfg);
+    // Bob asks for the sharp screen, so the large layer is what he gets from the start.
+    let mut w = World::new();
     let a = w.join("alice", "call1");
     let b = w.join("bob", "call1");
+    w.dc_send(b, rtcd_proto::dc::DcMessage::SharpScreen(true));
     w.share_screen(a);
     w.run_for(Duration::from_secs(1));
     w.stream_video(a, true, 2.0, 30, &BOTH);
@@ -417,18 +413,14 @@ fn an_undeclared_video_stream_is_not_forwarded() {
 
 #[test]
 fn a_receiver_with_bandwidth_to_spare_gets_the_large_screen_layer() {
-    // An estimate that starts above what the large layer needs (2.5 Mbit/s nominal).
-    let cfg = rtcd_sfu::config::EngineConfig {
-        min_bitrate: 3_000_000,
-        max_bitrate: 8_000_000,
-        ..support::engine_config()
-    };
-    let mut w = World::with_config(cfg);
+    // Bob's path has room to spare: once it has stayed clear on the small layer for a few seconds,
+    // the large one is tried, and kept.
+    let mut w = World::new();
     let a = w.join("alice", "call1");
     let b = w.join("bob", "call1");
     w.share_screen(a);
     w.run_for(Duration::from_secs(1));
-    w.stream_video(a, true, 4.0, 30, &BOTH);
+    w.stream_video(a, true, 10.0, 30, &BOTH);
 
     let got = video_of(&w, b, "screen_");
     assert!(

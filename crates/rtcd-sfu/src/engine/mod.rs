@@ -302,6 +302,7 @@ impl Engine {
             return;
         }
         self.advance_negotiation(key, now);
+        self.watch_screen_path(key, now);
         self.forward(key, rtp, now);
         self.flush(key);
         self.reschedule(key, now);
