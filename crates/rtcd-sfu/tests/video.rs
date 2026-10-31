@@ -296,6 +296,9 @@ fn a_screen_share_reaches_everyone_and_ends_cleanly() {
             parse_track_id(&track.track_id),
             Some((TrackType::Screen, "session-alice"))
         );
+        // Not in the stream of alice's voice: a browser keeps the tracks of one stream in step,
+        // and the share is played a second late.
+        assert_eq!(track.stream_ids, vec!["session-alice_screen"]);
         let got = video_of(&w, r, "screen_");
         assert!(got.len() > 60);
         // Estimates start low, so the small layer is what is sent.

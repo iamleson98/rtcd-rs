@@ -59,6 +59,18 @@ pub fn track_id(kind: TrackType, session_id: &str, entropy: u64) -> String {
     )
 }
 
+/// The stream a forwarded track of `kind` sent by `session_id` is in (`a=msid`): the sender's
+/// session for its voice and camera, and a stream of its own for a screen share and its sound. A
+/// browser keeps one video of a stream in step with the stream's audio: in the sender's stream that
+/// could be the share instead of the camera, and the share is played a second late (lms-web asks
+/// for it, so that what is lost on the way is sent again in time), which the voice is not to be.
+pub fn stream_id(kind: TrackType, session_id: &str) -> String {
+    match kind {
+        TrackType::Screen | TrackType::ScreenAudio => format!("{session_id}_screen"),
+        TrackType::Voice | TrackType::Video => session_id.to_owned(),
+    }
+}
+
 /// Who sends a track and what it is, from its id; `None` when the id is not one of ours.
 pub fn parse_track_id(id: &str) -> Option<(TrackType, &str)> {
     let mut fields = id.split('_');
