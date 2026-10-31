@@ -1,7 +1,8 @@
 //! Choosing between the simulcast layers of a video stream.
 //!
 //! A participant sends a camera or a screen share at two sizes, a small layer (`l`) and a large one
-//! (`h`), each in three temporal layers. The SFU sends each receiver one of the sizes, and of a
+//! (`h`), each in three temporal layers (and, when the client offers it, a third size for the
+//! recording alone, `r`, which no viewer is sent). The SFU sends each receiver one of the sizes, and of a
 //! screen share as many of its temporal layers as the receiver's path carries. What decides is
 //! policy, kept here as plain functions of measurements so it can be tested without a network: for
 //! a screen share what the receiver's path is measured to do with what it is sent (the queue that
@@ -10,11 +11,14 @@
 
 use std::time::{Duration, Instant};
 
-/// One of the two sizes a video is sent at.
+/// One of the sizes a video is sent at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Layer {
     Low,
     High,
+    /// A layer made for the recording alone (rid `r`): sharper and dearer than any viewer needs,
+    /// sent only by a sender with bandwidth to spare, recorded when it flows and never forwarded.
+    Record,
 }
 
 impl Layer {
@@ -23,14 +27,26 @@ impl Layer {
     pub fn from_rid(rid: Option<&str>) -> Self {
         match rid {
             Some("h") | Some("f") => Self::High,
+            Some("r") => Self::Record,
             _ => Self::Low,
         }
     }
 
+    /// The other of the two layers a viewer can be sent.
     pub fn other(self) -> Self {
         match self {
             Self::Low => Self::High,
-            Self::High => Self::Low,
+            Self::High | Self::Record => Self::Low,
+        }
+    }
+
+    /// How much picture the layer carries: what the recording prefers, and what it waits to
+    /// move up to.
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Low => 0,
+            Self::High => 1,
+            Self::Record => 2,
         }
     }
 }
