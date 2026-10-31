@@ -15,5 +15,6 @@ pub mod rate;
 pub mod record;
 pub mod rewrite;
 pub mod runtime;
+pub mod temporal;
 pub mod vad;
 pub mod vp8;

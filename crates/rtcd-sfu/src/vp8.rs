@@ -1,5 +1,6 @@
-//! The VP8 RTP payload descriptor (RFC 7741): what a forwarder needs of it to find keyframes and to
-//! keep picture numbering continuous when a receiver is moved from one simulcast layer to another.
+//! The VP8 RTP payload descriptor (RFC 7741): what a forwarder needs of it to find keyframes, to
+//! keep picture numbering continuous when a receiver is moved from one simulcast layer to another,
+//! and to tell the temporal layers of a stream apart.
 
 /// The parsed front of a VP8 RTP payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +17,18 @@ pub struct Descriptor {
     picture_id_at: usize,
     pub tl0_pic_idx: Option<u8>,
     tl0_at: usize,
+    /// The temporal layer of the frame, when the sender says.
+    pub temporal: Option<Temporal>,
+}
+
+/// Where a frame sits among the temporal layers of its stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Temporal {
+    /// The temporal layer (TID): 0 is the base, each layer above doubles the frame rate.
+    pub tid: u8,
+    /// The layer sync bit (Y): the frame refers to nothing above the base layer, so a receiver
+    /// that was not sent this layer can start on it here.
+    pub sync: bool,
 }
 
 impl Descriptor {
@@ -30,6 +43,7 @@ impl Descriptor {
             picture_id_at: 0,
             tl0_pic_idx: None,
             tl0_at: 0,
+            temporal: None,
         };
         if b0 & 0x80 == 0 {
             return Some(d);
@@ -54,8 +68,14 @@ impl Descriptor {
             d.len += 1;
         }
         if ext & 0x30 != 0 {
-            // TID/Y/KEYIDX byte.
-            payload.get(d.len)?;
+            // TID/Y/KEYIDX byte; the first two are meaningful only with the T bit.
+            let b = *payload.get(d.len)?;
+            if ext & 0x20 != 0 {
+                d.temporal = Some(Temporal {
+                    tid: b >> 6,
+                    sync: b & 0x20 != 0,
+                });
+            }
             d.len += 1;
         }
         Some(d)
@@ -117,6 +137,29 @@ mod tests {
         assert!(d.start);
         assert_eq!(d.picture_id, Some((0x1234, true)));
         assert_eq!(d.tl0_pic_idx, Some(9));
+        assert_eq!(d.temporal, Some(Temporal { tid: 0, sync: true }));
+    }
+
+    #[test]
+    fn reads_the_temporal_layer_and_its_sync_bit() {
+        let mut p = wide(true, 0, 7, 1, 0x01);
+        p[5] = 0x80; // TID 2, no sync
+        assert_eq!(
+            Descriptor::parse(&p).unwrap().temporal,
+            Some(Temporal {
+                tid: 2,
+                sync: false
+            })
+        );
+        p[5] = 0x60; // TID 1, sync
+        assert_eq!(
+            Descriptor::parse(&p).unwrap().temporal,
+            Some(Temporal { tid: 1, sync: true })
+        );
+        // KEYIDX alone (K without T) says nothing about temporal layers.
+        p[1] = 0xd0;
+        let d = Descriptor::parse(&p).unwrap();
+        assert_eq!((d.temporal, d.len), (None, 6));
     }
 
     #[test]
