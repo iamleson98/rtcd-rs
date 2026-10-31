@@ -36,7 +36,7 @@ impl Layer {
 }
 
 /// Nominal rates of the layers of a screen share, used until a layer has been measured.
-pub const NOMINAL_HIGH_RATE: u64 = 2_500_000;
+pub const NOMINAL_HIGH_RATE: u64 = 4_000_000;
 pub const NOMINAL_LOW_RATE: u64 = 500_000;
 /// The share of a layer's rate its lower temporal layers take until they have been measured: a
 /// browser's encoder gives the base layer two fifths of the bits and the second layer one fifth.
@@ -606,9 +606,9 @@ mod tests {
             rates,
             vec![
                 (rung(Layer::Low, None), 400_000),
-                (rung(Layer::High, Some(0)), 1_000_000),
-                (rung(Layer::High, Some(1)), 1_500_000),
-                (rung(Layer::High, None), 2_500_000),
+                (rung(Layer::High, Some(0)), 1_600_000),
+                (rung(Layer::High, Some(1)), 2_400_000),
+                (rung(Layer::High, None), 4_000_000),
             ]
         );
     }

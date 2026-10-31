@@ -1107,10 +1107,11 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
 
     #[test]
     fn the_default_cap_of_a_capture_holds_the_longest_lesson_at_the_highest_rates() {
-        // The web client's top layers (lms-web `media.ts`, `call-client.ts`): a camera 600 kbit/s,
-        // a screen 2.5 Mbit/s, a voice about 40 kbit/s; the longest recording is four hours and
-        // a class of ten cameras is the largest the cap is meant for. 2 GiB lasted 30 minutes.
-        let bits_per_second = 10 * (600_000 + 40_000) + 2_500_000;
+        // The web client's top layers (lms-web `media.ts`, `call-client.ts`): the teacher's camera
+        // 600 kbit/s, a learner's 400 kbit/s, a screen 4 Mbit/s, a voice about 40 kbit/s; the
+        // longest recording is four hours and a class of ten cameras is the largest the cap is
+        // meant for. 2 GiB lasted 30 minutes.
+        let bits_per_second = (600_000 + 40_000) + 9 * (400_000 + 40_000) + 4_000_000;
         let bytes = bits_per_second / 8 * 4 * 3600;
         let cap = RecordConfig::default().max_bytes;
         assert!(bytes < cap, "{bytes} bytes in four hours, cap {cap}");

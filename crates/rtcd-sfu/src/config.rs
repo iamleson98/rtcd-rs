@@ -105,7 +105,7 @@ impl Default for EngineConfig {
             // Half the small screen layer to one and a half times the large one: the range in which
             // choosing between the layers means something.
             min_bitrate: 250_000,
-            max_bitrate: 3_750_000,
+            max_bitrate: 6_000_000,
             ice_lite: true,
             pacing: false,
             audio_loudest: 0,
