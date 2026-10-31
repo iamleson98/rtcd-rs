@@ -171,11 +171,16 @@ async fn finish(run: &Run, ended: Ended, deps: &Deps) {
         // Only if no later run of the recording is using it.
         let _ = tokio::fs::remove_dir(parent).await;
     }
-    let _ = deps
-        .unfinished
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            Some(n.saturating_sub(1))
-        });
+    // One fewer unfinished recording, never below zero.
+    let mut seen = deps.unfinished.load(Ordering::Acquire);
+    while let Err(now) = deps.unfinished.compare_exchange_weak(
+        seen,
+        seen.saturating_sub(1),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        seen = now;
+    }
 }
 
 /// Whether trying again could help: a 4xx answer will not change.

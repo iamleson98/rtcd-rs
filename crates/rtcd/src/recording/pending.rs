@@ -37,17 +37,8 @@ impl Pending {
 
     /// A file of `n` bytes was uploaded or given up on, and removed.
     pub fn release(&self, n: u64) {
-        let _ = self
-            .files
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |f| {
-                Some(f.saturating_sub(1))
-            });
-        let before = self
-            .bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
-                Some(b.saturating_sub(n))
-            })
-            .unwrap_or(0);
+        saturating_sub(&self.files, 1);
+        let before = saturating_sub(&self.bytes, n);
         self.metrics.record_pending(before.saturating_sub(n));
     }
 
@@ -69,6 +60,23 @@ impl Pending {
     /// How many files wait.
     pub fn files(&self) -> u64 {
         self.files.load(Ordering::Relaxed)
+    }
+}
+
+/// Takes `n` off `cell` without going below zero, and returns what it held before.
+/// (`fetch_update` was renamed `try_update`, which the minimum supported compiler lacks.)
+fn saturating_sub(cell: &AtomicU64, n: u64) -> u64 {
+    let mut seen = cell.load(Ordering::Relaxed);
+    loop {
+        match cell.compare_exchange_weak(
+            seen,
+            seen.saturating_sub(n),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(before) => return before,
+            Err(now) => seen = now,
+        }
     }
 }
 
