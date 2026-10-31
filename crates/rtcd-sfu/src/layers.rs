@@ -2,9 +2,10 @@
 //!
 //! A participant sends a camera or a screen share at two sizes, a small layer (`l`) and a large one
 //! (`h`). The SFU sends each receiver one of them. What decides which is policy, kept here as plain
-//! functions of measurements so it can be tested without a network: for a screen share the
-//! receiver's bandwidth estimate against the rate of the large layer, for a camera what the
-//! receiver asked for and whether the sender still sends the large layer.
+//! functions of measurements so it can be tested without a network: for a screen share what the
+//! receiver's path can carry and how much of what is sent to it arrives, against the rate of the
+//! large layer; for a camera what the receiver asked for and whether the sender still sends the
+//! large layer.
 
 use std::time::{Duration, Instant};
 
@@ -39,33 +40,45 @@ pub const NOMINAL_LOW_RATE: u64 = 500_000;
 
 /// The share of a layer's rate the estimate has to reach for the layer to be sent.
 const TOLERANCE: f64 = 0.9;
-/// A receiver that asked for the large layer keeps it unless its link is starved: the loss-based
-/// estimate (which only falls when packets are lost) below this share of the layer's rate for
-/// [`PIN_PATIENCE`], once the estimate has had [`PIN_GRACE`] to find its level. It returns to the
-/// large layer when the estimate passes [`PIN_RESUME`].
+/// A receiver that asked for the large layer keeps it unless its link is starved: what its path
+/// can carry below this share of the layer's rate, or less than [`DROP_DELIVERY`] of what is sent
+/// arriving, for [`PIN_PATIENCE`], once the estimate has had [`PIN_GRACE`] to find its level. It
+/// returns to the large layer when the path can carry [`PIN_RESUME`] of it.
 const PIN_FLOOR: f64 = 0.4;
 const PIN_RESUME: f64 = 0.6;
 const PIN_GRACE: Duration = Duration::from_secs(30);
 const PIN_PATIENCE: Duration = Duration::from_secs(10);
+/// The large layer is sent only while this much of what is sent to the receiver arrives...
+const RAISE_DELIVERY: f64 = 0.9;
+/// ...and is taken away when less than this arrives, or when the path is also losing packets
+/// ([`LOSING`]) while its delay says it cannot carry the layer, for [`DROP_PATIENCE`].
+const DROP_DELIVERY: f64 = 0.75;
+const LOSING: f64 = 0.95;
+const DROP_PATIENCE: Duration = Duration::from_secs(2);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
 /// What the estimator and the sender's streams say, for one decision.
 #[derive(Debug, Clone, Copy)]
 pub struct ScreenInputs {
-    /// The receiver's bandwidth estimate, bits per second.
-    pub target: f64,
-    /// The loss-based half of the estimate.
-    pub loss_based: f64,
+    /// What the receiver's path can carry, bits per second: the delay-based half of its
+    /// estimate. The other half, from loss, only grows while under 2% of the packets are lost and
+    /// so stays at its floor on a path that loses a few per cent at random, which kept every such
+    /// receiver on the small layer for good; what arrives is measured instead (`delivery`).
+    pub capacity: f64,
+    /// The share (0..1) of the video sent to the receiver over the last seconds that arrived,
+    /// `None` when too little was sent to say.
+    pub delivery: Option<f64>,
     /// The measured rate of the large layer, if it has been measured.
     pub high_rate: Option<u64>,
 }
 
 /// Decides which layer of a screen share one receiver gets.
 ///
-/// The large layer is sent while the estimate can carry it. Moving up waits out a backoff that
-/// grows with every change, so a link hovering around the rate does not flip back and forth;
-/// moving down is immediate, because a receiver short of bandwidth loses frames at once.
+/// The large layer is sent while the path can carry it and what is sent arrives. Moving up waits
+/// out a backoff that grows with every change, so a link hovering around the rate does not flip
+/// back and forth, and is a trial: if the large layer does not arrive, the receiver is moved
+/// down again within [`DROP_PATIENCE`].
 #[derive(Debug)]
 pub struct ScreenLevel {
     /// The receiver wants the large layer unless its link is starved.
@@ -73,12 +86,13 @@ pub struct ScreenLevel {
     level: Layer,
     last_change: Option<Instant>,
     backoff: Duration,
+    /// Since when the large layer has not been carried or has not arrived.
+    starved_since: Option<Instant>,
 }
 
 #[derive(Debug)]
 struct Pin {
     since: Instant,
-    starved_since: Option<Instant>,
 }
 
 impl ScreenLevel {
@@ -89,6 +103,7 @@ impl ScreenLevel {
             level: Layer::Low,
             last_change: None,
             backoff: INITIAL_BACKOFF,
+            starved_since: None,
         }
     }
 
@@ -98,10 +113,8 @@ impl ScreenLevel {
         if !pinned {
             self.pin = None;
         } else if self.pin.is_none() {
-            self.pin = Some(Pin {
-                since: now,
-                starved_since: None,
-            });
+            self.pin = Some(Pin { since: now });
+            self.starved_since = None;
             self.level = Layer::High;
         }
     }
@@ -110,35 +123,50 @@ impl ScreenLevel {
         self.level
     }
 
+    /// Whether the receiver has been starved of the large layer for `patience`: records when it
+    /// began, and forgets it when it ends.
+    fn starved_for(&mut self, now: Instant, starved: bool, patience: Duration) -> bool {
+        if !starved {
+            self.starved_since = None;
+            return false;
+        }
+        let since = *self.starved_since.get_or_insert(now);
+        now.saturating_duration_since(since) >= patience
+    }
+
     /// Returns the layer to send now, which is the current one unless the inputs call for a change.
     pub fn decide(&mut self, now: Instant, inputs: ScreenInputs) -> Layer {
         let high = inputs.high_rate.unwrap_or(NOMINAL_HIGH_RATE) as f64 * TOLERANCE;
-        if let Some(pin) = &mut self.pin {
+        let arrives = |share: f64| inputs.delivery.is_none_or(|d| d >= share);
+        if let Some(since) = self.pin.as_ref().map(|p| p.since) {
             match self.level {
                 Layer::High => {
-                    let starved = now.saturating_duration_since(pin.since) >= PIN_GRACE
-                        && inputs.loss_based < high * PIN_FLOOR;
-                    if starved {
-                        let since = *pin.starved_since.get_or_insert(now);
-                        if now.saturating_duration_since(since) >= PIN_PATIENCE {
-                            pin.starved_since = None;
-                            self.level = Layer::Low;
-                        }
-                    } else {
-                        pin.starved_since = None;
+                    let starved = now.saturating_duration_since(since) >= PIN_GRACE
+                        && (inputs.capacity < high * PIN_FLOOR || !arrives(DROP_DELIVERY));
+                    if self.starved_for(now, starved, PIN_PATIENCE) {
+                        self.starved_since = None;
+                        self.level = Layer::Low;
                     }
                 }
-                Layer::Low if inputs.loss_based > high * PIN_RESUME => self.level = Layer::High,
+                Layer::Low if inputs.capacity > high * PIN_RESUME && arrives(RAISE_DELIVERY) => {
+                    self.level = Layer::High
+                }
                 Layer::Low => {}
             }
             return self.level;
         }
+        // A path whose delay says it cannot carry the layer is not enough to take it away: that
+        // half of the estimate swings with every burst. It also has to be losing packets.
+        let starved = !arrives(DROP_DELIVERY) || (inputs.capacity <= high && !arrives(LOSING));
         let wanted = match self.level {
-            // Dropping needs both halves of the estimate to agree; the delay-based half alone
-            // swings with every burst, and the loss-based one only falls when packets are lost.
-            Layer::High if inputs.target <= high && inputs.loss_based <= high => Layer::Low,
-            Layer::High => Layer::High,
-            Layer::Low if inputs.target > high => Layer::High,
+            Layer::High => {
+                if self.starved_for(now, starved, DROP_PATIENCE) {
+                    Layer::Low
+                } else {
+                    Layer::High
+                }
+            }
+            Layer::Low if inputs.capacity > high && arrives(RAISE_DELIVERY) => Layer::High,
             Layer::Low => Layer::Low,
         };
         if wanted == self.level {
@@ -159,6 +187,7 @@ impl ScreenLevel {
         }
         self.level = wanted;
         self.last_change = Some(now);
+        self.starved_since = None;
         self.backoff = (self.backoff + self.backoff / 2).min(MAX_BACKOFF);
         wanted
     }
@@ -208,11 +237,28 @@ impl StallWatch {
 mod tests {
     use super::*;
 
-    fn inputs(target: f64) -> ScreenInputs {
+    /// A path that can carry `capacity` and delivers everything.
+    fn inputs(capacity: f64) -> ScreenInputs {
         ScreenInputs {
-            target,
-            loss_based: target,
+            capacity,
+            delivery: Some(1.0),
             high_rate: Some(1_000_000),
+        }
+    }
+
+    /// A path that can carry the large layer (1 Mbit/s here) and delivers `delivery` of it.
+    fn delivering(delivery: f64) -> ScreenInputs {
+        ScreenInputs {
+            delivery: Some(delivery),
+            ..inputs(2_000_000.0)
+        }
+    }
+
+    /// A path that cannot carry the layer and delivers half of what is sent.
+    fn starved() -> ScreenInputs {
+        ScreenInputs {
+            delivery: Some(0.5),
+            ..inputs(100_000.0)
         }
     }
 
@@ -256,10 +302,11 @@ mod tests {
         let t0 = Instant::now();
         level.pin_high(true, t0);
         level.pin_high(false, t0);
+        assert_eq!(level.decide(t0, starved()), Layer::High, "not at once");
         assert_eq!(
-            level.decide(t0, inputs(10_000.0)),
+            level.decide(t0 + DROP_PATIENCE, starved()),
             Layer::Low,
-            "the estimate decides again, and a starved link drops at once"
+            "the estimate decides again, and a starved link drops"
         );
     }
 
@@ -283,39 +330,31 @@ mod tests {
     fn an_unmeasured_layer_is_assumed_to_need_its_nominal_rate() {
         let t = Instant::now();
         let mut s = ScreenLevel::new();
-        let unmeasured = |target| ScreenInputs {
-            target,
-            loss_based: target,
+        let unmeasured = |capacity| ScreenInputs {
             high_rate: None,
+            ..inputs(capacity)
         };
         assert_eq!(s.decide(t, unmeasured(1_500_000.0)), Layer::Low);
         assert_eq!(s.decide(t, unmeasured(2_400_000.0)), Layer::High);
     }
 
     #[test]
-    fn moving_down_is_immediate_and_moving_up_waits_out_the_backoff() {
+    fn moving_down_waits_out_the_patience_and_moving_up_the_backoff() {
         let t = Instant::now();
+        let at = |s: u64| t + Duration::from_secs(s);
         let mut s = ScreenLevel::new();
         assert_eq!(s.decide(t, inputs(2_000_000.0)), Layer::High);
         assert_eq!(
-            s.decide(t + Duration::from_secs(1), inputs(200_000.0)),
-            Layer::Low,
-            "down at once"
+            s.decide(at(1), starved()),
+            Layer::High,
+            "a moment of it is not enough"
         );
+        assert_eq!(s.decide(at(3), starved()), Layer::Low, "down once it lasts");
         // Bandwidth is back, but the last change was a second ago.
-        assert_eq!(
-            s.decide(t + Duration::from_secs(2), inputs(2_000_000.0)),
-            Layer::Low
-        );
+        assert_eq!(s.decide(at(4), inputs(2_000_000.0)), Layer::Low);
         // Each change lengthens the backoff by half: 10 s, 15 s after the first, 22.5 s after the drop.
-        assert_eq!(
-            s.decide(t + Duration::from_secs(20), inputs(2_000_000.0)),
-            Layer::Low
-        );
-        assert_eq!(
-            s.decide(t + Duration::from_secs(24), inputs(2_000_000.0)),
-            Layer::High
-        );
+        assert_eq!(s.decide(at(22), inputs(2_000_000.0)), Layer::Low);
+        assert_eq!(s.decide(at(26), inputs(2_000_000.0)), Layer::High);
     }
 
     #[test]
@@ -325,7 +364,7 @@ mod tests {
         let mut gaps = vec![];
         let mut last_up = None;
         for _ in 0..5 {
-            // Wait for the upgrade, then drop again right away.
+            // Wait for the upgrade, then be starved until it is taken away again.
             while s.decide(t, inputs(2_000_000.0)) != Layer::High {
                 t += Duration::from_secs(1);
             }
@@ -333,8 +372,9 @@ mod tests {
                 gaps.push(t.duration_since(prev));
             }
             last_up = Some(t);
-            t += Duration::from_secs(1);
-            assert_eq!(s.decide(t, inputs(100_000.0)), Layer::Low);
+            while s.decide(t, starved()) != Layer::Low {
+                t += Duration::from_secs(1);
+            }
         }
         assert!(gaps.windows(2).all(|w| w[1] >= w[0]), "{gaps:?}");
         assert!(gaps.last().unwrap() > &Duration::from_secs(20), "{gaps:?}");
@@ -345,12 +385,84 @@ mod tests {
         let t = Instant::now();
         let mut s = ScreenLevel::new();
         s.decide(t, inputs(2_000_000.0));
+        // The path's delay says it cannot carry the layer, and everything arrives.
+        let dip = inputs(300_000.0);
+        for secs in 1..30 {
+            assert_eq!(s.decide(t + Duration::from_secs(secs), dip), Layer::High);
+        }
+    }
+
+    #[test]
+    fn a_dip_while_packets_go_missing_drops_the_large_layer_once_it_lasts() {
+        let t = Instant::now();
+        let at = |s: u64| t + Duration::from_secs(s);
+        let mut s = ScreenLevel::new();
+        s.decide(t, inputs(2_000_000.0));
         let dip = ScreenInputs {
-            target: 300_000.0,
-            loss_based: 2_000_000.0,
-            high_rate: Some(1_000_000),
+            delivery: Some(0.9),
+            ..inputs(300_000.0)
         };
-        assert_eq!(s.decide(t + Duration::from_secs(1), dip), Layer::High);
+        assert_eq!(s.decide(at(1), dip), Layer::High);
+        // It ends before the patience: nothing is remembered.
+        assert_eq!(s.decide(at(2), inputs(2_000_000.0)), Layer::High);
+        assert_eq!(s.decide(at(3), dip), Layer::High);
+        assert_eq!(s.decide(at(5), dip), Layer::Low);
+    }
+
+    #[test]
+    fn a_path_that_loses_a_few_per_cent_at_random_gets_the_large_layer_and_keeps_it() {
+        let t = Instant::now();
+        let mut s = ScreenLevel::new();
+        let lossy = delivering(0.95);
+        assert_eq!(s.decide(t, lossy), Layer::High);
+        for secs in 1..60 {
+            assert_eq!(s.decide(t + Duration::from_secs(secs), lossy), Layer::High);
+        }
+    }
+
+    #[test]
+    fn a_path_that_loses_more_than_a_tenth_is_not_given_the_large_layer() {
+        let t = Instant::now();
+        let mut s = ScreenLevel::new();
+        for secs in 0..60 {
+            assert_eq!(
+                s.decide(t + Duration::from_secs(secs), delivering(0.85)),
+                Layer::Low
+            );
+        }
+    }
+
+    #[test]
+    fn a_large_layer_that_does_not_arrive_is_taken_away_whatever_the_estimate_says() {
+        let t = Instant::now();
+        let at = |s: u64| t + Duration::from_secs(s);
+        let mut s = ScreenLevel::new();
+        s.decide(t, inputs(2_000_000.0));
+        // The estimate still climbs, but a third of what is sent is lost.
+        assert_eq!(s.decide(at(1), delivering(0.6)), Layer::High);
+        assert_eq!(s.decide(at(3), delivering(0.6)), Layer::Low);
+    }
+
+    #[test]
+    fn without_feedback_to_say_what_arrives_the_estimate_decides() {
+        let t = Instant::now();
+        let mut s = ScreenLevel::new();
+        let unknown = ScreenInputs {
+            delivery: None,
+            ..inputs(2_000_000.0)
+        };
+        assert_eq!(s.decide(t, unknown), Layer::High);
+        let dip = ScreenInputs {
+            delivery: None,
+            ..inputs(100_000.0)
+        };
+        for secs in 1..30 {
+            assert_eq!(
+                s.decide(t + Duration::from_secs(secs), dip),
+                Layer::High,
+                "nothing says the layer is not arriving"
+            );
+        }
     }
 
     #[test]
@@ -358,9 +470,10 @@ mod tests {
         let t = Instant::now();
         let mut s = ScreenLevel::new();
         s.decide(t, inputs(2_000_000.0));
-        s.decide(t, inputs(100_000.0));
+        s.decide(t + Duration::from_secs(1), starved());
+        s.decide(t + Duration::from_secs(3), starved());
         assert!(s.backoff > INITIAL_BACKOFF);
-        s.decide(t + Duration::from_secs(600), inputs(100_000.0));
+        s.decide(t + Duration::from_secs(600), starved());
         assert_eq!(s.backoff, INITIAL_BACKOFF);
     }
 

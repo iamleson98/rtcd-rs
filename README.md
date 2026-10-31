@@ -67,6 +67,19 @@ counter; the host figures average the last five seconds):
 What is spent on the wire: only video takes part in the bandwidth estimate, so voice packets carry no
 transport-wide sequence number (8 bytes on a 65-byte packet, both ways) and nobody reports on them.
 
+## Which layer of a shared screen a viewer gets
+
+A viewer starts on the small layer and is moved to the large one (`layers.rs`) once the delay half of its
+bandwidth estimate says its path can carry the large layer's measured rate and at least 90% of the video
+sent to it is reported as arrived (`bwe.rs` counts it over the last three seconds). The loss half of the
+estimate is not used: it grows only while under 2% of the packets are lost, so on a path that loses a few
+per cent at random it stays at its floor for good, and the viewer never got the large layer. Lost packets
+are sent again on request, so what such a path leaves missing is next to nothing (tested: under 0.1% at 15%
+loss). The large layer is a trial that is judged by what arrives: a viewer is moved back to the small one
+when less than 75% of what is sent arrives, or the delay says the path cannot carry it while packets also go
+missing, for two seconds; each change lengthens the wait before the next try (10 s up to 5 min). A path
+that loses more than a tenth of the packets stays on the small layer.
+
 ## Running several instances
 
 `GET /system` returns `cpu_load` (the Go service's key, the busy share of all CPUs over the last
