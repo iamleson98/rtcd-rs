@@ -49,11 +49,19 @@ pub const VIDEO_HOLD: Duration = Duration::from_secs(30);
 pub const CAMERA_HOLD: Duration = Duration::from_secs(5);
 /// How long after a person turns a camera or share off the frames still arriving are dropped.
 const TURN_OFF_TAIL: Duration = Duration::from_millis(1500);
-/// Each recorded camera and screen is asked for a keyframe this often: a seek decodes from the
-/// keyframe before the target, and browsers otherwise send one only every few minutes.
-pub const KEYFRAME_EVERY: Duration = Duration::from_secs(20);
+/// No more than this passes between two keyframes of a recorded camera or screen: a sender that
+/// sent none for this long is asked for one. A player seeks by decoding from the keyframe before
+/// the target, so the time since it is what a seek costs: a second of a 1920x1200 screen is about
+/// 280 KB to fetch and 50 ms to decode. Browsers send one only every few minutes by themselves;
+/// the keyframes a viewer's loss or join brings count too, so a call that has them gets no more.
+/// Every keyframe asked for reaches the live viewers of that layer as well, which is why this is
+/// not shorter.
+pub const KEYFRAME_EVERY: Duration = Duration::from_secs(10);
 /// While a file waits for its first keyframe, or after a loss, the sender is asked this often.
 const KEYFRAME_RETRY: Duration = Duration::from_secs(1);
+/// A regular request that brought no keyframe is made again after this: longer than the answer
+/// takes to be written (a round trip to the sender, and the wait for a late packet before it).
+const KEYFRAME_UNANSWERED: Duration = Duration::from_secs(3);
 /// A keyframe of another size than the open file's is a new picture size only if the sender
 /// stays at it: encoders step the resolution down and back within a fraction of a second, and a
 /// file for each step would make the player load a new file for one frame.
@@ -236,6 +244,8 @@ pub struct StreamRecorder {
     /// Since when the keyframes seen are of another size than the open file's.
     size_since: Option<Instant>,
     last_ask: Option<Instant>,
+    /// When the last keyframe was written.
+    last_key: Option<Instant>,
     /// Frames before this are the tail of a stream the sender has just turned off.
     ignore_until: Option<Instant>,
     /// A file is closed and the next one opened once it has lasted this long, so that files can
@@ -301,6 +311,7 @@ impl StreamRecorder {
             need_key: false,
             size_since: None,
             last_ask: None,
+            last_key: None,
             ignore_until: None,
             rotate_every: None,
             lost: 0,
@@ -358,8 +369,9 @@ impl StreamRecorder {
     }
 
     /// Whether to ask a video sender for a keyframe now: often while a file waits for its first
-    /// one or a loss broke the picture, and regularly after that (seeking decodes from the
-    /// keyframe before the target). A sender that sends nothing is not asked.
+    /// one or a loss broke the picture, and once [`KEYFRAME_EVERY`] has passed since the last one
+    /// written (seeking decodes from the keyframe before the target). A sender that sends nothing
+    /// is not asked.
     fn want_keyframe(&mut self, now: Instant) -> bool {
         if !self.info.video {
             return false;
@@ -367,15 +379,18 @@ impl StreamRecorder {
         let active = self
             .last_packet
             .is_some_and(|t| now.saturating_duration_since(t) < SEGMENT_GAP);
-        let wait = if self.seg.is_none() || self.need_key {
-            KEYFRAME_RETRY
+        let (needed, wait) = if self.seg.is_none() || self.need_key {
+            (true, KEYFRAME_RETRY)
         } else {
-            KEYFRAME_EVERY
+            let overdue = self
+                .last_key
+                .is_none_or(|t| now.saturating_duration_since(t) >= KEYFRAME_EVERY);
+            (overdue, KEYFRAME_UNANSWERED)
         };
         let due = self
             .last_ask
             .is_none_or(|t| now.saturating_duration_since(t) >= wait);
-        if active && due {
+        if active && needed && due {
             self.last_ask = Some(now);
             return true;
         }
@@ -471,6 +486,9 @@ impl StreamRecorder {
                 self.open_failed(&e);
                 return;
             }
+        }
+        if key {
+            self.last_key = Some(arrived);
         }
         self.write(ts, key, data, true);
     }
@@ -1086,18 +1104,76 @@ mod tests {
         assert_eq!(data[first_block.start + 3], 0x80, "opens on a keyframe");
     }
 
+    /// Feeds a camera 30 frames a second for `secs`, a keyframe where `key` says or right after an
+    /// ask that `answer` says is answered; returns the seconds at which the sender was asked.
+    fn keyframe_asks(
+        tag: &str,
+        secs: u32,
+        key: impl Fn(u32) -> bool,
+        answer: impl Fn(u32) -> bool,
+    ) -> Vec<f64> {
+        let (rec, start) = setup(tag, u64::MAX);
+        let mut s = camera(&rec);
+        let mut asked = Vec::new();
+        let mut owed = false;
+        for i in 0..secs * 30 {
+            let now = start + Duration::from_millis(1000 * u64::from(i) / 30);
+            let k = key(i) || std::mem::take(&mut owed);
+            let wants = s.packet(vp8_frame(now, i as u16, i * 3000, k)) | s.tick(now);
+            if wants {
+                asked.push(f64::from(i) / 30.0);
+                owed = answer(i);
+            }
+        }
+        s.finish(start + Duration::from_secs(u64::from(secs)), "test");
+        asked
+    }
+
+    #[test]
+    fn a_keyframe_is_asked_for_once_none_came_for_the_longest_gap() {
+        // Only the first frame is a keyframe; every ask is answered at the next frame.
+        let asked = keyframe_asks("cadence", 35, |i| i == 0, |_| true);
+        let every = KEYFRAME_EVERY.as_secs_f64();
+        assert_eq!(asked.len(), 3, "{asked:?}");
+        for (n, at) in asked.iter().enumerate() {
+            let want = every * (n + 1) as f64;
+            assert!((at - want).abs() < 0.1, "ask {n} at {at} s, not {want} s");
+        }
+    }
+
+    #[test]
+    fn keyframes_the_sender_sends_anyway_leave_nothing_to_ask() {
+        // A keyframe every 5 s (a viewer's losses ask for them): the recording adds none.
+        let asked = keyframe_asks("anyway", 35, |i| i % 150 == 0, |_| false);
+        assert!(asked.is_empty(), "{asked:?}");
+    }
+
+    #[test]
+    fn a_keyframe_asked_for_and_not_sent_is_asked_for_again() {
+        let asked = keyframe_asks("unanswered", 18, |i| i == 0, |_| false);
+        let every = KEYFRAME_EVERY.as_secs_f64();
+        let again = KEYFRAME_UNANSWERED.as_secs_f64();
+        assert_eq!(asked.len(), 3, "{asked:?}");
+        for (at, want) in asked
+            .iter()
+            .zip([every, every + again, every + 2.0 * again])
+        {
+            assert!((at - want).abs() < 0.1, "asked at {at} s, not {want} s");
+        }
+    }
+
     #[test]
     fn a_lost_video_packet_freezes_the_picture_until_the_next_keyframe() {
         let (rec, start) = setup("loss", u64::MAX);
         let mut s = camera(&rec);
         let mut asked = Vec::new();
         for i in 0..120u32 {
-            // Frame 20 never arrives. Keyframes at 0 and 40.
+            // Frame 20 never arrives. Keyframes at 0 and 60: the gap is given up before the second.
             if i == 20 {
                 continue;
             }
             let now = start + Duration::from_millis(33 * u64::from(i));
-            if s.packet(vp8_frame(now, i as u16, i * 3000, i % 40 == 0)) {
+            if s.packet(vp8_frame(now, i as u16, i * 3000, i % 60 == 0)) {
                 asked.push(i);
             }
             s.tick(now);
@@ -1110,14 +1186,14 @@ mod tests {
             "{files:?}: the loss does not split the file"
         );
         let times = block_times(&files[0].path);
-        // Frames 0..19 are written; 21..39 are not (they depend on the lost one); 40.. are.
+        // Frames 0..19 are written; 21..59 are not (they depend on the lost one); 60.. are.
         let ms = |frame: i64| frame * 3000 / 90;
         assert_eq!(times.iter().filter(|t| **t < ms(20)).count(), 20);
         assert!(
-            times.iter().all(|t| *t < ms(20) || *t >= ms(40)),
+            times.iter().all(|t| *t < ms(20) || *t >= ms(60)),
             "{times:?}"
         );
-        assert!(times.contains(&ms(40)));
+        assert!(times.contains(&ms(60)));
         assert!(
             asked.iter().any(|i| *i > 20),
             "the sender was asked for a keyframe once the packet was given up: {asked:?}"
