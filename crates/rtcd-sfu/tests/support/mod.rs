@@ -72,6 +72,31 @@ pub enum Layer {
     High = 1,
 }
 
+/// What the network between the SFU and one browser does: packets from the SFU can be lost, take
+/// time, and queue behind a link of limited rate; what the browser sends (its feedback among it)
+/// takes the same time.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Path {
+    /// Fraction of the SFU's packets to the browser that are lost.
+    pub loss: f64,
+    /// Time a packet takes each way.
+    pub delay: Duration,
+    /// The downlink's rate, bits per second; unlimited when `None`.
+    pub rate_bps: Option<u64>,
+    /// A packet that would wait longer than this for the link is dropped.
+    pub queue: Duration,
+}
+
+/// A datagram on its way, with the time it arrives.
+struct InFlight {
+    due: Instant,
+    /// The browser it goes to or comes from.
+    browser: usize,
+    /// For the browser, the address it was sent from.
+    local: SocketAddr,
+    data: BytesMut,
+}
+
 /// An emulated browser.
 pub struct Browser {
     pub name: String,
@@ -110,6 +135,10 @@ pub struct Browser {
     pub datagrams_in: usize,
     /// Datagrams to and from this browser are lost.
     pub unreachable: bool,
+    /// What the network does to this browser's traffic, if anything.
+    pub path: Option<Path>,
+    /// When the downlink has sent everything queued on it.
+    link_free: Instant,
     pub connected: bool,
     pub signaling_conflicts: usize,
     /// Descriptions the SFU sent that the browser has not applied yet (it was mid-offer).
@@ -149,6 +178,12 @@ pub struct World {
     pub group: String,
     /// Sends from the engine to the browsers at this address are lost while set.
     pub blackhole: bool,
+    /// Datagrams on their way to browsers, and to the engine, over a [`Path`].
+    to_browsers: Vec<InFlight>,
+    to_engine: Vec<InFlight>,
+    rng: u64,
+    /// Bytes added to the payload of every video packet, so that frames have the size of real ones.
+    pub payload_pad: usize,
     /// Time spent inside the engine (datagrams in, timeouts), for the cost tests.
     pub engine_spent: Duration,
     /// Called just before the world calls into the engine, with `"datagram"` or `"timeout"` and
@@ -229,6 +264,10 @@ impl World {
             next_browser: 1,
             group: "group".into(),
             blackhole: false,
+            to_browsers: Vec::new(),
+            to_engine: Vec::new(),
+            rng: 0x9e37_79b9_7f4a_7c15,
+            payload_pad: 0,
             engine_spent: Duration::ZERO,
             around_engine: |_, _| {},
         }
@@ -381,6 +420,8 @@ impl World {
             read_errors: vec![],
             datagrams_in: 0,
             unreachable: false,
+            path: None,
+            link_free: self.now,
             connected: false,
             signaling_conflicts: 0,
             remote_candidates_seen: 0,
@@ -509,6 +550,8 @@ impl World {
     fn settle(&mut self) {
         for _ in 0..100_000 {
             let mut moved = false;
+            // What has come over a path by now.
+            moved |= self.deliver_due();
             // The engine's output to the browsers.
             while let Some(t) = self.engine.poll_transmit() {
                 moved = true;
@@ -519,24 +562,16 @@ impl World {
                 if self.blackhole {
                     continue;
                 }
-                if let Some(b) = self
+                let Some(i) = self
                     .browsers
-                    .iter_mut()
-                    .find(|b| b.addr == t.peer && !b.unreachable)
-                {
-                    b.datagrams_in += 1;
-                    if let Err(e) = b.pc.handle_read(TaggedBytesMut {
-                        now: self.now,
-                        transport: TransportContext {
-                            local_addr: b.addr,
-                            peer_addr: t.local,
-                            ecn: None,
-                            transport_protocol: TransportProtocol::UDP,
-                        },
-                        message: t.data,
-                    }) {
-                        b.read_errors.push(e.to_string());
-                    }
+                    .iter()
+                    .position(|b| b.addr == t.peer && !b.unreachable)
+                else {
+                    continue;
+                };
+                match self.browsers[i].path {
+                    None => self.read_by_browser(i, t.local, t.data),
+                    Some(path) => self.send_down(i, path, t.local, t.data),
                 }
             }
             // The engine's reports to the service, which relays them to the right browser.
@@ -553,6 +588,103 @@ impl World {
             }
         }
         panic!("the world never went quiet");
+    }
+
+    /// Browser `i` reads a datagram the SFU sent from `from`.
+    fn read_by_browser(&mut self, i: usize, from: SocketAddr, data: BytesMut) {
+        let now = self.now;
+        let b = &mut self.browsers[i];
+        b.datagrams_in += 1;
+        if let Err(e) = b.pc.handle_read(TaggedBytesMut {
+            now,
+            transport: TransportContext {
+                local_addr: b.addr,
+                peer_addr: from,
+                ecn: None,
+                transport_protocol: TransportProtocol::UDP,
+            },
+            message: data,
+        }) {
+            b.read_errors.push(e.to_string());
+        }
+    }
+
+    /// The engine reads a datagram that browser `i` sent.
+    fn engine_reads(&mut self, i: usize, data: BytesMut) {
+        let from = self.browsers[i].addr;
+        let started = Instant::now();
+        (self.around_engine)("datagram", true);
+        self.engine
+            .handle_datagram(self.now, Proto::Udp, self.server, from, data);
+        (self.around_engine)("datagram", false);
+        self.engine_spent += started.elapsed();
+    }
+
+    /// A datagram from the SFU enters the downlink of browser `i`: it may be lost, waits for the
+    /// link's rate (and is dropped when it would wait too long), and arrives a delay later.
+    fn send_down(&mut self, i: usize, path: Path, from: SocketAddr, data: BytesMut) {
+        if self.chance(path.loss) {
+            return;
+        }
+        let now = self.now;
+        let b = &mut self.browsers[i];
+        let mut leaves = now;
+        if let Some(bps) = path.rate_bps {
+            let start = b.link_free.max(now);
+            if start.saturating_duration_since(now) > path.queue {
+                return;
+            }
+            b.link_free = start + Duration::from_secs_f64(data.len() as f64 * 8.0 / bps as f64);
+            leaves = b.link_free;
+        }
+        self.to_browsers.push(InFlight {
+            due: leaves + path.delay,
+            browser: i,
+            local: from,
+            data,
+        });
+    }
+
+    /// Delivers the datagrams whose time has come, in both directions.
+    fn deliver_due(&mut self) -> bool {
+        let now = self.now;
+        let mut moved = false;
+        let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.to_browsers)
+            .into_iter()
+            .partition(|f| f.due <= now);
+        self.to_browsers = later;
+        for f in ready {
+            moved = true;
+            self.read_by_browser(f.browser, f.local, f.data);
+        }
+        let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.to_engine)
+            .into_iter()
+            .partition(|f| f.due <= now);
+        self.to_engine = later;
+        for f in ready {
+            moved = true;
+            self.engine_reads(f.browser, f.data);
+        }
+        moved
+    }
+
+    /// True with probability `p`, the same way on every run.
+    fn chance(&mut self, p: f64) -> bool {
+        if p <= 0.0 {
+            return false;
+        }
+        let mut x = self.rng;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng = x;
+        let r = x.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11;
+        (r as f64) / ((1u64 << 53) as f64) < p
+    }
+
+    /// Puts browser `i` behind a network that does what `path` says.
+    pub fn set_path(&mut self, i: usize, path: Path) {
+        self.browsers[i].path = Some(path);
     }
 
     fn on_engine_event(&mut self, e: Event) {
@@ -636,16 +768,21 @@ impl World {
         let now = self.now;
         // What the browser sends the SFU.
         loop {
-            let b = &mut self.browsers[i];
-            let Some(w) = b.pc.poll_write() else { break };
+            let Some(w) = self.browsers[i].pc.poll_write() else {
+                break;
+            };
             moved = true;
+            let b = &self.browsers[i];
             if w.transport.peer_addr == self.server && !self.blackhole && !b.unreachable {
-                let started = Instant::now();
-                (self.around_engine)("datagram", true);
-                self.engine
-                    .handle_datagram(now, Proto::Udp, self.server, b.addr, w.message);
-                (self.around_engine)("datagram", false);
-                self.engine_spent += started.elapsed();
+                match b.path {
+                    None => self.engine_reads(i, w.message),
+                    Some(path) => self.to_engine.push(InFlight {
+                        due: now + path.delay,
+                        browser: i,
+                        local: b.addr,
+                        data: w.message,
+                    }),
+                }
             }
         }
         loop {
@@ -765,6 +902,9 @@ impl World {
 
     fn next_wake(&mut self) -> Option<Instant> {
         let mut next = self.engine.poll_timeout();
+        for f in self.to_browsers.iter().chain(&self.to_engine) {
+            next = Some(next.map_or(f.due, |n| n.min(f.due)));
+        }
         for b in &mut self.browsers {
             if let Some(t) = b.pc.poll_timeout() {
                 next = Some(next.map_or(t, |n| n.min(t)));
@@ -831,6 +971,7 @@ impl World {
         lost: Option<usize>,
     ) {
         let now = self.now;
+        let pad = self.payload_pad;
         let b = &mut self.browsers[i];
         let v = if screen {
             b.screen.as_mut()
@@ -871,6 +1012,7 @@ impl World {
             if first {
                 payload.push(if key { 0x00 } else { 0x01 });
             }
+            payload.resize(payload.len() + pad, 0xcc);
             payload.extend_from_slice(&[
                 layer as u8 + 1,
                 0xaa,
@@ -966,6 +1108,39 @@ impl World {
             }
             self.run_for(Duration::from_millis(33));
         }
+    }
+
+    /// Streams the screen share of browser `i` for `seconds` as a browser sends one: the small
+    /// layer at 5 frames a second and the large at 15, each frame of the size that makes up the
+    /// layer's rate (`low_bps`, `high_bps`) in packets of about a kilobyte, with a keyframe four
+    /// times that size at the start, every ten seconds, and whenever the SFU asks for one.
+    pub fn stream_screen(&mut self, i: usize, seconds: f64, low_bps: u64, high_bps: u64) {
+        let pad = std::mem::replace(&mut self.payload_pad, 1000);
+        let packets = |bps: u64, fps: u64| (bps / 8 / fps / 1050).max(1) as usize;
+        // The layer, a frame every this many ticks, and the packets of a frame.
+        let layers = [
+            (Layer::Low, 6, packets(low_bps, 5)),
+            (Layer::High, 2, packets(high_bps, 15)),
+        ];
+        let mut last_key = [None::<usize>; 2];
+        for tick in 0..(seconds * 30.0) as usize {
+            for (n, &(layer, every, size)) in layers.iter().enumerate() {
+                if tick % every != 0 {
+                    continue;
+                }
+                let ssrc =
+                    self.browsers[i].screen.as_ref().expect("a screen").ssrcs[layer as usize];
+                let asked = self.browsers[i].keyframe_requests.contains(&ssrc);
+                self.browsers[i].keyframe_requests.retain(|&r| r != ssrc);
+                let key = asked || last_key[n].is_none_or(|t| tick - t >= 300);
+                if key {
+                    last_key[n] = Some(tick);
+                }
+                self.send_video(i, true, layer, key, if key { size * 4 } else { size });
+            }
+            self.run_for(Duration::from_millis(33));
+        }
+        self.payload_pad = pad;
     }
 
     /// Browser `i` asks for a keyframe of the stream received with `ssrc`.

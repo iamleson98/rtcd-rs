@@ -213,6 +213,33 @@ fn the_large_layer_of_a_camera_and_of_a_screen_is_recorded() {
     assert_eq!(rx.shared().dropped(), 0);
 }
 
+#[test]
+fn a_packet_that_reaches_the_sfu_late_is_recorded() {
+    // Lost on the sender's uplink and sent again after a NACK from far away: it comes behind the
+    // packets that followed it, and must still reach the writer, which puts it back in its place.
+    let mut w = World::new();
+    let a = w.join("alice", "call1");
+    w.share_screen(a);
+    let mut rx = start(&mut w, "call1", "rec1", 4096);
+    w.stream_video(a, true, 0.5, 30, &BOTH);
+    drain(&mut rx);
+    w.send_video_losing(a, true, Layer::High, false, 4, Some(2));
+    w.run_for(Duration::from_millis(600));
+    w.send_video(a, true, Layer::High, false, 2);
+    w.send_held_back(a, true);
+    w.run_for(Duration::from_millis(100));
+    let mut seqs: Vec<u16> = packets(&drain(&mut rx)).iter().map(|p| p.1).collect();
+    assert_eq!(
+        seqs.len(),
+        6,
+        "every packet of both frames reached the writer"
+    );
+    let first = *seqs.iter().min().unwrap();
+    seqs.sort_unstable();
+    assert_eq!(seqs, (first..first + 6).collect::<Vec<_>>());
+    assert_eq!(rx.shared().dropped(), 0);
+}
+
 /// The layer each packet of the recorded video streams came from, in order, with the stream.
 fn layers_recorded(items: &[RecordItem]) -> Vec<(u32, u8)> {
     items

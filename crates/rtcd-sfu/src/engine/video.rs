@@ -395,8 +395,8 @@ impl Engine {
         let after = s.down.screen_level.decide(
             now,
             ScreenInputs {
-                target: estimate.target,
-                loss_based: estimate.loss_based,
+                capacity: estimate.delay_based,
+                delivery: estimate.delivery,
                 high_rate,
             },
         );
