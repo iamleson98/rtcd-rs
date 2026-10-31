@@ -42,7 +42,7 @@ What the receivers experience, read from the connection statistics of each sessi
 | metric | what it counts |
 |---|---|
 | `rtcd_rtc_receiver_feedback_total{type}` | retransmission (`nack`), keyframe (`pli`) and full intra (`fir`) requests receivers sent |
-| `rtcd_rtc_retransmitted_packets_total`, `_bytes_total` | what was sent again over RTX because they asked (receivers that negotiate RTX) |
+| `rtcd_rtc_retransmitted_packets_total`, `_bytes_total` | what was sent again over a separate RTX stream because they asked. rtcd offers no RTX: it answers a `nack` by sending the packet again on its own stream, which the connection statistics cannot tell from a first send, so these stay 0; the `nack` count above shows how often receivers ask |
 | `rtcd_rtc_receiver_loss_ratio`, `rtcd_rtc_receiver_rtt` | histograms of the loss fraction and round trip time receivers report |
 | `rtcd_rtc_bandwidth_estimate_bps` | histogram of the receivers' bandwidth estimates |
 | `rtcd_rtc_screen_layer_seconds_total{layer}` | seconds receivers spent on the small and the large layer of a shared screen (`rate()` is the number of receivers on each) |
