@@ -58,12 +58,17 @@ const KEYFRAME_RETRY: Duration = Duration::from_secs(1);
 /// stays at it: encoders step the resolution down and back within a fraction of a second, and a
 /// file for each step would make the player load a new file for one frame.
 const SIZE_SETTLE: Duration = Duration::from_secs(1);
-/// How long a missing video packet is waited for (the sender's answer to a NACK), and how many
-/// packets are held behind the gap: a keyframe is dozens of packets, a voice frame one.
-const VIDEO_WAIT: Duration = Duration::from_millis(300);
-const VIDEO_HELD: usize = 256;
-const AUDIO_WAIT: Duration = Duration::from_millis(120);
-const AUDIO_HELD: usize = 32;
+/// How long a missing packet is waited for (the sender's answer to a NACK, which the SFU repeats
+/// every 100 ms), and how many packets are held behind the gap. A recording is not live, so it
+/// waits as long as a sender keeps what it sent (a browser about a second): a sender a long way
+/// off answers a NACK after more than a round trip of 230 ms, and a recording that gave up sooner
+/// would have a hole in it for every packet lost on the way, in the voice as much as in the
+/// picture. The ring must hold what arrives meanwhile: a screen sends a few hundred packets a
+/// second, a voice 50.
+const VIDEO_WAIT: Duration = Duration::from_millis(1200);
+const VIDEO_HELD: usize = 1024;
+const AUDIO_WAIT: Duration = Duration::from_millis(1200);
+const AUDIO_HELD: usize = 128;
 
 /// Kinds of recorded files (the manifest's vocabulary, shared with the server and the player).
 pub const VOICE: &str = "voice";
@@ -784,6 +789,51 @@ mod tests {
     }
 
     #[test]
+    fn a_voice_packet_that_comes_late_is_not_lost() {
+        let (rec, start) = setup("vlate", u64::MAX);
+        let mut s = voice(&rec);
+        // Packet 10 comes 800 ms after its time, as the sender's answer to a NACK does from far off.
+        let mut arrivals: Vec<(u16, Duration)> = (0..50u16)
+            .map(|i| (i, Duration::from_millis(20 * u64::from(i))))
+            .collect();
+        arrivals[10].1 += Duration::from_millis(800);
+        arrivals.sort_by_key(|(_, at)| *at);
+        for (i, at) in arrivals {
+            s.packet(opus(start + at, 100 + i, 960 * u32::from(i), &[0xfc, 1, 2]));
+            s.tick(start + at);
+        }
+        s.finish(start + Duration::from_secs(3), "test");
+        let files = rec.files();
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(
+            block_times(&files[0].path),
+            (0..50).map(|i| i * 20).collect::<Vec<_>>(),
+            "every 20 ms frame is in the file"
+        );
+        assert_eq!(s.lost, 0);
+    }
+
+    #[test]
+    fn a_voice_packet_that_never_comes_is_given_up_and_bridged() {
+        let (rec, start) = setup("vgone", u64::MAX);
+        let mut s = voice(&rec);
+        for i in (0..150u16).filter(|i| *i != 10) {
+            let at = start + Duration::from_millis(20 * u64::from(i));
+            s.packet(opus(at, 100 + i, 960 * u32::from(i), &[0xfc, 1, 2]));
+            s.tick(at);
+        }
+        s.finish(start + Duration::from_secs(4), "test");
+        assert_eq!(s.lost, 1);
+        let files = rec.files();
+        assert_eq!(files.len(), 1, "{files:?}");
+        let times = block_times(&files[0].path);
+        assert!(
+            times.windows(2).all(|w| w[1] - w[0] <= 40),
+            "a hole of one frame is bridged: {times:?}"
+        );
+    }
+
+    #[test]
     fn voice_is_split_where_the_microphone_was_muted() {
         let (rec, start) = setup("voice", u64::MAX);
         let mut s = voice(&rec);
@@ -1041,7 +1091,7 @@ mod tests {
         let (rec, start) = setup("loss", u64::MAX);
         let mut s = camera(&rec);
         let mut asked = Vec::new();
-        for i in 0..60u32 {
+        for i in 0..120u32 {
             // Frame 20 never arrives. Keyframes at 0 and 40.
             if i == 20 {
                 continue;
@@ -1052,7 +1102,7 @@ mod tests {
             }
             s.tick(now);
         }
-        s.finish(start + Duration::from_secs(5), "test");
+        s.finish(start + Duration::from_secs(6), "test");
         let files = rec.files();
         assert_eq!(
             files.len(),
@@ -1069,8 +1119,40 @@ mod tests {
         );
         assert!(times.contains(&ms(40)));
         assert!(
-            asked.iter().any(|i| (21..40).contains(i)),
-            "the sender was asked for a keyframe after the loss: {asked:?}"
+            asked.iter().any(|i| *i > 20),
+            "the sender was asked for a keyframe once the packet was given up: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn a_video_packet_that_comes_late_is_not_lost() {
+        let (rec, start) = setup("vidlate", u64::MAX);
+        let mut s = camera(&rec);
+        // Frame 20 comes 800 ms after its time, as the sender's answer to a NACK does from far off.
+        let mut arrivals: Vec<(u32, Duration)> = (0..60u32)
+            .map(|i| (i, Duration::from_millis(33 * u64::from(i))))
+            .collect();
+        arrivals[20].1 += Duration::from_millis(800);
+        arrivals.sort_by_key(|(_, at)| *at);
+        let mut asked = 0;
+        for (i, at) in arrivals {
+            let now = start + at;
+            asked += usize::from(s.packet(vp8_frame(now, i as u16, i * 3000, i == 0)));
+            s.tick(now);
+        }
+        s.finish(start + Duration::from_secs(5), "test");
+        let files = rec.files();
+        assert_eq!(files.len(), 1, "{files:?}");
+        let ms = |frame: i64| frame * 3000 / 90;
+        assert_eq!(
+            block_times(&files[0].path),
+            (0..60).map(ms).collect::<Vec<_>>(),
+            "every frame is in the file, in order"
+        );
+        assert_eq!(s.lost, 0);
+        assert!(
+            asked <= 1,
+            "no keyframe was needed after the first: {asked}"
         );
     }
 
