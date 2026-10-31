@@ -79,11 +79,16 @@ impl Rewriter {
                 {
                     self.picture_id_offset = last.wrapping_add(1).wrapping_sub(id);
                 }
+                // The new source starts at a keyframe, a base layer frame of its own: it takes the
+                // next TL0PICIDX. Were it to take the last one, the first base layer frame after it
+                // would read as referring to the old source's last one, and a receiver that has it
+                // before the keyframe (a keyframe is large, and the last of it to arrive) would
+                // decode it against a picture of the other layer.
                 if let (Some(last), Some(d)) =
                     (self.last_tl0, vp8::Descriptor::parse(&first.payload))
                     && let Some(t) = d.tl0_pic_idx
                 {
-                    self.tl0_offset = last.wrapping_sub(t);
+                    self.tl0_offset = last.wrapping_add(1).wrapping_sub(t);
                 }
             }
         }
@@ -197,11 +202,14 @@ mod tests {
         assert_eq!(seq, 1005, "the sequence number carries on");
         assert_eq!(ts, 90_000 + 4 * 3000 + 3000, "and the clock a frame later");
         assert_eq!(pid, 305, "and the picture id");
-        assert_eq!(tl0, 40, "and TL0PICIDX stays where it was");
+        assert_eq!(
+            tl0, 41,
+            "and TL0PICIDX: the keyframe is the next base layer frame"
+        );
 
         let mut next = packet(8, 5_003_000, 10, 200);
         r.rewrite(&mut next);
-        assert_eq!(numbers(&next), (1006, ts + 3000, 306, 40));
+        assert_eq!(numbers(&next), (1006, ts + 3000, 306, 41));
     }
 
     #[test]
@@ -229,7 +237,7 @@ mod tests {
         assert_eq!(seq, 0);
         assert_eq!(ts, (u32::MAX - 1000).wrapping_add(3000));
         assert_eq!(pid, 0);
-        assert_eq!(tl0, 255);
+        assert_eq!(tl0, 0);
     }
 
     #[test]
