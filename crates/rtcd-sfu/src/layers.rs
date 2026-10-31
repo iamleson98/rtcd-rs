@@ -68,8 +68,15 @@ const TRIAL: Duration = Duration::from_secs(3);
 /// ...and one holding less than this carries all of it.
 const QUEUE_LOW: f64 = 0.05;
 /// Less than this share of what is sent arriving is a path that drops what it cannot carry (one
-/// that queues little, or not at all).
+/// that queues little, or not at all)...
 const CONGESTED_DELIVERY: f64 = 0.85;
+/// ...unless nothing stands queued and the narrowest link of the path is known to carry this many
+/// times what is sent: then what was lost is a burst (a wireless hiccup, a router's blip) that
+/// the receiver's requests for packets sent again repair, not a path that carries less than it is
+/// given. A picture that is still sends little, so what the path delivered says nothing of what it
+/// can carry, and cutting the rate to it left the receiver on the lowest rung until the long climb
+/// back.
+const LOSS_ROOM: f64 = 1.5;
 /// The next rung is tried only while this much of what is sent arrives: a path that loses more
 /// than a tenth at random is not given more to lose.
 const RAISE_DELIVERY: f64 = 0.9;
@@ -80,20 +87,20 @@ const HEADROOM: f64 = 0.85;
 const DRAIN_SECONDS: f64 = 3.0;
 const LEAST_SHARE: f64 = 0.25;
 /// ...and nothing more is tried for a while.
-const HOLD: Duration = Duration::from_secs(6);
+const HOLD: Duration = Duration::from_secs(3);
 /// A path that has stayed clear this long on a rung is trusted with a little more each second, up
 /// to twice what it was seen to deliver or the rate of the rung above, whichever is more (a layer
 /// without temporal layers is one step of five times its rate)...
-const CLEAR_FOR: Duration = Duration::from_secs(4);
+const CLEAR_FOR: Duration = Duration::from_secs(2);
 const GROWTH_PER_SECOND: f64 = 0.08;
 const GROWTH_CEILING: f64 = 2.0;
 /// ...and the next rung is tried once that adds up to its rate, and fits in this share of what the
 /// narrowest link of the path carries (when that is known). A rung that brought congestion is not
 /// tried again for a wait that doubles each time, and is forgotten once held without trouble.
 const CAPACITY_SHARE: f64 = 0.85;
-const INITIAL_BACKOFF: Duration = Duration::from_secs(20);
-const MAX_BACKOFF: Duration = Duration::from_secs(300);
-const FORGET_AFTER: Duration = Duration::from_secs(60);
+const INITIAL_BACKOFF: Duration = Duration::from_secs(10);
+const MAX_BACKOFF: Duration = Duration::from_secs(120);
+const FORGET_AFTER: Duration = Duration::from_secs(30);
 
 /// One step of what a receiver can be sent of a screen share: a simulcast layer, and the highest
 /// of its temporal layers sent (`None`: every frame of the layer).
@@ -292,8 +299,10 @@ impl ScreenLevel {
         }
     }
 
-    /// Whether the path carries less than the receiver is sent (see [`QUEUE_HIGH`]).
-    fn congested(&mut self, now: Instant, inputs: &ScreenInputs) -> bool {
+    /// Whether the path carries less than the receiver is sent (see [`QUEUE_HIGH`]). `room`: the
+    /// narrowest link is known to carry far more than is sent (see [`LOSS_ROOM`]), so loss alone,
+    /// with nothing queued, is not congestion.
+    fn congested(&mut self, now: Instant, inputs: &ScreenInputs, room: bool) -> bool {
         let trend = inputs.queue_trend.unwrap_or(0.0);
         if self.trial_until.is_some_and(|t| now < t)
             && inputs.queue.is_some_and(|q| q >= TRIAL_QUEUE)
@@ -303,7 +312,7 @@ impl ScreenLevel {
         }
         let Some(q) = inputs.queue.filter(|&q| q >= QUEUE_HIGH) else {
             self.queued_since = None;
-            return inputs.dropping();
+            return inputs.dropping() && !room;
         };
         let since = *self.queued_since.get_or_insert(now);
         let surging = trend >= QUEUE_SURGING && self.keyframe_grace.is_none_or(|t| now >= t);
@@ -384,7 +393,10 @@ impl ScreenLevel {
             }
         };
         let mut target = current;
-        if self.congested(now, &inputs) {
+        let room = inputs.capacity.is_some_and(|c| {
+            c * CAPACITY_SHARE >= (ladder.rate(current) + inputs.other) * LOSS_ROOM
+        });
+        if self.congested(now, &inputs, room) {
             let carried = inputs.acked.map(|a| a - inputs.other);
             let share = HEADROOM
                 .min(1.0 - inputs.queue.unwrap_or(0.0) / DRAIN_SECONDS)
@@ -738,8 +750,41 @@ mod tests {
         }
         let gaps: Vec<u64> = tries.windows(2).map(|w| w[1] - w[0]).collect();
         assert!(gaps.len() >= 3, "{tries:?}");
-        assert!(gaps.windows(2).all(|g| g[1] > g[0]), "{gaps:?}");
-        assert!(*gaps.last().unwrap() >= 80, "{gaps:?}");
+        // Doubling, until the longest wait.
+        let cap = MAX_BACKOFF.as_secs() + 1;
+        assert!(
+            gaps.windows(2).all(|g| g[1] > g[0] || g[1] == cap),
+            "{gaps:?}"
+        );
+        assert_eq!(*gaps.last().unwrap(), cap, "{gaps:?}");
+    }
+
+    #[test]
+    fn a_burst_of_loss_on_a_path_with_room_is_left_to_the_receivers_repair_requests() {
+        let mut s = ScreenLevel::new();
+        let mut t = Instant::now();
+        let room = |capacity| ScreenInputs {
+            delivery: Some(0.7),
+            capacity: Some(capacity),
+            ..clear(400_000.0)
+        };
+        hold(&mut s, &mut t, 120, clear(4_000_000.0));
+        assert_eq!(s.rung(), Some(rung(Layer::High, None)));
+        // A still picture sends little, so what arrived (400 kbit/s) says nothing of what the
+        // path carries; its narrowest link carries 20 Mbit/s, 8 times the large layer.
+        t += Duration::from_secs(1);
+        assert_eq!(
+            s.decide(t, room(20_000_000.0), &ladder()),
+            rung(Layer::High, None),
+            "loss alone, with nothing queued and room to spare, is not congestion"
+        );
+        // The same loss on a link that carries little more than is sent is.
+        t += Duration::from_secs(1);
+        assert_eq!(
+            s.decide(t, room(3_000_000.0), &ladder()),
+            rung(Layer::Low, Some(1)),
+            "what arrived, less the headroom, is all the path is known to carry"
+        );
     }
 
     #[test]
