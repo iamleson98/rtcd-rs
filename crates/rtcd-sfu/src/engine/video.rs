@@ -53,7 +53,11 @@ impl Engine {
     ) -> Option<u32> {
         let p = self.sessions.get(publisher)?;
         let r = self.sessions.get(receiver)?;
-        let mut candidates = p.up.sources.iter().filter(|x| x.ty == ty);
+        // The layer made for the recording is never sent to a viewer.
+        let mut candidates =
+            p.up.sources
+                .iter()
+                .filter(|x| x.ty == ty && x.layer != Layer::Record);
         match ty {
             TrackType::Voice | TrackType::ScreenAudio => candidates.next().map(|x| x.id),
             TrackType::Video => {

@@ -14,6 +14,7 @@ changing the LMS server or the web client.
 | Container | the `Dockerfile` uses the LMS image's entrypoint and config template, so environment, ports (8045, 8443), user (2001) and the `/data` volume are unchanged |
 | Data | a data directory the Go rtcd used is opened as is: its registered clients are taken over on the first start (`crates/rtcd/src/legacy.rs`) |
 | Extension | a data channel frame of type 10 (`SharpScreen(true)`) asks for a shared screen at its large layer whatever the bandwidth estimate says, until the receiver's link is starved. Only the standalone session recorder, since removed, sent it; the Go service never sees it from a browser |
+| Extension | a data channel frame of type 11 (`Features`, a bit set: bit 1, `FEATURE_RECORD_LAYER`) is sent to a client when its data channel opens: this SFU takes a third simulcast layer, rid `r`, that it records and never forwards to a viewer. A client that does not know the frame ignores it; one that never gets it is talking to an SFU that does not take the layer, and must not send it (an older SFU would take `r` for the small layer) |
 | Media | ICE-lite over UDP and ICE-TCP, DTLS-SRTP, the `calls-dc` data channel (lock protocol, zlib SDP, media map), Opus voice with VAD events, VP8 camera and screen share with simulcast layer switching that needs no renegotiation, `video_subscribe`, keyframe relay, bandwidth-driven screen layer choice |
 | Metrics | the Prometheus metric names are the Go service's, plus the network counters below |
 

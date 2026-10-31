@@ -9,11 +9,14 @@
 
 use std::time::{Duration, Instant};
 
-/// One of the two sizes a video is sent at.
+/// One of the sizes a video is sent at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Layer {
     Low,
     High,
+    /// A layer made for the recording alone (rid `r`): sharper and dearer than any viewer needs,
+    /// sent only by a sender with bandwidth to spare, recorded when it flows and never forwarded.
+    Record,
 }
 
 impl Layer {
@@ -22,14 +25,26 @@ impl Layer {
     pub fn from_rid(rid: Option<&str>) -> Self {
         match rid {
             Some("h") | Some("f") => Self::High,
+            Some("r") => Self::Record,
             _ => Self::Low,
         }
     }
 
+    /// The other of the two layers a viewer can be sent.
     pub fn other(self) -> Self {
         match self {
             Self::Low => Self::High,
-            Self::High => Self::Low,
+            Self::High | Self::Record => Self::Low,
+        }
+    }
+
+    /// How much picture the layer carries: what the recording prefers, and what it waits to
+    /// move up to.
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Low => 0,
+            Self::High => 1,
+            Self::Record => 2,
         }
     }
 }
@@ -139,8 +154,9 @@ impl ScreenLevel {
         let high = inputs.high_rate.unwrap_or(NOMINAL_HIGH_RATE) as f64 * TOLERANCE;
         let arrives = |share: f64| inputs.delivery.is_none_or(|d| d >= share);
         if let Some(since) = self.pin.as_ref().map(|p| p.since) {
+            // (A viewer is never on the record layer: it is not forwarded.)
             match self.level {
-                Layer::High => {
+                Layer::High | Layer::Record => {
                     let starved = now.saturating_duration_since(since) >= PIN_GRACE
                         && (inputs.capacity < high * PIN_FLOOR || !arrives(DROP_DELIVERY));
                     if self.starved_for(now, starved, PIN_PATIENCE) {
@@ -159,7 +175,7 @@ impl ScreenLevel {
         // half of the estimate swings with every burst. It also has to be losing packets.
         let starved = !arrives(DROP_DELIVERY) || (inputs.capacity <= high && !arrives(LOSING));
         let wanted = match self.level {
-            Layer::High => {
+            Layer::High | Layer::Record => {
                 if self.starved_for(now, starved, DROP_PATIENCE) {
                     Layer::Low
                 } else {

@@ -628,3 +628,61 @@ fn a_node_that_does_not_adapt_keeps_the_large_layer_whatever_the_kernel_refuses(
         "a refusal storm changed a layer"
     );
 }
+
+#[test]
+fn the_record_layer_is_never_sent_to_a_viewer() {
+    let mut w = World::new();
+    w.record_layer = true;
+    let a = w.join_with_camera("alice", "call1");
+    let b = w.join("bob", "call1");
+    w.share_screen(a);
+    w.run_for(Duration::from_secs(1));
+    let all = [Layer::Low, Layer::High, Layer::Record];
+    w.stream_video(a, false, 4.0, 30, &all);
+    w.stream_video(a, true, 4.0, 30, &all);
+    for prefix in ["video_", "screen_"] {
+        let got = video_of(&w, b, prefix);
+        assert!(got.len() > 50, "{prefix} reaches the viewer");
+        assert!(
+            got.iter().all(|(l, _)| *l != Layer::Record),
+            "{prefix}: a layer made for the recording is not for a viewer"
+        );
+    }
+}
+
+#[test]
+fn a_viewer_is_sent_the_same_whether_or_not_the_sender_has_a_record_layer() {
+    let run = |record: bool| {
+        let mut w = World::new();
+        w.record_layer = record;
+        let a = w.join_with_camera("alice", "call1");
+        let b = w.join("bob", "call1");
+        w.run_for(Duration::from_secs(1));
+        let layers: &[Layer] = if record {
+            &[Layer::Low, Layer::High, Layer::Record]
+        } else {
+            &BOTH
+        };
+        w.stream_video(a, false, 3.0, 30, layers);
+        video_of(&w, b, "video_")
+            .iter()
+            .map(|(l, key)| (*l as u8, *key))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(run(true), run(false), "the layer is invisible to a viewer");
+}
+
+#[test]
+fn a_client_is_told_the_sfu_takes_a_record_layer() {
+    let mut w = World::new();
+    let a = w.join("alice", "call1");
+    assert!(
+        w.browsers[a]
+            .dc_frames
+            .contains(&rtcd_proto::dc::DcMessage::Features(
+                rtcd_proto::dc::FEATURE_RECORD_LAYER
+            )),
+        "{:?}",
+        w.browsers[a].dc_frames
+    );
+}
