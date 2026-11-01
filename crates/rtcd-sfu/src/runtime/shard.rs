@@ -4,7 +4,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::time::{Duration, Instant};
 
@@ -108,19 +108,48 @@ pub(crate) enum Undelivered {
     Stopped,
 }
 
+/// What a shard counts about its own queues, for the node's metrics and its limits.
+#[derive(Debug, Default)]
+pub(crate) struct ShardStats {
+    /// Datagrams other shards passed on to this one that it has not yet taken up.
+    pub forward_queued: AtomicUsize,
+    /// Datagrams passed on to this shard that were thrown away (counted when read).
+    pub forward_dropped: AtomicU64,
+    /// Over the last second: the most datagrams one turn of the loop took in, the most the engine
+    /// had queued to send when a turn flushed, and the longest turn in microseconds.
+    pub peak_reads: AtomicU32,
+    pub peak_transmits: AtomicU32,
+    pub longest_turn_us: AtomicU32,
+}
+
 /// The way to reach a running shard.
 #[derive(Debug, Clone)]
 pub(crate) struct ShardHandle {
     tx: SyncSender<ShardCommand>,
     waker: Arc<Waker>,
+    stats: Arc<ShardStats>,
     /// The fraction of its time the shard spent working over its last window, in parts per
     /// thousand.
     busy: Arc<AtomicU32>,
 }
 
 impl ShardHandle {
-    pub fn new(tx: SyncSender<ShardCommand>, waker: Arc<Waker>, busy: Arc<AtomicU32>) -> Self {
-        Self { tx, waker, busy }
+    pub fn new(
+        tx: SyncSender<ShardCommand>,
+        waker: Arc<Waker>,
+        busy: Arc<AtomicU32>,
+        stats: Arc<ShardStats>,
+    ) -> Self {
+        Self {
+            tx,
+            waker,
+            busy,
+            stats,
+        }
+    }
+
+    pub fn stats(&self) -> &ShardStats {
+        &self.stats
     }
 
     /// How busy the shard has been lately, 0 to 1.
@@ -189,6 +218,8 @@ pub(crate) struct ShardParts {
     pub peers: Arc<ShardTable>,
     /// Where this shard publishes how busy it is.
     pub busy: Arc<AtomicU32>,
+    /// Where it counts its queues.
+    pub stats: Arc<ShardStats>,
 }
 
 pub(crate) struct Shard {
@@ -221,6 +252,11 @@ pub(crate) struct Shard {
     /// as shards appear.
     forward: Vec<Vec<Forwarded>>,
     busy: Arc<AtomicU32>,
+    stats: Arc<ShardStats>,
+    /// Datagrams taken in by the turn that is running.
+    turn_reads: u32,
+    /// The peaks of the window that is running (see `ShardStats`).
+    window_peaks: [u32; 3],
     /// Time spent working since `window_start`.
     worked: Duration,
     window_start: Instant,
@@ -244,6 +280,7 @@ impl Shard {
             directory,
             peers,
             busy,
+            stats,
         } = parts;
         for (i, u) in udp.iter_mut().enumerate() {
             poll.registry()
@@ -277,6 +314,9 @@ impl Shard {
             peers,
             forward: Vec::new(),
             busy,
+            stats,
+            turn_reads: 0,
+            window_peaks: [0; 3],
             worked: Duration::ZERO,
             window_start: Instant::now(),
             pressure: Pressure::default(),
@@ -299,6 +339,7 @@ impl Shard {
                 continue;
             }
             let now = Instant::now();
+            self.turn_reads = 0;
 
             let mut commands_ready = false;
             for ev in events.iter() {
@@ -344,6 +385,13 @@ impl Shard {
     fn publish_busy(&mut self, woke: Instant) {
         let done = Instant::now();
         self.worked += done.saturating_duration_since(woke);
+        let [reads, _, longest] = &mut self.window_peaks;
+        *reads = (*reads).max(self.turn_reads);
+        *longest = (*longest).max(
+            done.saturating_duration_since(woke)
+                .as_micros()
+                .min(u128::from(u32::MAX)) as u32,
+        );
         let window = done.saturating_duration_since(self.window_start);
         if window >= BUSY_WINDOW {
             let fraction = (self.worked.as_secs_f32() / window.as_secs_f32()).clamp(0.0, 1.0);
@@ -360,6 +408,10 @@ impl Shard {
             };
             self.busy
                 .store((fraction * BUSY_SCALE) as u32 | flags, Ordering::Relaxed);
+            let [reads, transmits, longest] = std::mem::take(&mut self.window_peaks);
+            self.stats.peak_reads.store(reads, Ordering::Relaxed);
+            self.stats.peak_transmits.store(transmits, Ordering::Relaxed);
+            self.stats.longest_turn_us.store(longest, Ordering::Relaxed);
             self.worked = Duration::ZERO;
             self.window_start = done;
         }
@@ -395,6 +447,7 @@ impl Shard {
                 };
                 self.traffic.udp_in_bytes += data.len() as u64;
                 self.traffic.udp_in_packets += 1;
+                self.turn_reads += 1;
                 if let Some(dir) = &self.directory
                     && !self.engine.would_route(Proto::Udp, peer, data)
                     && let Some(owner) = dir.owner(Proto::Udp, peer, data)
@@ -518,6 +571,7 @@ impl Shard {
                 };
                 self.traffic.udp_in_bytes += data.len() as u64;
                 self.traffic.udp_in_packets += 1;
+                self.turn_reads += 1;
                 self.engine.handle_datagram(
                     now,
                     Proto::Udp,
@@ -545,7 +599,14 @@ impl Shard {
             // A shard that is full or gone loses them, as a congested network would.
             match self.peers.get(owner) {
                 Some(peer) => {
-                    let _ = peer.send(ShardCommand::Datagrams(std::mem::take(batch)));
+                    let n = batch.len();
+                    peer.stats.forward_queued.fetch_add(n, Ordering::Relaxed);
+                    if peer
+                        .send(ShardCommand::Datagrams(std::mem::take(batch)))
+                        .is_err()
+                    {
+                        peer.stats.forward_queued.fetch_sub(n, Ordering::Relaxed);
+                    }
                 }
                 None => batch.clear(),
             }
@@ -777,6 +838,10 @@ impl Shard {
                         .record_stop(now, &r.group, &r.call, &r.recording_id);
                 }
                 Ok(ShardCommand::Datagrams(batch)) => {
+                    self.stats
+                        .forward_queued
+                        .fetch_sub(batch.len(), Ordering::Relaxed);
+                    self.turn_reads += batch.len() as u32;
                     for d in batch {
                         self.engine
                             .handle_datagram(now, d.proto, d.local, d.peer, d.data);
@@ -828,6 +893,8 @@ impl Shard {
         // same two counters, and an atomic add per datagram is a million contended writes a
         // second on a busy node.
         let (mut wire_bytes, mut wire_packets) = (0u64, 0u64);
+        let queued = self.engine.queued_transmits().min(u32::MAX as usize) as u32;
+        self.window_peaks[1] = self.window_peaks[1].max(queued);
         while let Some(t) = self.engine.poll_transmit() {
             let tcp = matches!(t.proto, Proto::Tcp);
             wire_bytes += Gauge::wire_len(t.data.len(), t.peer, tcp);

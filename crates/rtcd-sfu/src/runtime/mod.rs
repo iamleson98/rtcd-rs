@@ -27,12 +27,14 @@ use tracing::{error, info, warn};
 pub use config::{SfuConfig, SfuConfigError};
 pub use registry::AdmitError;
 pub use scaler::ScalingPolicy;
+pub use table::Queues;
 
 use self::directory::Directory;
 use self::registry::Registry;
 use self::scaler::{Scaler, ShardLoad, Step};
 use self::shard::{
-    RecordStart, RecordStop, Shard, ShardCommand, ShardHandle, ShardParts, UdpSock, Undelivered,
+    RecordStart, RecordStop, Shard, ShardCommand, ShardHandle, ShardParts, ShardStats, UdpSock,
+    Undelivered,
 };
 use self::table::ShardTable;
 use crate::config::LocalAddress;
@@ -136,7 +138,8 @@ impl Core {
         let waker = Arc::new(Waker::new(poll.registry(), Token(0))?);
         let (tx, rx) = sync_channel(COMMAND_QUEUE);
         let busy = Arc::new(AtomicU32::new(0));
-        let handle = ShardHandle::new(tx, waker, busy.clone());
+        let stats = Arc::new(ShardStats::default());
+        let handle = ShardHandle::new(tx, waker, busy.clone(), stats.clone());
         let engine = Engine::new(
             Arc::new(self.cfg.engine.clone()),
             self.metrics.clone(),
@@ -155,6 +158,7 @@ impl Core {
             directory: self.directory.clone(),
             peers: self.table.clone(),
             busy,
+            stats,
         })?;
         let sink = self.sink.clone();
         let registry = self.registry.clone();
@@ -730,6 +734,11 @@ impl Sfu {
     /// How many of those are at their limit and refuse new sessions.
     pub fn shards_saturated(&self) -> usize {
         self.core.table.saturated_count()
+    }
+
+    /// What the shards' queues hold now, and their peaks over the last second.
+    pub fn queues(&self) -> Queues {
+        self.core.table.queues()
     }
 
     /// Starts one more shard, if the configuration leaves room for it. The SFU does this itself

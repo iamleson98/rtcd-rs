@@ -57,6 +57,12 @@ struct Node {
     shards_saturated: Gauge,
     egress_bps: Gauge,
     egress_pps: Gauge,
+    forward_queued: Gauge,
+    forward_dropped: Counter,
+    forward_dropped_seen: AtomicU64,
+    turn_peak_reads: Gauge,
+    turn_peak_transmits: Gauge,
+    turn_longest: Gauge,
     egress_ceiling_bps: Gauge,
     egress_ceiling_pps: Gauge,
     egress_adapt: Gauge,
@@ -138,6 +144,35 @@ impl Node {
                 "egress_pps",
                 "What the instance hands to its sockets, in datagrams per second",
             ),
+            forward_queued: g(
+                "forward_queued_packets",
+                "Datagrams one shard passed on to another that the other has not yet taken up (bounded: past the limit they are dropped)",
+            ),
+            forward_dropped: {
+                let c = Counter::with_opts(
+                    Opts::new(
+                        "forward_dropped_packets_total",
+                        "Datagrams passed between shards that were thrown away because the receiving shard had too many waiting",
+                    )
+                    .namespace(NAMESPACE),
+                )
+                .expect("valid metric");
+                r.register(Box::new(c.clone())).expect("unique metric");
+                c
+            },
+            forward_dropped_seen: AtomicU64::new(0),
+            turn_peak_reads: g(
+                "shard_turn_peak_reads",
+                "The most datagrams one turn of a shard's loop took in over the last second (the largest of any shard)",
+            ),
+            turn_peak_transmits: g(
+                "shard_turn_peak_transmits",
+                "The most datagrams the engine had queued to send when a shard's turn flushed, over the last second",
+            ),
+            turn_longest: g(
+                "shard_turn_longest_seconds",
+                "The longest turn of any shard's loop over the last second",
+            ),
             egress_ceiling_bps: g(
                 "egress_ceiling_bps",
                 "The send rate in bits per second at which the kernel started refusing datagrams, as the node learned it (0 until it has)",
@@ -194,6 +229,15 @@ impl Node {
         self.shards_saturated.set(s.shards_saturated as f64);
         self.egress_bps.set(s.egress_bps as f64);
         self.egress_pps.set(s.egress_pps as f64);
+        self.forward_queued.set(s.forward_queued as f64);
+        let seen = self
+            .forward_dropped_seen
+            .fetch_max(s.forward_dropped, Ordering::Relaxed);
+        self.forward_dropped
+            .inc_by(s.forward_dropped.saturating_sub(seen) as f64);
+        self.turn_peak_reads.set(f64::from(s.turn_peak_reads));
+        self.turn_peak_transmits.set(f64::from(s.turn_peak_transmits));
+        self.turn_longest.set(f64::from(s.turn_longest_us) / 1e6);
         self.egress_ceiling_bps.set(s.egress_ceiling_bps as f64);
         self.egress_ceiling_pps.set(s.egress_ceiling_pps as f64);
         self.egress_adapt.set(f64::from(s.egress_adapt));

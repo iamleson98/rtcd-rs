@@ -104,6 +104,12 @@ pub struct SystemStatus {
     pub egress_pps: u64,
     /// Datagrams the kernel refused to queue since the instance started reading the count.
     pub kernel_send_drops: u64,
+    /// The shards' queues (see `rtcd_sfu::runtime::Queues`).
+    pub forward_queued: usize,
+    pub forward_dropped: u64,
+    pub turn_peak_reads: u32,
+    pub turn_peak_transmits: u32,
+    pub turn_longest_us: u32,
     /// Whether the node acts on the kernel's refusals (`RTCD_RTC_EGRESSADAPT`). Off, only a send
     /// budget squeezes, `egress_choked` is never set and uploads are never slowed; the refusals
     /// are counted and `egress_refusing` is reported all the same.
