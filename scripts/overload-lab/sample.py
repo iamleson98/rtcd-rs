@@ -64,6 +64,13 @@ def get(path):
 
 METRICS = re.compile(r"^(rtcd_[a-z0-9_]+)(\{[^}]*\})? ([0-9.e+-]+)$")
 KEEP = (
+    "rtcd_rtc_receiver_loss_ratio_",
+    "rtcd_rtc_receiver_feedback_total",
+    "rtcd_rtc_retransmitted_packets_total",
+    "rtcd_rtc_keyframe_requests_total",
+    "rtcd_rtc_sessions_refused_total",
+    "rtcd_net_packets_total",
+    "rtcd_net_dropped",
     "rtcd_forward_",
     "rtcd_shard_turn",
     "rtcd_shard_",

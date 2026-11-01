@@ -201,7 +201,12 @@ pub async fn join(
         observer: false,
     }));
 
-    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("a UDP socket");
+    // On loopback, unless the participants are on another machine than rtcd: then the address
+    // they can be reached at.
+    let local = std::env::var("LMS_SIM_LOCAL_IP").unwrap_or_else(|_| "127.0.0.1".into());
+    let socket = UdpSocket::bind(format!("{local}:0"))
+        .await
+        .expect("a UDP socket");
     let addr = socket.local_addr().unwrap();
     rtcd.exempt(addr);
     let mut me = MediaEngine::default();
