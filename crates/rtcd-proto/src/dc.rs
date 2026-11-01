@@ -50,7 +50,15 @@ pub enum DcMessage {
     /// estimate says (the session recorder: it keeps what it gets). An extension of this
     /// service; the Go service never sends or receives it.
     SharpScreen(bool),
+    /// What this SFU can do beyond the Go service's, as the `FEATURE_*` bits; sent to a client
+    /// when its data channel opens. A client that does not know the frame ignores it, and one that
+    /// never gets it knows it is talking to an SFU that does not do these things.
+    Features(u32),
 }
+
+/// The SFU takes a third simulcast layer, rid `r`, that it records and never forwards to a viewer
+/// (a sender with bandwidth to spare sends the recording a sharper picture than any viewer needs).
+pub const FEATURE_RECORD_LAYER: u32 = 1;
 
 impl DcMessage {
     fn wire_type(&self) -> u8 {
@@ -65,6 +73,7 @@ impl DcMessage {
             Self::Unlock => 8,
             Self::MediaMap(_) => 9,
             Self::SharpScreen(_) => 10,
+            Self::Features(_) => 11,
         }
     }
 
@@ -81,6 +90,9 @@ impl DcMessage {
             }
             Self::LossRate(v) | Self::RoundTripTime(v) | Self::Jitter(v) => {
                 rmp::encode::write_f64(&mut out, *v).expect("vec write");
+            }
+            Self::Features(bits) => {
+                rmp::encode::write_uint(&mut out, u64::from(*bits)).expect("vec write");
             }
             Self::Sdp(json) => {
                 let mut z =
@@ -172,7 +184,43 @@ impl DcMessage {
                 field: "dc payload",
                 expected: "boolean",
             })?),
+            11 => Self::Features(
+                u32::try_from(payload()?.as_u64().ok_or(ProtoError::Type {
+                    field: "dc payload",
+                    expected: "unsigned integer",
+                })?)
+                .map_err(|_| ProtoError::Type {
+                    field: "dc payload",
+                    expected: "32-bit unsigned integer",
+                })?,
+            ),
             other => return Err(ProtoError::UnknownDcMessage(other)),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_features_of_the_sfu_travel_as_a_small_unsigned_integer() {
+        let frame = DcMessage::Features(FEATURE_RECORD_LAYER).encode();
+        // The type as the Go encoder writes it (0xcc NN), then a msgpack positive fixint, which
+        // the web client reads as the byte it is.
+        assert_eq!(frame, [0xcc, 11, 1]);
+        assert_eq!(
+            DcMessage::decode(&frame).unwrap(),
+            DcMessage::Features(FEATURE_RECORD_LAYER)
+        );
+        let many = DcMessage::Features(0x0001_0203);
+        assert_eq!(DcMessage::decode(&many.encode()).unwrap(), many);
+    }
+
+    #[test]
+    fn features_that_do_not_fit_are_refused() {
+        let mut frame = vec![0xcc, 11];
+        rmp::encode::write_uint(&mut frame, u64::from(u32::MAX) + 1).unwrap();
+        assert!(DcMessage::decode(&frame).is_err());
     }
 }

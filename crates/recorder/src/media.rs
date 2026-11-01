@@ -168,13 +168,24 @@ impl Recording {
     /// The path of the next file, `None` once the limit of files is reached.
     pub fn new_path(&self, kind: &str) -> Option<PathBuf> {
         let max = self.max_files;
-        let n = self
-            .next
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                (max == 0 || n < max).then_some(n + 1)
-            })
-            .ok()?
-            + 1;
+        // Claim the next number unless the limit is reached. (`fetch_update` was renamed
+        // `try_update`, which the minimum supported compiler lacks, so the loop is written out.)
+        let mut taken = self.next.load(Ordering::Relaxed);
+        loop {
+            if max != 0 && taken >= max {
+                return None;
+            }
+            match self.next.compare_exchange_weak(
+                taken,
+                taken + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(now) => taken = now,
+            }
+        }
+        let n = taken + 1;
         Some(self.dir.join(format!("{n:05}-{kind}.webm")))
     }
 

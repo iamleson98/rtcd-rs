@@ -61,22 +61,25 @@ pub struct RemoteTrack {
 pub struct VideoSender {
     pub sender: RTCRtpSenderId,
     pub stream_id: String,
-    /// SSRC of the small and the large layer.
-    pub ssrcs: [u32; 2],
-    seq: [u16; 2],
-    ts: [u32; 2],
-    picture_id: [u8; 2],
+    /// SSRC of the small, the large and the record layer (the last is sent only if the sender has
+    /// it: see [`World::record_layer`]).
+    pub ssrcs: [u32; 3],
+    seq: [u16; 3],
+    ts: [u32; 3],
+    picture_id: [u8; 3],
     /// For frames sent with temporal layers (`send_screen_frame`): the 15-bit picture id, the
     /// TL0PICIDX and where in the pattern of temporal layers each layer is.
-    wide_picture_id: [u16; 2],
-    tl0: [u8; 2],
-    pattern: [usize; 2],
+    wide_picture_id: [u16; 3],
+    tl0: [u8; 3],
+    pattern: [usize; 3],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layer {
     Low = 0,
     High = 1,
+    /// The layer made for the recording (rid `r`), present when [`World::record_layer`] is set.
+    Record = 2,
 }
 
 /// What the network between the SFU and one browser does: packets from the SFU can be lost, take
@@ -201,6 +204,8 @@ pub struct World {
     rng: u64,
     /// Bytes added to the payload of every video packet, so that frames have the size of real ones.
     pub payload_pad: usize,
+    /// New cameras and screens are offered with a third simulcast layer, the record layer.
+    pub record_layer: bool,
     /// Time spent inside the engine (datagrams in, timeouts), for the cost tests.
     pub engine_spent: Duration,
     /// Called just before the world calls into the engine, with `"datagram"` or `"timeout"` and
@@ -291,6 +296,7 @@ impl World {
             to_engine: Vec::new(),
             rng: 0x9e37_79b9_7f4a_7c15,
             payload_pad: 0,
+            record_layer: false,
             engine_spent: Duration::ZERO,
             around_engine: |_, _| {},
             nack_retry: None,
@@ -413,12 +419,14 @@ impl World {
             let ssrcs = [
                 2000 + self.next_browser as u32 * 10,
                 2001 + self.next_browser as u32 * 10,
+                2002 + self.next_browser as u32 * 10,
             ];
             video_sender(
                 &mut pc,
                 &format!("camera-stream-{name}"),
                 &format!("camera-{name}"),
                 ssrcs,
+                self.record_layer,
             )
         });
         pc.add_local_candidate(host_candidate(addr)).unwrap();
@@ -976,7 +984,11 @@ impl World {
 
     /// Browser `i` shares its screen: announces the stream, adds a simulcast sender and offers.
     pub fn share_screen(&mut self, i: usize) {
-        let ssrcs = [3000 + i as u32 * 10, 3001 + i as u32 * 10];
+        let ssrcs = [
+            3000 + i as u32 * 10,
+            3001 + i as u32 * 10,
+            3002 + i as u32 * 10,
+        ];
         let stream_id = format!("screen-stream-{}", self.browsers[i].name);
         self.signal(
             i,
@@ -989,6 +1001,7 @@ impl World {
             &stream_id,
             &format!("screen-{name}"),
             ssrcs,
+            self.record_layer,
         );
         self.browsers[i].screen = Some(sender);
         self.renegotiate(i);
@@ -1097,7 +1110,14 @@ impl World {
             }
             if let Some(id) = rid_ext {
                 header
-                    .set_extension(id, Bytes::from(if layer == Layer::Low { "l" } else { "h" }))
+                    .set_extension(
+                        id,
+                        Bytes::from(match layer {
+                            Layer::Low => "l",
+                            Layer::High => "h",
+                            Layer::Record => "r",
+                        }),
+                    )
                     .unwrap();
             }
             let packet = rtc::rtp::packet::Packet {
@@ -1293,7 +1313,14 @@ impl World {
             }
             if let Some(id) = rid_ext {
                 header
-                    .set_extension(id, Bytes::from(if layer == Layer::Low { "l" } else { "h" }))
+                    .set_extension(
+                        id,
+                        Bytes::from(match layer {
+                            Layer::Low => "l",
+                            Layer::High => "h",
+                            Layer::Record => "r",
+                        }),
+                    )
                     .unwrap();
             }
             v.seq[l] = v.seq[l].wrapping_add(1);
@@ -1454,7 +1481,8 @@ fn video_sender(
     pc: &mut RTCPeerConnection,
     stream_id: &str,
     track_id: &str,
-    ssrcs: [u32; 2],
+    ssrcs: [u32; 3],
+    record: bool,
 ) -> VideoSender {
     let coding = |rid: &str, ssrc: u32| RTCRtpEncodingParameters {
         rtp_coding_parameters: RTCRtpCodingParameters {
@@ -1476,7 +1504,10 @@ fn video_sender(
         track_id.to_owned(),
         track_id.to_owned(),
         RtpCodecKind::Video,
-        vec![coding("l", ssrcs[0]), coding("h", ssrcs[1])],
+        [coding("l", ssrcs[0]), coding("h", ssrcs[1])]
+            .into_iter()
+            .chain(record.then(|| coding("r", ssrcs[2])))
+            .collect(),
     );
     let id = pc
         .add_transceiver_from_track(
@@ -1492,22 +1523,22 @@ fn video_sender(
         sender: RTCRtpSenderId::from(id),
         stream_id: stream_id.to_owned(),
         ssrcs,
-        seq: [100, 5000],
-        ts: [1000, 900_000],
-        picture_id: [10, 90],
-        wide_picture_id: [1000, 20_000],
-        tl0: [3, 200],
-        pattern: [0, 0],
+        seq: [100, 5000, 20_000],
+        ts: [1000, 900_000, 1_800_000],
+        picture_id: [10, 90, 50],
+        wide_picture_id: [1000, 20_000, 30_000],
+        tl0: [3, 200, 100],
+        pattern: [0, 0, 0],
     }
 }
 
 /// The layer a received video packet came from (see [`World::send_video`]; the marker sits four
 /// bytes from the end) and whether it begins a keyframe.
 pub fn describe(packet: &rtc::rtp::Packet) -> (Layer, bool) {
-    let layer = if packet.payload[packet.payload.len() - 4] == 1 {
-        Layer::Low
-    } else {
-        Layer::High
+    let layer = match packet.payload[packet.payload.len() - 4] {
+        1 => Layer::Low,
+        3 => Layer::Record,
+        _ => Layer::High,
     };
     (layer, rtcd_sfu::vp8::is_keyframe(&packet.payload))
 }
