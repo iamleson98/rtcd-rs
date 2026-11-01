@@ -301,22 +301,32 @@ and 12 Mbit/s for a class of 30 with 24 cameras, measured with `lms-sim`).
 
 A node that is asked for more than it carries must refuse and shed before it runs away. The kernel
 does not push back on UDP (a full qdisc is success for the sender, counted in `SndbufErrors`), so
-nothing in a shard's send path blocks; what grows is what a shard that has fallen behind keeps, and
-the lag grows with it. Measured on the OVH 4-vCPU video node (2026-11-01): ~720 sessions, offered
-rate 6.6 Gbit/s, a million refused datagrams in two minutes, resident memory 0.5 to 2.26 GB, killed
-at the 3 GiB limit with every call on it.
+nothing in a shard's send path blocks. Two things grow instead, measured in `scripts/overload-lab`
+(a node with a token bucket on its interface, three CPUs and a 3 GiB limit, loaded with classes):
 
-Bounds (always on, `src/runtime/shard.rs`):
+1. **What a shard that has fallen behind keeps.** Its turn read up to 1,024 datagrams from each of
+   hundreds of sockets and queued a datagram for every receiver of every video packet before it sent
+   one; the other shards passed it more through a channel that held 65,536 batches. One turn queued
+   875,000 datagrams and took 8.8 s, resident memory went from 0.1 to 2.8 GB of 3 GiB, and the lag grew
+   with the memory. (On the OVH node, 0.5 to 2.26 GB, then the kill.)
+2. **What receivers ask for.** Under loss every receiver asks again for the same packets, and the node
+   answered every time: 36 receivers made it offer 1.7 Gbit/s, 20 times what they had asked it to
+   carry, the kernel refused 27 million datagrams, and the refusals were the loss. (The production
+   runaway offered 6.6 Gbit/s from a node that carried 820 cleanly.) With the NACK history cut to 32
+   packets the same load offered 0.2 Gbit/s.
+
+Bounds (always on):
 
 - Datagrams one shard passes on to another (the kernel hands a packet to the shard its port hash
   picks, not the one that owns the session) are limited to 4,096 waiting per receiving shard, about
-  100 ms of a busy one. Past that only handshakes (STUN, DTLS) go; past twice that, nothing. The
-  channel used to hold 65,536 batches of up to 64 datagrams with no limit in datagrams.
-- A turn of the loop takes in at most 8,192 datagrams over all sockets; the rest is read in the next
-  turn, after the timers.
-- The engine's queued datagrams are handed to the sockets at 2,048, not at the end of the turn: a
-  video packet becomes a datagram for each receiver, and a turn that read a thousand held a call's
-  worth of copies of each.
+  100 ms of a busy one. Past that only handshakes (STUN, DTLS) go; past twice that, nothing.
+- A turn of the loop stops reading at 20 ms (and at 8,192 datagrams); the sockets that still have
+  datagrams are read in the next turn, after the timers.
+- The engine's queued datagrams are handed to the sockets at 2,048, not at the end of the turn.
+- A retransmission request is answered whole or not at all, up to a tenth of the packets the node
+  sends (never below 500 a second, so a lossy receiver on a quiet node is answered in full) and to a
+  trickle while the kernel refuses its datagrams (`Gauge::allow_retransmits`,
+  `src/nack_limit.rs`). `rtcd_rtc_retransmits_limited_total` counts what was left unanswered.
 
 Limits (`src/runtime/guard.rs`; a thread of its own reads the memory every 250 ms, not the async
 runtime a saturated node starves):
@@ -328,16 +338,22 @@ runtime a saturated node starves):
   their loudest voice only. Each limit is released ten points lower; 0 turns it off.
 - While the kernel refuses the node's datagrams (`egress_refusing`), or it sends at the ceiling it
   learned, newcomers are refused (`RTCD_RTC_REFUSEWHENKERNELREFUSES`, default true).
-- `GET /system` reports `admission_closed` (`memory`, `memory_hard`, `refusals`; empty when open),
-  which the server reads to place new calls elsewhere. Metrics: `rtcd_admission_closed{reason}`,
-  `rtcd_rtc_sessions_refused_total{reason}` (`shard` too), `rtcd_forward_queued_packets`,
-  `rtcd_forward_dropped_packets_total`, `rtcd_shard_turn_peak_reads`, `rtcd_shard_turn_peak_transmits`,
-  `rtcd_shard_turn_longest_seconds`.
+- With `RTCD_RTC_EGRESSCAPACITYMBPS` (what the card is planned to carry; 0, the default, says
+  nothing) the node takes no newcomer once it sends `RTCD_RTC_REFUSEEGRESSPERCENT` (70) of it and
+  sheds from `RTCD_RTC_SHEDEGRESSPERCENT` (90), each released ten points lower. A call cannot move
+  and keeps growing as people rejoin or arrive late, so the node near its card stops taking them
+  before the kernel starts refusing. Plan it under the card: the OVH 4-vCPU video node took 800 to
+  850 Mbit/s of a 1 Gbit/s card cleanly.
+- `GET /system` reports `admission_closed` (`memory`, `memory_hard`, `egress`, `refusals`; empty
+  when open), `egress_capacity_bps` and `egress_headroom_bps` (the refusal mark less what it sends),
+  which the server reads to place calls (a call goes only where the headroom covers what the class is
+  expected to send). Metrics: `rtcd_admission_closed{reason}`, `rtcd_egress_capacity_bps`,
+  `rtcd_egress_headroom_bps`, `rtcd_rtc_sessions_refused_total{reason}` (`shard` too),
+  `rtcd_forward_queued_packets`, `rtcd_forward_dropped_packets_total`, `rtcd_shard_turn_peak_reads`,
+  `rtcd_shard_turn_peak_transmits`, `rtcd_shard_turn_longest_seconds`.
 
 A refused session is closed, as at a saturated shard; the web app treats that as a lost connection
 and tries again with growing pauses (`lms-web/src/lib/features/calls/rejoin.ts`).
-
-The lab that measured this is `scripts/overload-lab`.
 
 ## Upgrading from the previous release
 
