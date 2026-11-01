@@ -63,6 +63,28 @@ def snmp_udp():
     return {"udp_out": d.get("OutDatagrams", 0), "udp_sndbuf_err": d.get("SndbufErrors", 0), "udp_rcvbuf_err": d.get("RcvbufErrors", 0)}
 
 
+def nic():
+    """What the interface carried and what its qdisc dropped: the card's own count, exact where the
+    kernel's UDP counter is per call (a segmented send of 64 datagrams that fails counts once)."""
+    out = {}
+    try:
+        for line in open("/proc/net/dev"):
+            name, _, rest = line.partition(":")
+            if name.strip() == "eth0":
+                f = rest.split()
+                out["eth0_tx_bytes"], out["eth0_tx_packets"] = int(f[8]), int(f[9])
+    except OSError:
+        pass
+    try:
+        text = subprocess.run(["tc", "-s", "qdisc", "show", "dev", "eth0"], capture_output=True, text=True).stdout
+        m = re.search(r"Sent (\d+) bytes (\d+) pkt \(dropped (\d+)", text)
+        if m:
+            out["qdisc_sent_pkts"], out["qdisc_dropped"] = int(m.group(2)), int(m.group(3))
+    except OSError:
+        pass
+    return out
+
+
 def get(path):
     try:
         with urllib.request.urlopen(API + path, timeout=2) as r:
@@ -107,6 +129,7 @@ while time.time() - start < TOTAL:
         row.update(status(p))
     row.update(cgroup())
     row.update(snmp_udp())
+    row.update(nic())
     try:
         s = json.loads(get("/system") or "{}")
         for k in (
@@ -121,6 +144,11 @@ while time.time() - start < TOTAL:
             "egress_refusing",
             "egress_choked",
             "egress_ceiling_bps",
+            "egress_ceiling_pps",
+            "egress_capacity_bps",
+            "egress_capacity_source",
+            "egress_headroom_bps",
+            "admission_closed",
             "cpu_load",
             "rss_bytes",
             "rss_limit_bytes",
