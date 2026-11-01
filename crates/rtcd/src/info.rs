@@ -109,6 +109,7 @@ pub struct SystemStatus {
     /// it learned). Empty when it does.
     pub admission_closed: &'static str,
     /// The shards' queues (see `rtcd_sfu::runtime::Queues`).
+    pub retransmits_limited: u64,
     pub forward_queued: usize,
     pub forward_dropped: u64,
     pub turn_peak_reads: u32,

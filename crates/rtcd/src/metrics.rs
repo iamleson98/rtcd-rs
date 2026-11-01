@@ -60,6 +60,8 @@ struct Node {
     admission_closed: GaugeVec,
     forward_queued: Gauge,
     forward_dropped: Counter,
+    retransmits_limited: Counter,
+    retransmits_limited_seen: AtomicU64,
     forward_dropped_seen: AtomicU64,
     turn_peak_reads: Gauge,
     turn_peak_transmits: Gauge,
@@ -175,6 +177,20 @@ impl Node {
                 c
             },
             forward_dropped_seen: AtomicU64::new(0),
+            retransmits_limited: {
+                let c = Counter::with_opts(
+                    Opts::new(
+                        "retransmits_limited_total",
+                        "Packets receivers asked the node to retransmit that it left unanswered: past a tenth of what it sends, and almost all of them while the kernel refuses its datagrams",
+                    )
+                    .namespace(NAMESPACE)
+                    .subsystem("rtc"),
+                )
+                .expect("valid metric");
+                r.register(Box::new(c.clone())).expect("unique metric");
+                c
+            },
+            retransmits_limited_seen: AtomicU64::new(0),
             turn_peak_reads: g(
                 "shard_turn_peak_reads",
                 "The most datagrams one turn of a shard's loop took in over the last second (the largest of any shard)",
@@ -248,6 +264,11 @@ impl Node {
                 .with_label_values(&[reason])
                 .set(f64::from(s.admission_closed == reason));
         }
+        let seen = self
+            .retransmits_limited_seen
+            .fetch_max(s.retransmits_limited, Ordering::Relaxed);
+        self.retransmits_limited
+            .inc_by(s.retransmits_limited.saturating_sub(seen) as f64);
         self.forward_queued.set(s.forward_queued as f64);
         let seen = self
             .forward_dropped_seen

@@ -184,6 +184,7 @@ impl Service {
             egress_pps: sfu.egress_pps(),
             kernel_send_drops: sfu.kernel_send_drops(),
             admission_closed: sfu.admission().reason(),
+            retransmits_limited: sfu.retransmits_limited(),
             forward_queued: queues.forward_queued,
             forward_dropped: queues.forward_dropped,
             turn_peak_reads: queues.peak_reads,

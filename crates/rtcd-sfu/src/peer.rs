@@ -24,6 +24,7 @@ use rtc::shared::error::Result;
 
 use crate::bwe::{Estimate, SharedGcc};
 use crate::config::EngineConfig;
+use crate::nack_limit::LimitedNackResponder;
 
 pub const AUDIO_LEVEL_URI: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
 pub const OPUS_PAYLOAD_TYPE: u8 = 111;
@@ -126,9 +127,12 @@ pub(crate) fn new_peer(
     let mut registry = Registry::new()
         .with(
             Slot::NackResponder,
-            NackResponderBuilder::new()
-                .with_size(cfg.nack_buffer_size)
-                .build(),
+            LimitedNackResponder::new(
+                NackResponderBuilder::new()
+                    .with_size(cfg.nack_buffer_size)
+                    .build(),
+                cfg.egress.clone(),
+            ),
         )
         .with(Slot::NackGenerator, NackGeneratorBuilder::new().build())
         .with(Slot::ReceiverReport, ReceiverReportBuilder::new().build())

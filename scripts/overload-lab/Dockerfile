@@ -9,6 +9,9 @@ COPY . .
 # A lab build: thin LTO and one codegen unit are the release profile's; the lab trades a few
 # percent of speed (the same for every run) for a build that takes minutes.
 ENV CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+# The target directory is a cache shared between builds of different sources: make cargo see ours
+# as new (COPY keeps the files' own times, which can be older than what the cache holds).
+RUN find crates -name '*.rs' -exec touch {} +
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -p rtcd -p lms-sim \

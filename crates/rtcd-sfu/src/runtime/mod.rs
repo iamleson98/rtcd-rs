@@ -809,6 +809,12 @@ impl Sfu {
         self.core.table.saturated_count()
     }
 
+    /// Retransmissions receivers asked for that the node left unanswered since it started (see
+    /// `Gauge::allow_retransmits`).
+    pub fn retransmits_limited(&self) -> u64 {
+        self.core.cfg.engine.egress.retransmits_limited()
+    }
+
     /// What the node's own limits (memory, the card) say about taking more people.
     pub fn admission(&self) -> Verdict {
         self.core.admission.get()
