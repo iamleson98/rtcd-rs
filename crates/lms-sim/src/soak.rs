@@ -115,6 +115,7 @@ pub async fn run(args: impl Iterator<Item = String>, assets: std::path::PathBuf)
                 voice: true,
                 camera: i < a.cameras,
                 screen: i < a.screens,
+                ..Default::default()
             };
             people.push(class::join(&rtcd, assets.clone(), CHAN_ID, spec, i).await);
             tokio::time::sleep(Duration::from_millis(50)).await;

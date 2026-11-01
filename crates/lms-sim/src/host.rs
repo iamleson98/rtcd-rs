@@ -166,6 +166,32 @@ impl Rtcd {
         }
     }
 
+    /// A client of an rtcd that runs elsewhere (another process or container) with self registration
+    /// on: `http` is its API address, `media` where clients send media (its advertised address).
+    pub async fn remote(http: &str, media: SocketAddr) -> Self {
+        let http = http.trim_end_matches('/').to_owned();
+        let r = reqwest::Client::new()
+            .post(format!("{http}/register"))
+            .json(&serde_json::json!({ "clientID": CLIENT, "authKey": KEY }))
+            .send()
+            .await
+            .expect("register");
+        // A second run finds the client registered already.
+        assert!(
+            matches!(r.status().as_u16(), 201 | 400),
+            "register: {}",
+            r.status()
+        );
+        Self {
+            app: None,
+            reports: Arc::default(),
+            http,
+            media,
+            dir: std::env::temp_dir().join("lms-sim-remote"),
+            relay: None,
+        }
+    }
+
     /// Opens a websocket as the registered client.
     pub async fn connect(&self) -> RtcdConn {
         let auth = format!(
