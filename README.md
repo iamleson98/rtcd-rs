@@ -55,7 +55,7 @@ counter; the host figures average the last five seconds):
 |---|---|
 | `rtcd_sessions`, `rtcd_shards`, `rtcd_shards_pressured`, `rtcd_shards_saturated` | sessions, the threads serving them, and how many of those shed load or refuse new sessions |
 | `rtcd_egress_bps`, `rtcd_egress_pps` | what the shards hand to their sockets, link-layer headers included (the card's own counter is `rtcd_host_tx_bps`) |
-| `rtcd_egress_ceiling_bps`, `rtcd_egress_ceiling_pps` | the rate at which the kernel started refusing datagrams, as the node learned it (0 until it has) |
+| `rtcd_egress_ceiling_bps`, `rtcd_egress_ceiling_pps` | what the node takes its card to carry, in bits and packets a second: learned by sending, or said (0 when nothing is estimated); `rtcd_egress_capacity_bps` is the one in bits |
 | `rtcd_egress_squeezed`, `rtcd_egress_refusing`, `rtcd_egress_choked` | 1 while video is held to the small layers; while the kernel refuses datagrams (recording uploads slow down); while it keeps refusing after the squeeze (one voice per call) |
 | `rtcd_kernel_send_drops_total` (counter) | datagrams the kernel refused to queue (UDP `SndbufErrors`), from when the process first read the count |
 | `rtcd_host_cpu_load`, `rtcd_host_cpu_busiest` | busy share of all CPUs and of the busiest one (waiting for I/O counts as idle) |
@@ -182,6 +182,75 @@ for twenty seconds, so the drop itself does not release it. 0 (the default) sets
 nothing else squeezes video: `GET /system` reports `egress_bps`, `egress_squeezed` and the kernel's
 refusals either way, for whatever places new calls (`src/egress.rs`).
 
+### Finding the card's ceilings: `RTCD_RTC_EGRESSAUTO` (default on)
+
+Nobody can say in advance what a virtual card carries. The OVH 4-vCPU video node took 800 to 850
+Mbit/s of a "1 Gbit/s" card and 117 thousand packets a second, and not both at once with small packets;
+the card's reported speed is wrong or missing on virtual NICs; a number written in a setting leaves a
+third of the card unused (70 % of 850) or none of it protected (unset, as production was). So the
+node finds it by sending, the way a congestion controller does (`src/capacity.rs`): one ceiling for
+bits and one for packets, each on its own, decided on the *sustained* rate (the median of the last
+seven seconds, so a keyframe fanned out to a class does not close the node, and a class joining is
+followed three seconds late).
+
+1. **Start.** At `RTCD_RTC_EGRESSLEARNMINMBPS` (default 400) and `RTCD_RTC_EGRESSLEARNMINPPS` (default
+   80000), about half of what the OVH video card was measured to take. This is also the least the
+   node ever concludes: refusals while it sends under it are taken for the machine's (the kernel's
+   count is the whole machine's, and rtcd runs with `hostNetwork`), not for the card's limit. A link
+   that reports a speed under 1 Gbit/s (`/sys/class/net/<interface>/speed`) starts at 40 % of it, and
+   no ceiling in bits passes 97 % of the link; a link reporting more, or nothing, changes nothing
+   (virtual cards say 10000 for a hypervisor that gives them 1000, and a link that says less than it
+   gives is why `RTCD_RTC_EGRESSCAPACITYMBPS` exists).
+2. **Rise.** A ceiling is *pressed* when the sustained rate is within 85 % of it. After ten seconds in
+   a row pressed, without two refusing windows in a row (one is a burst), it rises by 10 %, then 20 %,
+   then 25 % for every rise that held, never to more than a quarter above the rate, and not while the
+   node holds its people down (the rate is then its own choice). A ceiling nothing presses on does not
+   move. The node climbs only as fast as its people ask for more and the kernel accepts it; from 400
+   to 850 Mbit/s takes about a minute of pressing.
+3. **Wall.** Three refusing windows in a row (a window refuses when the kernel refused at least 50
+   datagrams a second and 0.5 % of those sent; a stall of the machine or the card is over in a second
+   or two) are a wall: the limit that was being met takes the highest rate the kernel accepted whole
+   just before (the sustained rate of the last window that refused nothing and was not squeezed). Not
+   the rate that failed, which is a burst, and not the rate less the kernel's share of refusals,
+   which reads low (the kernel counts a call, not a datagram, and the node sends 64 at a time). A
+   node asked for more in one step takes the rate from before the step, which it could carry, and
+   finds the rest by probing. A wall already known is lowered by a tenth at most per run. Which limit
+   was met is read from the rates: the one near its ceiling; the kernel does not say.
+4. **Probing the wall.** A rise made within two minutes before a wall failed: the next one waits
+   twice as long (20 s, 40 s ... up to ten minutes) and is 5 %. A rise that held (the next came with
+   no refusal in between) puts the wait and the step back. A node sitting at its wall tests it ever
+   less often (one refusing spell of a few seconds every ten minutes at most); one whose card got
+   faster, or whose wall was a stall's, finds out.
+5. **Said.** `RTCD_RTC_EGRESSCAPACITYMBPS` and `RTCD_RTC_EGRESSCAPACITYPPS` replace what the node
+   would learn for their limit, and nothing moves them. With `RTCD_RTC_EGRESSAUTO=false` only what is
+   said is known and a limit not said has no ceiling.
+
+The ceilings are in `GET /system` (`egress_capacity_bps`, `egress_ceiling_pps`, and
+`egress_capacity_source`: `probing` before the card has refused anything, `learned` after, `fixed` for
+the operator's) and in the metrics above. They are in memory: a restarted node starts again at the
+start (the first class of the day climbs for a minute or two, and nothing stale is kept in a file).
+
+What the node does near them is the admission's (below): it takes no newcomer from 94 % of the nearer
+ceiling (`RTCD_RTC_REFUSEEGRESSPERCENT`, released at 89 %), and, once a ceiling is a wall and not a
+probe and the kernel is refusing, sheds quality from 110 % of it (`RTCD_RTC_SHEDEGRESSPERCENT`),
+held at least twenty seconds.
+
+Failure modes, in the order they are likely:
+
+- **A wall that is too low** (a stall of three seconds that fell in a rise, a step in demand, a
+  neighbour on the card): the node refuses newcomers earlier than it needs to until a rise finds
+  the rest, a minute or two. It never sheds against it unless the kernel is refusing as well.
+- **A wall that is too high**: the node sends past what the card takes until the kernel refuses
+  three seconds in a row, then it is lowered to what was carried whole before (by a tenth at most per
+  run). Joins stop at 94 % of it, and a call that grows past that loses what the kernel refuses.
+- **The kernel's count is the machine's**, so a process on the node that sends UDP and overflows its
+  own queue is read as the card's refusals. Refusals while the node sends under its start are never
+  taken for a wall, and the kernel's count is only the trigger: the rate learned is the node's own.
+- **A card slower than the start the link does not name** (a 200 Mbit/s VPS whose NIC reports 10000)
+  is never learned, and the node goes by memory and the kernel's refusals alone, as before. Set
+  `RTCD_RTC_EGRESSLEARNMINMBPS` and `_PPS` under such a card, or say it.
+- **A restarted node** has forgotten and climbs again from the start.
+
 ### Acting on the kernel's refusals: `RTCD_RTC_EGRESSADAPT` (default off)
 
 The node counts the datagrams the kernel refuses to queue and reports them (`kernel_send_drops`,
@@ -189,9 +258,10 @@ The node counts the datagrams the kernel refuses to queue and reports them (`ker
 `RTCD_RTC_EGRESSADAPT=true` (`rtc.egress_adapt`) it also acts on them, in steps. The refusals are the
 whole machine's signal (rtcd runs with `hostNetwork`, so any UDP sender on the node adds to the
 count, which also counts calls and not datagrams), so these are guesses until a run on the real card
-has shown them right, and they are off until then; off, only a send budget squeezes, no voice is cut
-and uploads go at their full rate, as in the release before. A window *refuses* when the kernel
-refused at least 50 datagrams a second and 0.5 % of those sent.
+has shown them right, and they are off until then; off, only a send budget and the admission's hold
+squeeze, no voice is cut and uploads go at their full rate, as in the release before. (The ceilings
+above are learned from the same refusals but act through the admission only, whatever this setting
+says.)
 
 1. Two refusing windows in a row slow recording uploads to a quarter of their rate for as long as the
    refusals last and ten seconds after (`egress_refusing`), unless the files waiting are half of
@@ -200,29 +270,19 @@ refused at least 50 datagrams a second and 0.5 % of those sent.
    and ten seconds after (`egress_squeezed`). A stall of the machine or the card lasts seconds and
    teaches nothing. A squeeze that comes back within two minutes is held twice as long (up to five
    minutes), so a demand just over the limit does not switch layers and voices every few seconds.
-3. Fifteen in a row are an overload, not a stall. If the node sends at least the *learn floor*
-   (`RTCD_RTC_EGRESSLEARNMINMBPS`, default 400, or `RTCD_RTC_EGRESSLEARNMINPPS`, default 80000: about
-   half of what the OVH video VPS's card was measured to take; below it refusals are never taken for
-   an overload) each limit's ceiling becomes 90 % of the most the card took in the run (what was
-   handed to the sockets less what the kernel refused, before the squeeze took it down;
-   `egress_ceiling_bps`, `_pps`, each taught only while that limit is the one being met), and the
-   squeeze is held by it from then on, released after
-   twenty seconds under 65 % of it (twice as long when it keeps coming back). The ceiling is lifted
-   by a tenth for every five minutes without a refusal and forgotten once it is twice what was taught
-   (a node idle all night starts the morning without it). An overload that finds the node not
-   squeezed teaches the rate afresh; one while squeezed teaches only a lower rate.
-4. A squeeze the node decided on (a budget, a ceiling) that the kernel refuses through for five
-   windows in a row *chokes* the node (`egress_choked`): calls forward their loudest voice only, until
-   the kernel has accepted everything for ten seconds. A choke that comes back within a minute begins
-   at the first refusing window and is held twice as long (up to two minutes). A clean window between
-   the refusals starts the count again, so an overload that stutters never chokes; and a stall that
-   falls in a squeeze from a real ceiling and lasts five windows costs one voice per call for ten
-   seconds.
+3. A squeeze the node decided on (a budget, or the admission's hold near the ceiling) that the kernel
+   refuses through for five windows in a row *chokes* the node (`egress_choked`): calls forward their
+   loudest voice only, until the kernel has accepted everything for ten seconds. A choke that comes
+   back within a minute begins at the first refusing window and is held twice as long (up to two
+   minutes). A clean window between the refusals starts the count again, so an overload that stutters
+   never chokes; and a stall that falls in a squeeze and lasts five windows costs one voice per call
+   for ten seconds.
 
-Refusals teach by what the card *took*, so a demand at twice the card's limit learns the limit, not
+A wall is taught by what the card *took*, so a demand at twice the card's limit learns the limit, not
 twice it. The gauge cannot tell a stall from an overload except by how long it lasts and how much the
-card took: a stall that took everything teaches nothing, one that took at least the floor for fifteen
-windows is taken for an overload, so the longest real stall has to be measured on the card.
+card took: a stall that took everything teaches nothing, one that lasts three windows and took at
+least the start is taken for a wall (and probed again in twenty seconds), so the longest real stall has
+to be measured on the card.
 
 The service also brings these figures up to date every second whether or not any session is left,
 and a window in which nothing was sent clears the squeeze and the choke, so an idle node reports no
@@ -336,21 +396,29 @@ runtime a saturated node starves):
   participant in the call or just gone are not) and the node sheds: small video layers, fewer voices.
 - From `RTCD_RTC_REFUSEHARDMEMORYPERCENT` (85) nobody is taken, a host included, and calls forward
   their loudest voice only. Each limit is released ten points lower; 0 turns it off.
-- While the kernel refuses the node's datagrams (`egress_refusing`), or it sends at the ceiling it
-  learned, newcomers are refused (`RTCD_RTC_REFUSEWHENKERNELREFUSES`, default true).
-- With `RTCD_RTC_EGRESSCAPACITYMBPS` (what the card is planned to carry; 0, the default, says
-  nothing) the node takes no newcomer once it sends `RTCD_RTC_REFUSEEGRESSPERCENT` (70) of it and
-  sheds from `RTCD_RTC_SHEDEGRESSPERCENT` (90), each released ten points lower. A call cannot move
-  and keeps growing as people rejoin or arrive late, so the node near its card stops taking them
-  before the kernel starts refusing. Plan it under the card: the OVH 4-vCPU video node took 800 to
-  850 Mbit/s of a 1 Gbit/s card cleanly.
+- While the kernel refuses the node's datagrams (`egress_refusing`) newcomers are refused
+  (`RTCD_RTC_REFUSEWHENKERNELREFUSES`, default true).
+- Near the card's ceilings (the learned ones, or said by `RTCD_RTC_EGRESSCAPACITYMBPS` and `_PPS`; see
+  "Finding the card's ceilings") the node takes no newcomer once it sends `RTCD_RTC_REFUSEEGRESSPERCENT`
+  (94) of the nearer one, released at 89, so that a node uses all but a few percent of what its card
+  carries and stops before the kernel refuses. A call cannot move and keeps growing as people rejoin
+  or arrive late, so the few percent left are what those calls grow into. It sheds (small video
+  layers, fewer voices) from `RTCD_RTC_SHEDEGRESSPERCENT` (110) of a ceiling that is a fact, a wall
+  the card showed or a figure said, never against a probe, and only while the kernel refuses: past a
+  wall everyone loses packets, a demand a few percent over loses a few percent which receivers
+  recover, and cutting every receiver's video for that costs more. A shed is held for twenty seconds at least (twice as long
+  each time it returns within two minutes, up to five minutes) and released when the rate is 15
+  points under its mark; the node stays closed to newcomers while it sheds and for thirty seconds
+  after, because the rate it reports is low only because of the shed.
 - `GET /system` reports `admission_closed` (`memory`, `memory_hard`, `egress`, `refusals`; empty
-  when open), `egress_capacity_bps` and `egress_headroom_bps` (the refusal mark less what it sends),
-  which the server reads to place calls (a call goes only where the headroom covers what the class is
-  expected to send). Metrics: `rtcd_admission_closed{reason}`, `rtcd_egress_capacity_bps`,
-  `rtcd_egress_headroom_bps`, `rtcd_rtc_sessions_refused_total{reason}` (`shard` too),
-  `rtcd_forward_queued_packets`, `rtcd_forward_dropped_packets_total`, `rtcd_shard_turn_peak_reads`,
-  `rtcd_shard_turn_peak_transmits`, `rtcd_shard_turn_longest_seconds`.
+  when open), `egress_capacity_bps` (the ceiling in bits: said, learned or still probing, with
+  `egress_capacity_source`) and `egress_headroom_bps` (the refusal mark less what it sends), which
+  the server reads to place calls (a call goes only where the headroom covers what the class is
+  expected to send). A node that has not yet seen its wall reports the start it probes from, so
+  the server prefers a node that has shown it carries more. Metrics: `rtcd_admission_closed{reason}`,
+  `rtcd_egress_capacity_bps`, `rtcd_egress_headroom_bps`, `rtcd_rtc_sessions_refused_total{reason}`
+  (`shard` too), `rtcd_forward_queued_packets`, `rtcd_forward_dropped_packets_total`,
+  `rtcd_shard_turn_peak_reads`, `rtcd_shard_turn_peak_transmits`, `rtcd_shard_turn_longest_seconds`.
 
 A refused session is closed, as at a saturated shard; the web app treats that as a lost connection
 and tries again with growing pauses (`lms-web/src/lib/features/calls/rejoin.ts`).
@@ -367,6 +435,13 @@ With no setting changed, a node that takes this release behaves differently in f
   (`RTCD_RTC_REFUSEWHENSATURATED=false` turns that off).
 - Under load (90 % busy for two seconds, or a send budget reached) it holds receivers to the small
   video layers and forwards two voices.
+
+On by default since the release that finds the card's ceilings: `RTCD_RTC_EGRESSAUTO` (the node learns
+what its card carries and takes no newcomer within 6 % of it; set `RTCD_RTC_EGRESSAUTO=false` for a
+node that goes by memory and the kernel's refusals alone). `RTCD_RTC_REFUSEEGRESSPERCENT` and
+`RTCD_RTC_SHEDEGRESSPERCENT` now apply to those ceilings (94 and 110, were 70 and 90 of a figure
+that had to be written down); a figure written in `RTCD_RTC_EGRESSCAPACITYMBPS` is what the card was
+measured to take, not a margin under it.
 
 Off unless set: the send budgets (`RTCD_RTC_EGRESSBUDGETMBPS`, `RTCD_RTC_EGRESSBUDGETPPS`), acting
 on the kernel's refusals (`RTCD_RTC_EGRESSADAPT`) and the packet time (`RTCD_RTC_AUDIOPTIMEMS`). `GET /system` gains `shards_pressured`, `shards_saturated`,

@@ -26,15 +26,17 @@ pub struct Limits {
     /// The share at which nobody is accepted, not even a class's host, and calls forward their
     /// loudest voice only (0: not at all). It is released ten points lower.
     pub memory_hard: f64,
-    /// Whether newcomers are refused while the kernel refuses datagrams or the node sends at the
-    /// ceiling it learned.
+    /// Whether newcomers are refused while the kernel refuses datagrams.
     pub on_refusals: bool,
-    /// What the node's card is planned to carry, in bits per second (0: not said). With it, the
-    /// node refuses newcomers once it sends `egress_refuse` of it, and sheds (small video layers,
-    /// fewer voices) from `egress_shed`; each is released ten points lower, and 0 turns it off. A
-    /// call cannot move and keeps growing as people rejoin or arrive late, so the node that is
-    /// near its card must stop taking them before the kernel starts refusing.
-    pub egress_capacity_bps: u64,
+    /// The share of the card's ceiling (bits or packets a second, whichever is nearer; see
+    /// `capacity`) at which the node refuses newcomers, and the share at which it sheds (small
+    /// video layers, fewer voices). 0 turns each off. A call cannot move and keeps growing as
+    /// people rejoin or arrive late, so the node that is near its card must stop taking them
+    /// before the kernel starts refusing. It sheds only when what its people ask for is past what
+    /// the card takes (a ceiling learned is the rate the kernel last took whole, so 110 % of it is past the wall): a
+    /// demand a little over loses a little to the kernel, which a receiver recovers, and cutting
+    /// everyone's video to its small layer for that would cost far more. While it sheds the rate
+    /// is lower than the demand, so the node stays closed to newcomers for as long.
     pub egress_refuse: f64,
     pub egress_shed: f64,
 }
@@ -45,9 +47,8 @@ impl Default for Limits {
             memory_soft: 0.70,
             memory_hard: 0.85,
             on_refusals: true,
-            egress_capacity_bps: 0,
-            egress_refuse: 0.70,
-            egress_shed: 0.90,
+            egress_refuse: 0.94,
+            egress_shed: 1.10,
         }
     }
 }
@@ -145,12 +146,16 @@ pub struct Reading {
     pub memory: u64,
     /// The kernel is refusing datagrams.
     pub refusing: bool,
-    /// The send rate in bits and packets per second, and the ceilings the node learned for them
-    /// (0: none yet).
+    /// The send rate in bits and packets per second, and the ceilings of the card for them (0:
+    /// not known).
     pub bps: u64,
     pub pps: u64,
     pub ceiling_bps: u64,
     pub ceiling_pps: u64,
+    /// Which of those ceilings are facts (the operator's, or a wall the card showed) and not a
+    /// probe: the node sheds only against a fact.
+    pub proven_bps: bool,
+    pub proven_pps: bool,
 }
 
 /// The decision, with the memory it keeps so that a reading hovering at a limit does not open and
@@ -159,20 +164,47 @@ pub struct Reading {
 pub struct Admission {
     limits: Limits,
     verdict: Verdict,
+    /// Updates so far, to time the hold of the shed.
+    ticks: u64,
+    shed: Shed,
 }
 
-/// The share of the limit below which a limit that was reached is released.
+/// The shed of quality near the card's ceiling, which is held (see [`Admission::update`]).
+#[derive(Debug, Default)]
+struct Shed {
+    on: bool,
+    until: u64,
+    hold: u64,
+    ended: u64,
+    /// Newcomers stay refused until then: the rate was low because of the shed, not because the
+    /// people had gone.
+    closed_until: u64,
+}
+
+/// The share of a memory limit below which a limit that was reached is released.
 const RELEASE: f64 = 0.10;
-/// The share of the learned ceiling at which the node counts as sending at it, and below which it
-/// does not any more.
-const AT_CEILING: f64 = 1.0;
-const OFF_CEILING: f64 = 0.9;
+/// The same for the refusal of newcomers near the card's ceiling: the node sends close to it by
+/// design, so a release ten points lower would leave a tenth of the card unused.
+const EGRESS_RELEASE: f64 = 0.05;
+/// The shed is released only when the rate is this far under its mark, because it is the shed that
+/// lowered the rate.
+const SHED_RELEASE: f64 = 0.15;
+/// How long a shed lasts at least, twice as long when it comes back within [`SHED_AGAIN`] of its
+/// end, up to [`SHED_MAX`]: a demand just over the ceiling does not switch every layer every few
+/// seconds. In updates ([`TICK`]).
+const SHED_HOLD: u64 = 20 * 4;
+const SHED_AGAIN: u64 = 120 * 4;
+const SHED_MAX: u64 = 300 * 4;
+/// How long the node stays closed to newcomers after a shed, in updates.
+const SHED_COOL: u64 = 30 * 4;
 
 impl Admission {
     pub fn new(limits: Limits) -> Self {
         Self {
             limits,
             verdict: Verdict::default(),
+            ticks: 0,
+            shed: Shed::default(),
         }
     }
 
@@ -199,35 +231,61 @@ impl Admission {
         };
         v |= level(self.limits.memory_soft, MEMORY);
         v |= level(self.limits.memory_hard, MEMORY_HARD);
-        if self.limits.egress_capacity_bps > 0 {
-            let capacity = self.limits.egress_capacity_bps as f64;
-            let sent = r.bps as f64 / capacity;
-            let level = |limit: f64, bit: u8| {
-                if limit <= 0.0 {
-                    0
-                } else if sent >= limit || (held & bit != 0 && sent >= limit - RELEASE) {
-                    bit
-                } else {
-                    0
-                }
-            };
-            v |= level(self.limits.egress_refuse, EGRESS);
-            v |= level(self.limits.egress_shed, EGRESS_SHED);
-        }
-        if self.limits.on_refusals {
-            let at = |rate: u64, ceiling: u64| {
-                if ceiling == 0 {
-                    return false;
-                }
-                let f = rate as f64 / ceiling as f64;
-                f >= AT_CEILING || (held & REFUSALS != 0 && f >= OFF_CEILING)
-            };
-            if r.refusing || at(r.bps, r.ceiling_bps) || at(r.pps, r.ceiling_pps) {
-                v |= REFUSALS;
+        self.ticks += 1;
+        let share = |rate: u64, ceiling: u64| {
+            if ceiling == 0 {
+                0.0
+            } else {
+                rate as f64 / ceiling as f64
             }
+        };
+        let sent = share(r.bps, r.ceiling_bps).max(share(r.pps, r.ceiling_pps));
+        let refuse = self.limits.egress_refuse;
+        if refuse > 0.0
+            && (sent >= refuse || (held & EGRESS != 0 && sent >= refuse - EGRESS_RELEASE))
+        {
+            v |= EGRESS;
+        }
+        let known = share(if r.proven_bps { r.bps } else { 0 }, r.ceiling_bps)
+            .max(share(if r.proven_pps { r.pps } else { 0 }, r.ceiling_pps));
+        if self.limits.egress_shed > 0.0 && self.shed(known, r.refusing) {
+            v |= EGRESS_SHED | EGRESS;
+        }
+        if self.ticks < self.shed.closed_until {
+            v |= EGRESS;
+        }
+        if self.limits.on_refusals && r.refusing {
+            v |= REFUSALS;
         }
         self.verdict = Verdict(v);
         self.verdict
+    }
+
+    /// Whether the node sheds at this share of its card's ceiling: from `egress_shed` of it while
+    /// the kernel refuses, for at least [`SHED_HOLD`] and until the rate is [`SHED_RELEASE`] under
+    /// the mark. A node over a ceiling the kernel does not refuse at has a ceiling that is too low,
+    /// which the estimator finds out.
+    fn shed(&mut self, sent: f64, refusing: bool) -> bool {
+        let mark = self.limits.egress_shed;
+        let t = self.ticks;
+        let sh = &mut self.shed;
+        if sent >= mark && (sh.on || refusing) {
+            if !sh.on {
+                let soon = sh.ended > 0 && t.saturating_sub(sh.ended) < SHED_AGAIN;
+                sh.hold = if soon {
+                    (sh.hold * 2).min(SHED_MAX)
+                } else {
+                    SHED_HOLD
+                };
+                sh.on = true;
+            }
+            sh.until = t + sh.hold;
+        } else if sh.on && t >= sh.until && sent < mark - SHED_RELEASE {
+            sh.on = false;
+            sh.ended = t;
+            sh.closed_until = t + SHED_COOL;
+        }
+        sh.on
     }
 }
 
@@ -330,28 +388,6 @@ mod tests {
     }
 
     #[test]
-    fn sending_at_the_learned_ceiling_closes_the_node_until_it_is_ten_percent_under() {
-        let mut a = Admission::default();
-        let at = |bps| Reading {
-            bps,
-            ceiling_bps: 800_000_000,
-            ..Default::default()
-        };
-        assert!(!a.update(at(700_000_000)).refuses_newcomers());
-        assert!(a.update(at(800_000_000)).refuses_newcomers());
-        assert!(a.update(at(740_000_000)).refuses_newcomers(), "92 %: held");
-        assert!(!a.update(at(700_000_000)).refuses_newcomers());
-        let none = Reading {
-            bps: 900_000_000,
-            ..Default::default()
-        };
-        assert!(
-            !a.update(none).refuses_newcomers(),
-            "no ceiling learned, nothing to be at"
-        );
-    }
-
-    #[test]
     fn the_verdict_is_shared_between_threads() {
         let s = Shared::default();
         assert!(!s.get().refuses_newcomers());
@@ -360,31 +396,123 @@ mod tests {
         assert!(s.get().refuses_everyone());
     }
 
-    #[test]
-    fn a_node_near_its_card_takes_no_newcomer_and_sheds_nearer_still() {
-        let mut a = Admission::new(Limits {
-            egress_capacity_bps: 1_000_000_000,
-            ..Limits::default()
-        });
-        let at = |mbps: u64| Reading {
-            bps: mbps * 1_000_000,
+    fn card(bps: u64, pps: u64) -> Reading {
+        Reading {
+            bps,
+            pps,
+            ceiling_bps: 850_000_000,
+            ceiling_pps: 117_000,
+            proven_bps: true,
+            proven_pps: true,
             ..Default::default()
-        };
-        assert!(!a.update(at(650)).refuses_newcomers(), "65 %");
-        let v = a.update(at(720));
-        assert!(v.refuses_newcomers() && !v.refuses_everyone() && !v.sheds());
+        }
+    }
+
+    fn mbit(m: u64, pps: u64) -> Reading {
+        Reading {
+            refusing: m > 850,
+            ..card(m * 1_000_000, pps)
+        }
+    }
+
+    #[test]
+    fn a_node_takes_newcomers_almost_to_its_ceiling_and_not_beyond() {
+        let mut a = Admission::default();
+        assert!(!a.update(mbit(700, 50_000)).refuses_newcomers(), "82 %");
+        assert!(!a.update(mbit(790, 50_000)).refuses_newcomers(), "93 %");
+        let v = a.update(mbit(810, 50_000));
+        assert!(
+            v.refuses_newcomers() && !v.refuses_everyone() && !v.sheds(),
+            "95 %"
+        );
         assert_eq!(v.reason(), "egress");
         assert!(
-            a.update(at(650)).refuses_newcomers(),
-            "65 %: above 60, held"
+            a.update(mbit(770, 50_000)).refuses_newcomers(),
+            "91 %: above 89, held"
         );
-        let v = a.update(at(920));
-        assert!(v.sheds() && !v.chokes(), "92 %");
-        assert!(!a.update(at(550)).refuses_newcomers(), "55 %: released");
-        let mut unknown = Admission::default();
+        assert!(!a.update(mbit(740, 50_000)).refuses_newcomers(), "87 %");
+    }
+
+    #[test]
+    fn the_nearer_of_the_two_ceilings_decides() {
+        let mut a = Admission::default();
+        // Far from the bits, at the packets: voice.
+        let v = a.update(mbit(90, 112_000));
+        assert!(v.refuses_newcomers(), "96 % of the packets");
+        assert!(!a.update(mbit(90, 80_000)).refuses_newcomers(), "68 %");
+    }
+
+    #[test]
+    fn a_node_sheds_only_at_the_ceiling_and_keeps_shedding_for_a_while() {
+        let mut a = Admission::default();
         assert!(
-            !unknown.update(at(5_000)).refuses_newcomers(),
-            "no card said, nothing to be near"
+            !a.update(mbit(850, 50_000)).sheds(),
+            "100 %: the wall itself"
         );
+        assert!(!a.update(mbit(920, 50_000)).sheds(), "108 %");
+        let v = a.update(mbit(950, 50_000));
+        assert!(v.sheds() && !v.chokes() && v.refuses_newcomers(), "112 %");
+        // The shed took the rate down; the node holds it for twenty seconds all the same, and
+        // stays closed to newcomers: the demand is still there.
+        for _ in 0..79 {
+            let v = a.update(mbit(500, 50_000));
+            assert!(v.sheds() && v.refuses_newcomers());
+        }
+        let v = a.update(mbit(500, 50_000));
+        assert!(
+            !v.sheds() && v.refuses_newcomers(),
+            "after twenty seconds, still closed"
+        );
+        for _ in 0..119 {
+            assert!(a.update(mbit(500, 50_000)).refuses_newcomers());
+        }
+        assert!(
+            !a.update(mbit(500, 50_000)).refuses_newcomers(),
+            "after thirty more"
+        );
+        // Not released at 98 %: the shed is what lowered it. It is at 95 %.
+        let mut a = Admission::default();
+        a.update(mbit(950, 50_000));
+        for _ in 0..100 {
+            assert!(
+                a.update(mbit(830, 50_000)).sheds(),
+                "98 %: over the release mark"
+            );
+        }
+        assert!(!a.update(mbit(790, 50_000)).sheds(), "93 %");
+    }
+
+    #[test]
+    fn a_shed_that_comes_back_is_held_longer() {
+        let mut a = Admission::default();
+        let hold = |a: &mut Admission| {
+            a.update(mbit(950, 50_000));
+            let mut n = 0;
+            while a.update(mbit(300, 50_000)).sheds() {
+                n += 1;
+            }
+            n
+        };
+        let first = hold(&mut a);
+        let second = hold(&mut a);
+        assert!(second >= 2 * first - 2, "{first} then {second} updates");
+    }
+
+    #[test]
+    fn a_node_with_no_ceiling_known_has_no_card_to_be_near() {
+        let mut a = Admission::default();
+        let v = a.update(Reading {
+            bps: 5_000_000_000,
+            pps: 900_000,
+            ..Default::default()
+        });
+        assert!(!v.refuses_newcomers() && !v.sheds());
+        let mut off = Admission::new(Limits {
+            egress_refuse: 0.0,
+            egress_shed: 0.0,
+            on_refusals: false,
+            ..Limits::default()
+        });
+        assert!(!off.update(mbit(900, 200_000)).refuses_newcomers());
     }
 }

@@ -576,7 +576,7 @@ fn a_shard_with_room_keeps_the_large_layer() {
 
 #[test]
 fn a_node_with_no_budget_squeezes_video_when_the_kernel_refuses_datagrams() {
-    // No budget is set: the node's own ceiling, learned from the refusals, is all there is.
+    // No budget is set: the stall squeeze against the kernel's refusals is all there is.
     let refused = Arc::new(AtomicU64::new(0));
     let mut w = World::with_config(config_with_refusals(&refused, true));
     let a = w.join_with_camera("alice", "call1");

@@ -151,17 +151,17 @@ impl Node {
             ),
             egress_capacity: g(
                 "egress_capacity_bps",
-                "What the card is planned to carry (RTCD_RTC_EGRESSCAPACITYMBPS), in bits per second; 0 when not said",
+                "What the node takes its card to carry, in bits per second: RTCD_RTC_EGRESSCAPACITYMBPS, or what it has learned by sending (see /system egress_capacity_source); 0 when not known",
             ),
             egress_headroom: g(
                 "egress_headroom_bps",
-                "How much more the node can send before it takes no newcomer (the refusal share of the card less what it sends); 0 when there, or when no card was said",
+                "How much more the node can send before it takes no newcomer (the refusal share of the card less what it sends); 0 when there, or when the card is not known",
             ),
             admission_closed: {
                 let v = GaugeVec::new(
                     Opts::new(
                         "admission_closed",
-                        "1 while the node takes no new sessions, by reason: memory, memory_hard (not even a class's host), egress (the card is nearly full) or refusals (the kernel refuses datagrams, or the node sends at its learned ceiling)",
+                        "1 while the node takes no new sessions, by reason: memory, memory_hard (not even a class's host), egress (it sends near what its card carries) or refusals (the kernel refuses datagrams)",
                     )
                     .namespace(NAMESPACE),
                     &["reason"],
@@ -215,16 +215,19 @@ impl Node {
             ),
             egress_ceiling_bps: g(
                 "egress_ceiling_bps",
-                "The send rate in bits per second at which the kernel started refusing datagrams, as the node learned it (0 until it has)",
+                "What the node takes its card to carry, in bits per second (the same as egress_capacity_bps; 0 when nothing is estimated)",
             ),
-            egress_ceiling_pps: g("egress_ceiling_pps", "The same in datagrams per second"),
+            egress_ceiling_pps: g(
+                "egress_ceiling_pps",
+                "What the node takes its card to carry, in datagrams per second: learned, or RTCD_RTC_EGRESSCAPACITYPPS",
+            ),
             egress_adapt: g(
                 "egress_adapt",
                 "1 when the node acts on the kernel's refusals (RTCD_RTC_EGRESSADAPT), 0 when it only counts and reports them",
             ),
             egress_squeezed: g(
                 "egress_squeezed",
-                "1 while receivers are held to the small video layers and calls to two voices: a send budget is reached, or, with egress_adapt, the kernel is refusing datagrams (until ten seconds after) or the learned ceiling is reached",
+                "1 while receivers are held to the small video layers and calls to two voices: a send budget is reached, the node sends at what its card carries, or, with egress_adapt, the kernel is refusing datagrams (until ten seconds after)",
             ),
             egress_refusing: g(
                 "egress_refusing",
@@ -575,7 +578,7 @@ impl Metrics {
                 r,
                 "rtc",
                 "sessions_refused_total",
-                "Sessions turned away, by reason: shard (the shard its call lives on is at its limit), memory and memory_hard (the node is nearly out of memory), refusals (the kernel refuses the node's datagrams, or it sends at its learned ceiling)",
+                "Sessions turned away, by reason: shard (the shard its call lives on is at its limit), memory and memory_hard (the node is nearly out of memory), refusals (the kernel refuses the node's datagrams)",
                 &["reason"],
             ),
             connection_time: histogram(

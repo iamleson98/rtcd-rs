@@ -4,9 +4,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rtcd_sfu::capacity;
 use rtcd_sfu::config::{EngineConfig, LocalAddress};
 use rtcd_sfu::egress::Gauge;
 use rtcd_sfu::engine::Event;
+use rtcd_sfu::hostnet;
 use rtcd_sfu::runtime::{Limits, ScalingPolicy, Sfu, SfuConfig};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
@@ -87,12 +89,27 @@ pub fn sfu_config(cfg: &Config, addresses: Vec<LocalAddress>) -> SfuConfig {
     engine.audio_ptime_ms = rtc.audio_ptime_ms.clamp(0, 120) as u32;
     engine.egress_budget_bps = rtc.egress_budget_mbps.clamp(0, 100_000) as u64 * 1_000_000;
     engine.egress_budget_pps = rtc.egress_budget_pps.clamp(0, 100_000_000) as u64;
+    let fixed = [
+        rtc.egress_capacity_mbps.clamp(0, 100_000) as f64 * 1e6,
+        rtc.egress_capacity_pps.clamp(0, 100_000_000) as f64,
+    ];
+    let mut gauge = Gauge::default();
     if rtc.egress_adapt {
-        engine.egress = std::sync::Arc::new(Gauge::adaptive(
-            rtc.egress_learn_min_mbps.clamp(0, 100_000) as u64 * 1_000_000,
-            rtc.egress_learn_min_pps.clamp(0, 100_000_000) as u64,
-        ));
+        gauge = gauge.adapting();
     }
+    // Without auto only what the operator said is known.
+    if rtc.egress_auto || fixed.iter().any(|&f| f > 0.0) {
+        gauge = gauge.estimating(capacity::Config {
+            start: [
+                rtc.egress_learn_min_mbps.clamp(1, 100_000) as f64 * 1e6,
+                rtc.egress_learn_min_pps.clamp(1, 100_000_000) as f64,
+            ],
+            fixed,
+            learn: rtc.egress_auto,
+            link_bps: hostnet::link_speed_bps().map_or(0.0, |bps| bps as f64),
+        });
+    }
+    engine.egress = std::sync::Arc::new(gauge);
     // A shard is a thread, a call lives on one, and one carries a few hundred participants before it
     // saturates (measured: a single shard dropped 3 % of the voice packets at 600 participants on
     // four cores, and lost two thirds at 900, where two shards lost 7 %). Another is not free
@@ -126,7 +143,6 @@ pub fn sfu_config(cfg: &Config, addresses: Vec<LocalAddress>) -> SfuConfig {
             memory_soft: rtc.refuse_memory_percent as f64 / 100.0,
             memory_hard: rtc.refuse_hard_memory_percent as f64 / 100.0,
             on_refusals: rtc.refuse_when_kernel_refuses,
-            egress_capacity_bps: rtc.egress_capacity_mbps as u64 * 1_000_000,
             egress_refuse: rtc.refuse_egress_percent as f64 / 100.0,
             egress_shed: rtc.shed_egress_percent as f64 / 100.0,
         },

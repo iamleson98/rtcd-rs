@@ -199,29 +199,36 @@ pub struct RtcConfig {
     pub audio_ptime_ms: i64,
     /// The most this node should send, in megabits per second. Near it every receiver's cameras
     /// and screen shares fall back to their small layer, so the node slows down evenly instead of
-    /// losing packets for everyone. 0 (the default) sets no budget: nothing squeezes video except
-    /// `egress_adapt`, which learns a ceiling from the kernel refusing datagrams. The rate is
+    /// losing packets for everyone. 0 (the default) sets no budget: the node goes by the ceilings
+    /// it finds out (`egress_auto`) and, with `egress_adapt`, by the kernel's refusals. The rate is
     /// reported on `GET /system` either way.
     pub egress_budget_mbps: i64,
     /// The most this node should send, in packets per second: the same fall back for the other
     /// ceiling. A virtual network card takes a limited number of packets however small they are,
     /// and voice packets are small: the OVH video VPS sends 150 to 200 thousand a second and then
     /// its transmit ring stays full. Set it to about 80 % of what the card was measured to take.
-    /// 0 (the default) sets no budget, and nothing squeezes on packets except `egress_adapt`.
+    /// 0 (the default) sets no budget, and the packets go by the ceiling the node finds out.
     pub egress_budget_pps: i64,
     /// Whether the node acts on the kernel refusing its datagrams (`RTCD_RTC_EGRESSADAPT`). Off,
     /// the default, it counts and reports them (`GET /system`, `/metrics`) and squeezes video
-    /// only for a send budget, as the previous release did. On, it also squeezes video and cuts
-    /// voices to two while refusals last, learns a ceiling from an overload that goes on for
-    /// fifteen seconds, cuts calls to their loudest voice if the squeeze does not stop the
-    /// refusals, and slows recording uploads while they last (see `rtcd_sfu::egress`). Those are
-    /// guesses about a signal that is the whole machine's: turn it on after a run on the real card.
+    /// only for a send budget and near its card's ceiling, as the previous release did. On, it
+    /// also squeezes video and cuts voices to two while refusals last, cuts calls to their loudest
+    /// voice if the squeeze does not stop the refusals, and slows recording uploads while they
+    /// last (see `rtcd_sfu::egress`). Those are guesses about a signal that is the whole
+    /// machine's: turn it on after a run on the real card.
     pub egress_adapt: bool,
-    /// The learn floor, when `egress_adapt` is on: refusals while the node sends under this many
-    /// megabits a second and under `egress_learn_min_pps` packets a second never teach it a
-    /// ceiling (it squeezes while they last and no longer), because a node that small is not at
-    /// its card's limit. The defaults are about half of what the OVH video VPS's card was measured
-    /// to take: 800 Mbit/s of large packets, 160 thousand small ones a second.
+    /// Whether the node finds out what its card carries (`RTCD_RTC_EGRESSAUTO`, the default) and
+    /// refuses newcomers and sheds quality only near that, instead of at a number written down
+    /// (see `rtcd_sfu::capacity`). It starts at the figures below, raises its ceiling while it is
+    /// pressed against it and the kernel accepts everything, and lowers it to just under the rate
+    /// at which the kernel began to refuse. `egress_capacity_mbps` and `egress_capacity_pps`
+    /// override what it learns for their limit.
+    pub egress_auto: bool,
+    /// Where the node starts, in megabits and packets a second, and the least it ever concludes
+    /// (refusals while it sends under them are not taken for its card's limit: the kernel's count
+    /// is the whole machine's). About half of what the OVH video VPS's card was measured to take:
+    /// 800 Mbit/s of large packets, 160 thousand small ones a second. A card known to be slower
+    /// (its link speed) starts lower; set these under a slower card the link does not name.
     pub egress_learn_min_mbps: i64,
     pub egress_learn_min_pps: i64,
     /// Whether a join is refused while the shard that would serve it is at its limit (a thread
@@ -239,16 +246,21 @@ pub struct RtcConfig {
     /// call on the node ends at once. Each is released ten points lower.
     pub refuse_memory_percent: i64,
     pub refuse_hard_memory_percent: i64,
-    /// Whether a join is refused while the kernel refuses datagrams the node hands it, or the
-    /// node sends at the ceiling it learned from them. The default is on: a node whose card drops
-    /// packets for everyone on it does not take more.
+    /// Whether a join is refused while the kernel refuses datagrams the node hands it. The default
+    /// is on: a node whose card drops packets for everyone on it does not take more.
     pub refuse_when_kernel_refuses: bool,
-    /// What the node's card is planned to carry, in megabits a second (0: not said). With it the
-    /// node takes no newcomer once it sends `refuse_egress_percent` of it (a call keeps growing as
-    /// people rejoin or arrive late, and cannot move), sheds from `shed_egress_percent`, and
-    /// reports its headroom on `GET /system` for the server that places calls. Plan it under the
-    /// card (the OVH 4-vCPU video node took 800 to 850 Mbit/s of a 1 Gbit/s card cleanly).
+    /// What the node's card carries, in megabits and packets a second, when the operator knows it
+    /// (0, the default: the node learns it; see `egress_auto`). Given, it replaces what the node
+    /// would learn for that limit, and nothing moves it. Say what the card was measured to take
+    /// cleanly (the OVH 4-vCPU video node: 850 Mbit/s of a 1 Gbit/s card, 117 thousand packets).
     pub egress_capacity_mbps: i64,
+    pub egress_capacity_pps: i64,
+    /// The share of the card's ceiling (bits or packets, the nearer) at which the node takes no
+    /// newcomer (a call keeps growing as people rejoin or arrive late, and cannot move), and the
+    /// share at which it sheds: small video layers and fewer voices, held at least twenty seconds.
+    /// A ceiling the node learned is the rate the kernel last took whole, so the defaults take the
+    /// last join 6 % under it and shed 10 % past it: a demand a little over the wall loses a
+    /// little, which receivers recover, and cutting everyone's video costs more than that.
     pub refuse_egress_percent: i64,
     pub shed_egress_percent: i64,
     /// Seconds to let running sessions end on shutdown before ending them; 0 waits for them
@@ -368,6 +380,7 @@ impl Default for RtcConfig {
             egress_budget_mbps: 0,
             egress_budget_pps: 0,
             egress_adapt: false,
+            egress_auto: true,
             egress_learn_min_mbps: 400,
             egress_learn_min_pps: 80_000,
             refuse_when_saturated: true,
@@ -375,8 +388,9 @@ impl Default for RtcConfig {
             refuse_hard_memory_percent: 85,
             refuse_when_kernel_refuses: true,
             egress_capacity_mbps: 0,
-            refuse_egress_percent: 70,
-            shed_egress_percent: 90,
+            egress_capacity_pps: 0,
+            refuse_egress_percent: 94,
+            shed_egress_percent: 110,
             drain_timeout_seconds: 0,
         }
     }
@@ -519,6 +533,7 @@ impl Config {
         integer!("RTC_EGRESSBUDGETMBPS", self.rtc.egress_budget_mbps);
         integer!("RTC_EGRESSBUDGETPPS", self.rtc.egress_budget_pps);
         boolean!("RTC_EGRESSADAPT", self.rtc.egress_adapt);
+        boolean!("RTC_EGRESSAUTO", self.rtc.egress_auto);
         integer!("RTC_EGRESSLEARNMINMBPS", self.rtc.egress_learn_min_mbps);
         integer!("RTC_EGRESSLEARNMINPPS", self.rtc.egress_learn_min_pps);
         boolean!("RTC_REFUSEWHENSATURATED", self.rtc.refuse_when_saturated);
@@ -532,6 +547,7 @@ impl Config {
             self.rtc.refuse_when_kernel_refuses
         );
         integer!("RTC_EGRESSCAPACITYMBPS", self.rtc.egress_capacity_mbps);
+        integer!("RTC_EGRESSCAPACITYPPS", self.rtc.egress_capacity_pps);
         integer!("RTC_REFUSEEGRESSPERCENT", self.rtc.refuse_egress_percent);
         integer!("RTC_SHEDEGRESSPERCENT", self.rtc.shed_egress_percent);
         integer!("RTC_DRAINTIMEOUTSECONDS", self.rtc.drain_timeout_seconds);
@@ -649,16 +665,16 @@ impl Config {
                 "must be between 0 and 100000000",
             ));
         }
-        if !(0..=100_000).contains(&rtc.egress_learn_min_mbps) {
+        if !(1..=100_000).contains(&rtc.egress_learn_min_mbps) {
             return Err(invalid(
                 "EgressLearnMinMbps",
-                "must be between 0 and 100000",
+                "must be between 1 and 100000",
             ));
         }
-        if !(0..=100_000_000).contains(&rtc.egress_learn_min_pps) {
+        if !(1..=100_000_000).contains(&rtc.egress_learn_min_pps) {
             return Err(invalid(
                 "EgressLearnMinPps",
-                "must be between 0 and 100000000",
+                "must be between 1 and 100000000",
             ));
         }
         if !(0..=100).contains(&rtc.refuse_memory_percent) {
@@ -685,12 +701,18 @@ impl Config {
                 "must be between 0 and 100000",
             ));
         }
+        if !(0..=100_000_000).contains(&rtc.egress_capacity_pps) {
+            return Err(invalid(
+                "EgressCapacityPps",
+                "must be between 0 and 100000000",
+            ));
+        }
         for (name, v) in [
             ("RefuseEgressPercent", rtc.refuse_egress_percent),
             ("ShedEgressPercent", rtc.shed_egress_percent),
         ] {
-            if !(0..=100).contains(&v) {
-                return Err(invalid(name, "must be between 0 and 100"));
+            if !(0..=200).contains(&v) {
+                return Err(invalid(name, "must be between 0 and 200"));
             }
         }
         if rtc.refuse_egress_percent > 0
@@ -901,8 +923,15 @@ mod tests {
         );
         assert!(c.rtc.refuse_when_kernel_refuses);
         assert_eq!(
-            c.rtc.egress_capacity_mbps, 0,
-            "the card is not guessed: it is said, or the node goes by memory and the kernel's refusals"
+            (c.rtc.egress_capacity_mbps, c.rtc.egress_capacity_pps),
+            (0, 0),
+            "the card is not guessed: it is said, or the node finds it out"
+        );
+        assert!(c.rtc.egress_auto, "a node finds out what its card carries");
+        assert_eq!(
+            (c.rtc.refuse_egress_percent, c.rtc.shed_egress_percent),
+            (94, 110),
+            "a node takes newcomers almost to its ceiling and sheds only past it"
         );
         assert_eq!(c.store.data_source, "/tmp/rtcd_db");
         assert_eq!(c.api.security.session_cache.expiration_minutes, 1440);
@@ -1013,7 +1042,9 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
             ("RTCD_RTC_REFUSEMEMORYPERCENT", "60"),
             ("RTCD_RTC_REFUSEHARDMEMORYPERCENT", "90"),
             ("RTCD_RTC_REFUSEWHENKERNELREFUSES", "false"),
+            ("RTCD_RTC_EGRESSAUTO", "false"),
             ("RTCD_RTC_EGRESSCAPACITYMBPS", "850"),
+            ("RTCD_RTC_EGRESSCAPACITYPPS", "117000"),
             ("RTCD_RTC_REFUSEEGRESSPERCENT", "75"),
             ("RTCD_RTC_SHEDEGRESSPERCENT", "95"),
             ("RTCD_STORE_DATASOURCE", "/data/db"),
@@ -1045,11 +1076,13 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
         assert_eq!(
             (
                 c.rtc.egress_capacity_mbps,
+                c.rtc.egress_capacity_pps,
                 c.rtc.refuse_egress_percent,
                 c.rtc.shed_egress_percent
             ),
-            (850, 75, 95)
+            (850, 117_000, 75, 95)
         );
+        assert!(!c.rtc.egress_auto);
         assert_eq!(c.store.data_source, "/data/db");
         assert!(!c.logger.enable_file);
         assert!(c.logger.console_json);
@@ -1136,12 +1169,13 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
         assert!(bad(&|c| c.rtc.audio_ptime_ms = -20).contains("multiple of 20"));
         assert!(bad(&|c| c.rtc.egress_budget_mbps = -1).contains("between 0 and 100000"));
         assert!(bad(&|c| c.rtc.egress_budget_pps = -1).contains("between 0 and 100000000"));
-        assert!(bad(&|c| c.rtc.egress_learn_min_mbps = -1).contains("between 0 and 100000"));
-        assert!(bad(&|c| c.rtc.egress_learn_min_pps = -1).contains("between 0 and 100000000"));
+        assert!(bad(&|c| c.rtc.egress_learn_min_mbps = 0).contains("between 1 and 100000"));
+        assert!(bad(&|c| c.rtc.egress_learn_min_pps = 0).contains("between 1 and 100000000"));
+        assert!(bad(&|c| c.rtc.egress_capacity_pps = -1).contains("between 0 and 100000000"));
         assert!(bad(&|c| c.rtc.refuse_memory_percent = 101).contains("between 0 and 100"));
         assert!(bad(&|c| c.rtc.refuse_hard_memory_percent = -1).contains("between 0 and 100"));
         assert!(bad(&|c| c.rtc.egress_capacity_mbps = -1).contains("between 0 and 100000"));
-        assert!(bad(&|c| c.rtc.refuse_egress_percent = 101).contains("between 0 and 100"));
+        assert!(bad(&|c| c.rtc.refuse_egress_percent = 201).contains("between 0 and 200"));
         assert!(
             bad(&|c| {
                 c.rtc.refuse_egress_percent = 90;
