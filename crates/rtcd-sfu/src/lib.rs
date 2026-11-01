@@ -1,5 +1,6 @@
 //! The media plane of rtcd.
 pub mod bwe;
+pub mod capacity;
 pub mod config;
 pub mod egress;
 pub mod engine;

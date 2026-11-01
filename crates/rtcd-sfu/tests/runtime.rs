@@ -22,7 +22,7 @@ fn a_node_with_no_session_left_stops_reporting_its_last_squeeze_and_rates() {
     let refused = Arc::new(AtomicU64::new(0));
     let counter = refused.clone();
     let gauge = Arc::new(
-        Gauge::with_kernel_drops(move || Some(counter.load(Ordering::Relaxed))).adapting(0, 0),
+        Gauge::with_kernel_drops(move || Some(counter.load(Ordering::Relaxed))).adapting(),
     );
     let live = Live::start_with(1, 0, ScalingPolicy::default(), gauge.clone());
     let sfu = &live.sfu;

@@ -65,6 +65,10 @@ async fn the_system_info_carries_the_load_of_the_instance() {
         "host_tx_pps",
         "host_tx_dropped_pps",
         "egress_adapt",
+        "egress_capacity_bps",
+        "egress_capacity_source",
+        "egress_headroom_bps",
+        "egress_ceiling_pps",
         "egress_refusing",
         "egress_choked",
     ] {

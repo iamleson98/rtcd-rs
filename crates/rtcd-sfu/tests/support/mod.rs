@@ -219,7 +219,7 @@ pub fn config_with_refusals(refused: &Arc<AtomicU64>, adapt: bool) -> EngineConf
     let gauge =
         rtcd_sfu::egress::Gauge::with_kernel_drops(move || Some(refused.load(Ordering::Relaxed)));
     EngineConfig {
-        egress: Arc::new(if adapt { gauge.adapting(0, 0) } else { gauge }),
+        egress: Arc::new(if adapt { gauge.adapting() } else { gauge }),
         ..engine_config()
     }
 }

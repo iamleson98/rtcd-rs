@@ -76,6 +76,30 @@ fn read() -> Option<Counters> {
     None
 }
 
+/// What the default route's interface says it carries, in bits per second (`None` where the system
+/// does not say). A physical card says it truly; a virtual one often says nothing, or something the
+/// hypervisor does not give (a 1 Gbit/s VPS on a card that says 10000), so this is a bound on what
+/// the node may assume, never a measurement of it.
+pub fn link_speed_bps() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let route = std::fs::read_to_string("/proc/net/route").ok()?;
+        let interface = default_interface(&route)?;
+        parse_speed(&std::fs::read_to_string(format!("/sys/class/net/{interface}/speed")).ok()?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// `/sys/class/net/<interface>/speed`: megabits per second, `-1` when the driver does not know.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn parse_speed(text: &str) -> Option<u64> {
+    let mbps: i64 = text.trim().parse().ok()?;
+    (mbps > 0).then(|| mbps as u64 * 1_000_000)
+}
+
 /// The rate between two readings `secs` apart; `None` if no time passed or a counter went back
 /// (the interface was reset).
 pub fn rate(before: &Counters, after: &Counters, secs: f64) -> Option<Rate> {
@@ -137,6 +161,14 @@ wg0\t00000000\t0100000A\t0003\t0\t0\t50\t00000000\t0\t0\t0\n";
  face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n\
     lo:  100  1 0 0 0 0 0 0   100  1 0 0 0 0 0 0\n\
   ens3: 5000 40 0 0 0 0 0 0 9000000 6000 2 7 0 0 0 0\n";
+
+    #[test]
+    fn a_link_speed_is_read_in_bits_and_an_unknown_one_is_none() {
+        assert_eq!(parse_speed("1000\n"), Some(1_000_000_000));
+        assert_eq!(parse_speed("-1\n"), None);
+        assert_eq!(parse_speed("0"), None);
+        assert_eq!(parse_speed("unknown"), None);
+    }
 
     #[test]
     fn the_default_route_names_the_interface() {

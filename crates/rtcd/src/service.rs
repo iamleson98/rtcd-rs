@@ -185,6 +185,7 @@ impl Service {
             kernel_send_drops: sfu.kernel_send_drops(),
             admission_closed: sfu.admission().reason(),
             egress_capacity_bps: sfu.egress_capacity_bps(),
+            egress_capacity_source: sfu.egress_capacity_source(),
             egress_headroom_bps: sfu.egress_headroom_bps(),
             retransmits_limited: sfu.retransmits_limited(),
             forward_queued: queues.forward_queued,

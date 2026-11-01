@@ -678,8 +678,10 @@ fn a_shard_with_no_room_left_forwards_two_voices_at_most_and_gives_them_back() {
 #[test]
 fn a_node_whose_kernel_keeps_refusing_after_the_squeeze_forwards_the_loudest_voice_only() {
     let refused = Arc::new(AtomicU64::new(0));
+    // A send budget of 600 packets a second decides the squeeze: the speakers' 800 pass it.
     let mut w = World::with_config(EngineConfig {
         audio_loudest: 0,
+        egress_budget_pps: 600,
         ..config_with_refusals(&refused, true)
     });
     let speakers: Vec<usize> = (0..4).map(|i| w.join(&format!("s{i}"), "call1")).collect();
@@ -709,8 +711,7 @@ fn a_node_whose_kernel_keeps_refusing_after_the_squeeze_forwards_the_loudest_voi
     };
 
     // A lecture begins with two people talking; the kernel takes everything. Then the rest join
-    // in and the traffic outgrows what the card takes: the refusals are at a rate the node had
-    // not carried.
+    // in and the traffic outgrows what the card takes.
     let calm = gained(&mut w, 4, 0, 2);
     assert!(calm[0] > 100 && calm[1] > 100, "both are heard: {calm:?}");
 
@@ -723,8 +724,8 @@ fn a_node_whose_kernel_keeps_refusing_after_the_squeeze_forwards_the_loudest_voi
     );
 
     // An overload: the card takes most of the 800 or so packets a second but not all (a hundred
-    // refused, an eighth), and refusals for fifteen seconds teach the ceiling, and refusals that go on through
-    // the squeeze it holds for five more leave the loudest voice only.
+    // refused, an eighth), and refusals that go on through the squeeze the node decided on for five
+    // windows leave the loudest voice only.
     gained(&mut w, 15, 100, 4);
     let choked = gained(&mut w, 3, 100, 4);
     assert!(choked[0] > 100, "the loudest goes on: {choked:?}");
@@ -733,9 +734,8 @@ fn a_node_whose_kernel_keeps_refusing_after_the_squeeze_forwards_the_loudest_voi
         "the others are left out: {choked:?}"
     );
 
-    // Once the kernel has accepted everything for a while the choke is over. The node does not
-    // go back to what it sent when the kernel first refused (that is its ceiling now, lifted a
-    // notch every few quiet minutes), so two voices are still forwarded.
+    // Once the kernel has accepted everything for a while the choke is over. The traffic is still
+    // over the budget, so two voices are still forwarded.
     gained(&mut w, 30, 0, 4);
     let held = gained(&mut w, 3, 0, 4);
     assert!(

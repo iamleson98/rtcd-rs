@@ -321,10 +321,12 @@ fn watch(core: Arc<Core>, stop: Arc<std::sync::atomic::AtomicBool>) {
                 memory.total
             },
             refusing: egress.refusing(Instant::now()),
-            bps: egress.rate_bps(),
-            pps: egress.rate_pps(),
+            bps: egress.sustained_bps(),
+            pps: egress.sustained_pps(),
             ceiling_bps: egress.ceiling_bps(),
             ceiling_pps: egress.ceiling_pps(),
+            proven_bps: egress.ceiling_proven(true),
+            proven_pps: egress.ceiling_proven(false),
         });
         core.admission.set(verdict);
         egress.hold(if verdict.chokes() {
@@ -751,8 +753,8 @@ impl Sfu {
         self.core.cfg.engine.egress.kernel_send_drops()
     }
 
-    /// The send rate in bits per second at which the kernel started refusing datagrams, as the
-    /// node learned it (0 until it has).
+    /// What the node takes its card to carry in bits per second: the operator's figure, or what it
+    /// has learned (0 when it estimates nothing).
     pub fn egress_ceiling_bps(&self) -> u64 {
         self.core.cfg.engine.egress.ceiling_bps()
     }
@@ -815,17 +817,23 @@ impl Sfu {
         self.core.cfg.engine.egress.retransmits_limited()
     }
 
-    /// What the card is planned to carry, in bits per second (0: not said).
+    /// What the card carries in bits per second, as far as the node knows (see
+    /// `Gauge::ceiling_bps`; 0: not known).
     pub fn egress_capacity_bps(&self) -> u64 {
-        self.core.cfg.limits.egress_capacity_bps
+        self.core.cfg.engine.egress.ceiling_bps()
+    }
+
+    /// Where `egress_capacity_bps` comes from (see `Gauge::capacity_source`).
+    pub fn egress_capacity_source(&self) -> &'static str {
+        self.core.cfg.engine.egress.capacity_source()
     }
 
     /// How much more the node can send before it stops taking newcomers (`egress_refuse` of its
-    /// card less what it sends now); 0 when it is there, or when no card was said.
+    /// card less what it sends now); 0 when it is there, or when the card is not known.
     pub fn egress_headroom_bps(&self) -> u64 {
-        let limits = &self.core.cfg.limits;
-        let mark = limits.egress_capacity_bps as f64 * limits.egress_refuse;
-        (mark - self.egress_bps() as f64).max(0.0) as u64
+        let mark = self.egress_capacity_bps() as f64 * self.core.cfg.limits.egress_refuse;
+        let sent = self.core.cfg.engine.egress.sustained_bps();
+        (mark - sent as f64).max(0.0) as u64
     }
 
     /// What the node's own limits (memory, the card) say about taking more people.
