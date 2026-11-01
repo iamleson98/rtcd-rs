@@ -815,6 +815,19 @@ impl Sfu {
         self.core.cfg.engine.egress.retransmits_limited()
     }
 
+    /// What the card is planned to carry, in bits per second (0: not said).
+    pub fn egress_capacity_bps(&self) -> u64 {
+        self.core.cfg.limits.egress_capacity_bps
+    }
+
+    /// How much more the node can send before it stops taking newcomers (`egress_refuse` of its
+    /// card less what it sends now); 0 when it is there, or when no card was said.
+    pub fn egress_headroom_bps(&self) -> u64 {
+        let limits = &self.core.cfg.limits;
+        let mark = limits.egress_capacity_bps as f64 * limits.egress_refuse;
+        (mark - self.egress_bps() as f64).max(0.0) as u64
+    }
+
     /// What the node's own limits (memory, the card) say about taking more people.
     pub fn admission(&self) -> Verdict {
         self.core.admission.get()

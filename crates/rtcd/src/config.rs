@@ -243,6 +243,14 @@ pub struct RtcConfig {
     /// node sends at the ceiling it learned from them. The default is on: a node whose card drops
     /// packets for everyone on it does not take more.
     pub refuse_when_kernel_refuses: bool,
+    /// What the node's card is planned to carry, in megabits a second (0: not said). With it the
+    /// node takes no newcomer once it sends `refuse_egress_percent` of it (a call keeps growing as
+    /// people rejoin or arrive late, and cannot move), sheds from `shed_egress_percent`, and
+    /// reports its headroom on `GET /system` for the server that places calls. Plan it under the
+    /// card (the OVH 4-vCPU video node took 800 to 850 Mbit/s of a 1 Gbit/s card cleanly).
+    pub egress_capacity_mbps: i64,
+    pub refuse_egress_percent: i64,
+    pub shed_egress_percent: i64,
     /// Seconds to let running sessions end on shutdown before ending them; 0 waits for them
     /// without limit, as the Go service does (a second signal ends them at once).
     pub drain_timeout_seconds: i64,
@@ -366,6 +374,9 @@ impl Default for RtcConfig {
             refuse_memory_percent: 70,
             refuse_hard_memory_percent: 85,
             refuse_when_kernel_refuses: true,
+            egress_capacity_mbps: 0,
+            refuse_egress_percent: 70,
+            shed_egress_percent: 90,
             drain_timeout_seconds: 0,
         }
     }
@@ -520,6 +531,9 @@ impl Config {
             "RTC_REFUSEWHENKERNELREFUSES",
             self.rtc.refuse_when_kernel_refuses
         );
+        integer!("RTC_EGRESSCAPACITYMBPS", self.rtc.egress_capacity_mbps);
+        integer!("RTC_REFUSEEGRESSPERCENT", self.rtc.refuse_egress_percent);
+        integer!("RTC_SHEDEGRESSPERCENT", self.rtc.shed_egress_percent);
         integer!("RTC_DRAINTIMEOUTSECONDS", self.rtc.drain_timeout_seconds);
         text!("STORE_DATASOURCE", self.store.data_source);
         boolean!("RECORD_ENABLED", self.record.enabled);
@@ -663,6 +677,29 @@ impl Config {
             return Err(invalid(
                 "RefuseHardMemoryPercent",
                 "must not be below RefuseMemoryPercent",
+            ));
+        }
+        if !(0..=100_000).contains(&rtc.egress_capacity_mbps) {
+            return Err(invalid(
+                "EgressCapacityMbps",
+                "must be between 0 and 100000",
+            ));
+        }
+        for (name, v) in [
+            ("RefuseEgressPercent", rtc.refuse_egress_percent),
+            ("ShedEgressPercent", rtc.shed_egress_percent),
+        ] {
+            if !(0..=100).contains(&v) {
+                return Err(invalid(name, "must be between 0 and 100"));
+            }
+        }
+        if rtc.refuse_egress_percent > 0
+            && rtc.shed_egress_percent > 0
+            && rtc.shed_egress_percent < rtc.refuse_egress_percent
+        {
+            return Err(invalid(
+                "ShedEgressPercent",
+                "must not be below RefuseEgressPercent",
             ));
         }
         if !(0..=64).contains(&rtc.audio_loudest) {
@@ -863,6 +900,10 @@ mod tests {
             "a node takes nobody at 70 % of its memory, not even a host at 85 %"
         );
         assert!(c.rtc.refuse_when_kernel_refuses);
+        assert_eq!(
+            c.rtc.egress_capacity_mbps, 0,
+            "the card is not guessed: it is said, or the node goes by memory and the kernel's refusals"
+        );
         assert_eq!(c.store.data_source, "/tmp/rtcd_db");
         assert_eq!(c.api.security.session_cache.expiration_minutes, 1440);
         assert!(!c.record.enabled, "recording is off unless asked for");
@@ -972,6 +1013,9 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
             ("RTCD_RTC_REFUSEMEMORYPERCENT", "60"),
             ("RTCD_RTC_REFUSEHARDMEMORYPERCENT", "90"),
             ("RTCD_RTC_REFUSEWHENKERNELREFUSES", "false"),
+            ("RTCD_RTC_EGRESSCAPACITYMBPS", "850"),
+            ("RTCD_RTC_REFUSEEGRESSPERCENT", "75"),
+            ("RTCD_RTC_SHEDEGRESSPERCENT", "95"),
             ("RTCD_STORE_DATASOURCE", "/data/db"),
             ("RTCD_LOGGER_ENABLEFILE", "false"),
             ("RTCD_LOGGER_CONSOLEJSON", "1"),
@@ -998,6 +1042,14 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
             (60, 90)
         );
         assert!(!c.rtc.refuse_when_kernel_refuses);
+        assert_eq!(
+            (
+                c.rtc.egress_capacity_mbps,
+                c.rtc.refuse_egress_percent,
+                c.rtc.shed_egress_percent
+            ),
+            (850, 75, 95)
+        );
         assert_eq!(c.store.data_source, "/data/db");
         assert!(!c.logger.enable_file);
         assert!(c.logger.console_json);
@@ -1088,6 +1140,15 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
         assert!(bad(&|c| c.rtc.egress_learn_min_pps = -1).contains("between 0 and 100000000"));
         assert!(bad(&|c| c.rtc.refuse_memory_percent = 101).contains("between 0 and 100"));
         assert!(bad(&|c| c.rtc.refuse_hard_memory_percent = -1).contains("between 0 and 100"));
+        assert!(bad(&|c| c.rtc.egress_capacity_mbps = -1).contains("between 0 and 100000"));
+        assert!(bad(&|c| c.rtc.refuse_egress_percent = 101).contains("between 0 and 100"));
+        assert!(
+            bad(&|c| {
+                c.rtc.refuse_egress_percent = 90;
+                c.rtc.shed_egress_percent = 80;
+            })
+            .contains("must not be below")
+        );
         assert!(
             bad(&|c| {
                 c.rtc.refuse_memory_percent = 80;

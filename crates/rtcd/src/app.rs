@@ -126,6 +126,9 @@ pub fn sfu_config(cfg: &Config, addresses: Vec<LocalAddress>) -> SfuConfig {
             memory_soft: rtc.refuse_memory_percent as f64 / 100.0,
             memory_hard: rtc.refuse_hard_memory_percent as f64 / 100.0,
             on_refusals: rtc.refuse_when_kernel_refuses,
+            egress_capacity_bps: rtc.egress_capacity_mbps as u64 * 1_000_000,
+            egress_refuse: rtc.refuse_egress_percent as f64 / 100.0,
+            egress_shed: rtc.shed_egress_percent as f64 / 100.0,
         },
         ..Default::default()
     }

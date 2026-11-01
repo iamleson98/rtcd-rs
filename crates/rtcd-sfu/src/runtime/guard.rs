@@ -29,6 +29,14 @@ pub struct Limits {
     /// Whether newcomers are refused while the kernel refuses datagrams or the node sends at the
     /// ceiling it learned.
     pub on_refusals: bool,
+    /// What the node's card is planned to carry, in bits per second (0: not said). With it, the
+    /// node refuses newcomers once it sends `egress_refuse` of it, and sheds (small video layers,
+    /// fewer voices) from `egress_shed`; each is released ten points lower, and 0 turns it off. A
+    /// call cannot move and keeps growing as people rejoin or arrive late, so the node that is
+    /// near its card must stop taking them before the kernel starts refusing.
+    pub egress_capacity_bps: u64,
+    pub egress_refuse: f64,
+    pub egress_shed: f64,
 }
 
 impl Default for Limits {
@@ -37,6 +45,9 @@ impl Default for Limits {
             memory_soft: 0.70,
             memory_hard: 0.85,
             on_refusals: true,
+            egress_capacity_bps: 0,
+            egress_refuse: 0.70,
+            egress_shed: 0.90,
         }
     }
 }
@@ -72,6 +83,8 @@ impl std::fmt::Debug for MemorySource {
 const MEMORY: u8 = 1;
 const MEMORY_HARD: u8 = 2;
 const REFUSALS: u8 = 4;
+const EGRESS: u8 = 8;
+const EGRESS_SHED: u8 = 16;
 
 /// What the node's limits say about taking more people, and about what it carries.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -90,7 +103,7 @@ impl Verdict {
 
     /// The node holds receivers to the small video layers and calls to few voices.
     pub fn sheds(self) -> bool {
-        self.0 & (MEMORY | MEMORY_HARD) != 0
+        self.0 & (MEMORY | MEMORY_HARD | EGRESS_SHED) != 0
     }
 
     /// The node holds calls to their loudest voice.
@@ -104,6 +117,7 @@ impl Verdict {
             0 => "",
             v if v & MEMORY_HARD != 0 => "memory_hard",
             v if v & MEMORY != 0 => "memory",
+            v if v & (EGRESS | EGRESS_SHED) != 0 => "egress",
             _ => "refusals",
         }
     }
@@ -185,6 +199,21 @@ impl Admission {
         };
         v |= level(self.limits.memory_soft, MEMORY);
         v |= level(self.limits.memory_hard, MEMORY_HARD);
+        if self.limits.egress_capacity_bps > 0 {
+            let capacity = self.limits.egress_capacity_bps as f64;
+            let sent = r.bps as f64 / capacity;
+            let level = |limit: f64, bit: u8| {
+                if limit <= 0.0 {
+                    0
+                } else if sent >= limit || (held & bit != 0 && sent >= limit - RELEASE) {
+                    bit
+                } else {
+                    0
+                }
+            };
+            v |= level(self.limits.egress_refuse, EGRESS);
+            v |= level(self.limits.egress_shed, EGRESS_SHED);
+        }
         if self.limits.on_refusals {
             let at = |rate: u64, ceiling: u64| {
                 if ceiling == 0 {
@@ -263,6 +292,7 @@ mod tests {
             memory_soft: 0.0,
             memory_hard: 0.0,
             on_refusals: true,
+            ..Limits::default()
         });
         assert!(!a.update(memory(2.99)).refuses_newcomers());
         let mut a = Admission::default();
@@ -328,5 +358,33 @@ mod tests {
         let mut a = Admission::default();
         s.set(a.update(memory(2.7)));
         assert!(s.get().refuses_everyone());
+    }
+
+    #[test]
+    fn a_node_near_its_card_takes_no_newcomer_and_sheds_nearer_still() {
+        let mut a = Admission::new(Limits {
+            egress_capacity_bps: 1_000_000_000,
+            ..Limits::default()
+        });
+        let at = |mbps: u64| Reading {
+            bps: mbps * 1_000_000,
+            ..Default::default()
+        };
+        assert!(!a.update(at(650)).refuses_newcomers(), "65 %");
+        let v = a.update(at(720));
+        assert!(v.refuses_newcomers() && !v.refuses_everyone() && !v.sheds());
+        assert_eq!(v.reason(), "egress");
+        assert!(
+            a.update(at(650)).refuses_newcomers(),
+            "65 %: above 60, held"
+        );
+        let v = a.update(at(920));
+        assert!(v.sheds() && !v.chokes(), "92 %");
+        assert!(!a.update(at(550)).refuses_newcomers(), "55 %: released");
+        let mut unknown = Admission::default();
+        assert!(
+            !unknown.update(at(5_000)).refuses_newcomers(),
+            "no card said, nothing to be near"
+        );
     }
 }

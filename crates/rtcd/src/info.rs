@@ -108,6 +108,11 @@ pub struct SystemStatus {
     /// class's host) or `refusals` (the kernel refuses datagrams, or the node sends at the ceiling
     /// it learned). Empty when it does.
     pub admission_closed: &'static str,
+    /// What the card is planned to carry (`RTCD_RTC_EGRESSCAPACITYMBPS`; 0: not said), and how much
+    /// more the node can send before it takes no newcomer. A server placing a call that will need
+    /// bandwidth reads these.
+    pub egress_capacity_bps: u64,
+    pub egress_headroom_bps: u64,
     /// The shards' queues (see `rtcd_sfu::runtime::Queues`).
     pub retransmits_limited: u64,
     pub forward_queued: usize,

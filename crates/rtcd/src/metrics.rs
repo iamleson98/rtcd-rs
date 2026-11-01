@@ -58,6 +58,8 @@ struct Node {
     egress_bps: Gauge,
     egress_pps: Gauge,
     admission_closed: GaugeVec,
+    egress_capacity: Gauge,
+    egress_headroom: Gauge,
     forward_queued: Gauge,
     forward_dropped: Counter,
     retransmits_limited: Counter,
@@ -147,11 +149,19 @@ impl Node {
                 "egress_pps",
                 "What the instance hands to its sockets, in datagrams per second",
             ),
+            egress_capacity: g(
+                "egress_capacity_bps",
+                "What the card is planned to carry (RTCD_RTC_EGRESSCAPACITYMBPS), in bits per second; 0 when not said",
+            ),
+            egress_headroom: g(
+                "egress_headroom_bps",
+                "How much more the node can send before it takes no newcomer (the refusal share of the card less what it sends); 0 when there, or when no card was said",
+            ),
             admission_closed: {
                 let v = GaugeVec::new(
                     Opts::new(
                         "admission_closed",
-                        "1 while the node takes no new sessions, by reason: memory, memory_hard (not even a class's host) or refusals (the kernel refuses datagrams, or the node sends at its learned ceiling)",
+                        "1 while the node takes no new sessions, by reason: memory, memory_hard (not even a class's host), egress (the card is nearly full) or refusals (the kernel refuses datagrams, or the node sends at its learned ceiling)",
                     )
                     .namespace(NAMESPACE),
                     &["reason"],
@@ -259,7 +269,9 @@ impl Node {
         self.shards_saturated.set(s.shards_saturated as f64);
         self.egress_bps.set(s.egress_bps as f64);
         self.egress_pps.set(s.egress_pps as f64);
-        for reason in ["memory", "memory_hard", "refusals"] {
+        self.egress_capacity.set(s.egress_capacity_bps as f64);
+        self.egress_headroom.set(s.egress_headroom_bps as f64);
+        for reason in ["memory", "memory_hard", "egress", "refusals"] {
             self.admission_closed
                 .with_label_values(&[reason])
                 .set(f64::from(s.admission_closed == reason));
