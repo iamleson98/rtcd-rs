@@ -78,6 +78,7 @@ KEEP = (
     "rtcd_rtc_retransmitted_packets_total",
     "rtcd_rtc_keyframe_requests_total",
     "rtcd_rtc_sessions_refused_total",
+    "rtcd_rtc_retransmits_limited_total",
     "rtcd_net_packets_total",
     "rtcd_net_dropped",
     "rtcd_forward_",

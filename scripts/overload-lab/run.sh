@@ -38,7 +38,7 @@ docker run -d --name lab-rtcd --network "$NET" --ip "$RTCD_IP" --cpuset-cpus=0-2
   --memory="$MEM" --memory-swap="$MEM" --cap-add NET_ADMIN --ulimit nofile=65536:65536 \
   "${envs[@]}" "$IMAGE" rtcd-entrypoint.sh >/dev/null
 until docker exec lab-rtcd curl -sf localhost:8045/version >/dev/null 2>&1; do sleep 1; done
-docker exec lab-rtcd tc qdisc replace dev eth0 root tbf rate "${RATE_MBIT}mbit" burst 128kb limit "${QDISC_KB}kb"
+docker exec lab-rtcd tc qdisc replace dev eth0 root tbf rate "${RATE_MBIT}mbit" burst "$(( RATE_MBIT > 128 ? RATE_MBIT : 128 ))kb" limit "${QDISC_KB}kb"
 docker exec -d lab-rtcd sh -c "python3 /usr/local/bin/sample.py $SAMPLE 100000 > /data/sample.jsonl"
 
 total=$(( CLASSES * (STUDENTS + 1) ))
