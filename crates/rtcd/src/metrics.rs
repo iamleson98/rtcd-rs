@@ -57,6 +57,7 @@ struct Node {
     shards_saturated: Gauge,
     egress_bps: Gauge,
     egress_pps: Gauge,
+    admission_closed: GaugeVec,
     forward_queued: Gauge,
     forward_dropped: Counter,
     forward_dropped_seen: AtomicU64,
@@ -144,6 +145,19 @@ impl Node {
                 "egress_pps",
                 "What the instance hands to its sockets, in datagrams per second",
             ),
+            admission_closed: {
+                let v = GaugeVec::new(
+                    Opts::new(
+                        "admission_closed",
+                        "1 while the node takes no new sessions, by reason: memory, memory_hard (not even a class's host) or refusals (the kernel refuses datagrams, or the node sends at its learned ceiling)",
+                    )
+                    .namespace(NAMESPACE),
+                    &["reason"],
+                )
+                .expect("valid metric");
+                r.register(Box::new(v.clone())).expect("unique metric");
+                v
+            },
             forward_queued: g(
                 "forward_queued_packets",
                 "Datagrams one shard passed on to another that the other has not yet taken up (bounded: past the limit they are dropped)",
@@ -229,6 +243,11 @@ impl Node {
         self.shards_saturated.set(s.shards_saturated as f64);
         self.egress_bps.set(s.egress_bps as f64);
         self.egress_pps.set(s.egress_pps as f64);
+        for reason in ["memory", "memory_hard", "refusals"] {
+            self.admission_closed
+                .with_label_values(&[reason])
+                .set(f64::from(s.admission_closed == reason));
+        }
         self.forward_queued.set(s.forward_queued as f64);
         let seen = self
             .forward_dropped_seen
@@ -236,7 +255,8 @@ impl Node {
         self.forward_dropped
             .inc_by(s.forward_dropped.saturating_sub(seen) as f64);
         self.turn_peak_reads.set(f64::from(s.turn_peak_reads));
-        self.turn_peak_transmits.set(f64::from(s.turn_peak_transmits));
+        self.turn_peak_transmits
+            .set(f64::from(s.turn_peak_transmits));
         self.turn_longest.set(f64::from(s.turn_longest_us) / 1e6);
         self.egress_ceiling_bps.set(s.egress_ceiling_bps as f64);
         self.egress_ceiling_pps.set(s.egress_ceiling_pps as f64);
@@ -269,6 +289,7 @@ pub struct Metrics {
     rtc_sessions: GaugeVec,
     conn_states: CounterVec,
     rtc_errors: CounterVec,
+    sessions_refused: CounterVec,
     connection_time: HistogramVec,
     dc_open_time: HistogramVec,
     lock_grab_time: HistogramVec,
@@ -516,6 +537,13 @@ impl Metrics {
                 "errors_total",
                 "Total number of RTC related errors",
                 &["groupID", "type"],
+            ),
+            sessions_refused: counter(
+                r,
+                "rtc",
+                "sessions_refused_total",
+                "Sessions turned away, by reason: shard (the shard its call lives on is at its limit), memory and memory_hard (the node is nearly out of memory), refusals (the kernel refuses the node's datagrams, or it sends at its learned ceiling)",
+                &["reason"],
             ),
             connection_time: histogram(
                 r,
@@ -789,6 +817,10 @@ impl SfuMetrics for Metrics {
 
     fn connection_state(&self, state: &str) {
         self.conn_states.with_label_values(&[state]).inc();
+    }
+
+    fn session_refused(&self, reason: &str) {
+        self.sessions_refused.with_label_values(&[reason]).inc();
     }
 
     fn error(&self, group: &str, kind: &str) {

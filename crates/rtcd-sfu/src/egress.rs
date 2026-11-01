@@ -60,7 +60,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Video falls back to the small layers at this share of the budget.
@@ -218,6 +218,9 @@ pub struct Gauge {
     rate: AtomicU64,
     rate_packets: AtomicU64,
     squeezed: AtomicBool,
+    /// What the node holds regardless of the kernel (see [`Gauge::hold`]): 0 nothing, 1 squeeze,
+    /// 2 squeeze and choke.
+    held: AtomicU8,
     /// Datagrams the kernel refused to queue since the node started (UDP `SndbufErrors`).
     kernel_drops: AtomicU64,
     /// Until when the kernel counts as refusing and the node as choked, in nanoseconds after
@@ -306,7 +309,13 @@ impl Gauge {
 
     /// Whether receivers are being held to the small layers.
     pub fn squeezed(&self) -> bool {
-        self.squeezed.load(Ordering::Relaxed)
+        self.squeezed.load(Ordering::Relaxed) || self.held.load(Ordering::Relaxed) > 0
+    }
+
+    /// Holds the node squeezed (`1`) or squeezed and choked (`2`), or lets go (`0`), whatever the
+    /// kernel says: for a limit that is not the card's (the node's memory).
+    pub fn hold(&self, level: u8) {
+        self.held.store(level.min(2), Ordering::Relaxed);
     }
 
     /// Whether the kernel is refusing datagrams at `now`: two windows in a row refused, and the
@@ -319,6 +328,7 @@ impl Gauge {
     /// bits fell and the packets did not.
     pub fn choked(&self, now: Instant) -> bool {
         self.choked_until.load(Ordering::Relaxed) > self.nanos(now)
+            || self.held.load(Ordering::Relaxed) > 1
     }
 
     fn nanos(&self, t: Instant) -> u64 {

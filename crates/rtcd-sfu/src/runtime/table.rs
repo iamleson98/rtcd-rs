@@ -86,7 +86,9 @@ impl ShardTable {
             q.forward_queued += s.forward_queued.load(Ordering::Relaxed);
             q.forward_dropped += s.forward_dropped.load(Ordering::Relaxed);
             q.peak_reads = q.peak_reads.max(s.peak_reads.load(Ordering::Relaxed));
-            q.peak_transmits = q.peak_transmits.max(s.peak_transmits.load(Ordering::Relaxed));
+            q.peak_transmits = q
+                .peak_transmits
+                .max(s.peak_transmits.load(Ordering::Relaxed));
             q.longest_turn_us = q
                 .longest_turn_us
                 .max(s.longest_turn_us.load(Ordering::Relaxed));

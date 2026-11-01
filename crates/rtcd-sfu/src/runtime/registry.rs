@@ -18,6 +18,8 @@ pub enum AdmitError {
     NoShard,
     #[error("every shard that could serve the session is at its limit")]
     Saturated,
+    #[error("the node is nearly out of memory and takes nobody")]
+    NodeFull,
 }
 
 /// How long after its last session left a call a participant counts as coming back to it.
@@ -101,6 +103,7 @@ impl Registry {
 
     /// Records a new session and returns the shard to serve it: the one its call lives on, else
     /// the running one with the fewest sessions.
+    #[cfg(test)]
     pub fn admit(&self, cfg: &SessionConfig) -> Result<usize, AdmitError> {
         self.admit_unless(cfg, &|_| false)
     }

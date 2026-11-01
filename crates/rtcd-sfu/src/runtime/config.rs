@@ -37,6 +37,10 @@ pub struct SfuConfig {
     /// Whether a session is refused while its shard is saturated (see `scaler::Level`), so the
     /// sessions the shard has keep their quality instead of every call on it losing packets.
     pub refuse_when_saturated: bool,
+    /// What the node as a whole stays under (see `guard`).
+    pub limits: super::guard::Limits,
+    /// Where the node reads its memory from.
+    pub memory: super::guard::MemorySource,
 }
 
 impl Default for SfuConfig {
@@ -53,6 +57,8 @@ impl Default for SfuConfig {
             tcp_idle_timeout: Duration::from_secs(60),
             tcp_write_limit: 4 * 1024 * 1024,
             refuse_when_saturated: true,
+            limits: super::guard::Limits::default(),
+            memory: super::guard::MemorySource::default(),
         }
     }
 }

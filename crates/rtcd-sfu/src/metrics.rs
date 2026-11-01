@@ -36,6 +36,10 @@ pub trait Metrics: Send + Sync + 'static {
     fn connection_state(&self, state: &str) {
         let _ = state;
     }
+    /// A session was turned away: `reason` is `shard` (the shard its call lives on is at its
+    /// limit), `memory`, `memory_hard` or `refusals` (the node's own limits).
+    fn session_refused(&self, _reason: &str) {}
+
     fn error(&self, group: &str, kind: &str) {
         let _ = (group, kind);
     }

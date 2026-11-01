@@ -54,7 +54,11 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
         };
         match k.as_str() {
             "--http" => a.http = v.clone(),
-            "--media" => a.media = v.parse().map_err(|_| format!("{k}: {v} is not an address"))?,
+            "--media" => {
+                a.media = v
+                    .parse()
+                    .map_err(|_| format!("{k}: {v} is not an address"))?
+            }
             "--classes" => a.classes = n()? as u32,
             "--students" => a.students = n()? as u32,
             "--cameras" => a.cameras = n()? as u32,
@@ -126,7 +130,11 @@ pub async fn run(args: impl Iterator<Item = String>, assets: std::path::PathBuf)
             }
         }
     }
-    println!("{{\"t\": {}, \"started\": {}, \"all\": true}}", started.elapsed().as_secs(), index);
+    println!(
+        "{{\"t\": {}, \"started\": {}, \"all\": true}}",
+        started.elapsed().as_secs(),
+        index
+    );
     tokio::time::sleep(Duration::from_secs(a.seconds)).await;
     for p in people {
         p.leave().await;

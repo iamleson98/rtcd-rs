@@ -104,6 +104,10 @@ pub struct SystemStatus {
     pub egress_pps: u64,
     /// Datagrams the kernel refused to queue since the instance started reading the count.
     pub kernel_send_drops: u64,
+    /// Why the node takes no new sessions, if it does not: `memory`, `memory_hard` (not even a
+    /// class's host) or `refusals` (the kernel refuses datagrams, or the node sends at the ceiling
+    /// it learned). Empty when it does.
+    pub admission_closed: &'static str,
     /// The shards' queues (see `rtcd_sfu::runtime::Queues`).
     pub forward_queued: usize,
     pub forward_dropped: u64,

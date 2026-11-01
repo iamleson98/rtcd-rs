@@ -3,6 +3,7 @@
 
 mod config;
 mod directory;
+mod guard;
 mod registry;
 mod scaler;
 mod shard;
@@ -25,6 +26,7 @@ use rtcd_proto::{Message, SessionConfig};
 use tracing::{error, info, warn};
 
 pub use config::{SfuConfig, SfuConfigError};
+pub use guard::{Admission, Limits, MemorySource, Reading, Verdict};
 pub use registry::AdmitError;
 pub use scaler::ScalingPolicy;
 pub use table::Queues;
@@ -87,6 +89,8 @@ struct Core {
     registry: Arc<Registry>,
     directory: Option<Arc<Directory>>,
     table: Arc<ShardTable>,
+    /// What the node's own limits say about taking more people (see `guard`).
+    admission: guard::Shared,
     /// The thread of each running shard, by slot.
     threads: Mutex<Vec<(usize, JoinHandle<()>)>>,
     /// Held while shards are added or stopped, so two changes cannot interleave.
@@ -298,6 +302,52 @@ fn scale(core: Arc<Core>, stop: Arc<std::sync::atomic::AtomicBool>) {
     }
 }
 
+/// Watches the node's memory and card and keeps `Core::admission` up to date (see `guard`).
+fn watch(core: Arc<Core>, stop: Arc<std::sync::atomic::AtomicBool>) {
+    let mut admission = Admission::new(core.cfg.limits);
+    let mut last = Verdict::default();
+    while !stop.load(Ordering::Acquire) {
+        std::thread::park_timeout(guard::TICK);
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        let egress = &core.cfg.engine.egress;
+        let memory = core.cfg.memory.read();
+        let verdict = admission.update(Reading {
+            rss: memory.rss,
+            memory: if memory.limit > 0 {
+                memory.limit
+            } else {
+                memory.total
+            },
+            refusing: egress.refusing(Instant::now()),
+            bps: egress.rate_bps(),
+            pps: egress.rate_pps(),
+            ceiling_bps: egress.ceiling_bps(),
+            ceiling_pps: egress.ceiling_pps(),
+        });
+        core.admission.set(verdict);
+        egress.hold(if verdict.chokes() {
+            2
+        } else {
+            u8::from(verdict.sheds())
+        });
+        if verdict != last {
+            if verdict.refuses_newcomers() {
+                warn!(
+                    reason = verdict.reason(),
+                    rss = memory.rss,
+                    limit = memory.limit,
+                    "the node takes no new sessions"
+                );
+            } else {
+                info!("the node takes new sessions again");
+            }
+            last = verdict;
+        }
+    }
+}
+
 /// A running SFU.
 pub struct Sfu {
     core: Arc<Core>,
@@ -368,6 +418,7 @@ impl Sfu {
             ),
             directory: shared_port.then(|| Arc::new(Directory::default())),
             table: Arc::new(ShardTable::new(slots)),
+            admission: guard::Shared::default(),
             threads: Mutex::new(Vec::with_capacity(slots)),
             resize: Mutex::new(()),
             pending_records: Mutex::new(HashMap::new()),
@@ -406,6 +457,13 @@ impl Sfu {
             );
         }
 
+        let (core2, stop) = (core.clone(), scaler_stop.clone());
+        helpers.push(
+            std::thread::Builder::new()
+                .name("sfu-guard".into())
+                .spawn(move || watch(core2, stop))?,
+        );
+
         info!(shards = n, up_to = slots, addresses = ?cfg.engine.addresses.iter().map(LocalAddress::advertised_udp).collect::<std::collections::BTreeSet<_>>(), "sfu started");
         Ok(Self {
             core,
@@ -430,12 +488,27 @@ impl Sfu {
     pub fn join(&self, cfg: SessionConfig) -> Result<(), JoinError> {
         cfg.validate().map_err(JoinError::Invalid)?;
         self.core.make_room(&cfg);
-        let shard = if self.core.cfg.refuse_when_saturated {
-            self.core
-                .registry
-                .admit_unless(&cfg, &|slot| self.core.table.saturated(slot))?
-        } else {
-            self.core.registry.admit(&cfg)?
+        let verdict = self.core.admission.get();
+        if verdict.refuses_everyone() {
+            self.core.metrics.session_refused(verdict.reason());
+            return Err(AdmitError::NodeFull.into());
+        }
+        let closed = verdict.refuses_newcomers();
+        let saturated = self.core.cfg.refuse_when_saturated;
+        let shard = match self.core.registry.admit_unless(&cfg, &|slot| {
+            closed || (saturated && self.core.table.saturated(slot))
+        }) {
+            Ok(shard) => shard,
+            Err(err) => {
+                if err == AdmitError::Saturated {
+                    self.core.metrics.session_refused(if closed {
+                        verdict.reason()
+                    } else {
+                        "shard"
+                    });
+                }
+                return Err(err.into());
+            }
         };
         let session_id = cfg.session_id.clone();
         let call = (cfg.group_id.clone(), cfg.call_id.clone());
@@ -734,6 +807,11 @@ impl Sfu {
     /// How many of those are at their limit and refuse new sessions.
     pub fn shards_saturated(&self) -> usize {
         self.core.table.saturated_count()
+    }
+
+    /// What the node's own limits (memory, the card) say about taking more people.
+    pub fn admission(&self) -> Verdict {
+        self.core.admission.get()
     }
 
     /// What the shards' queues hold now, and their peaks over the last second.

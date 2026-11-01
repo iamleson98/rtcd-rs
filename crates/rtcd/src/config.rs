@@ -231,6 +231,18 @@ pub struct RtcConfig {
     /// goes to a shard that is not at its limit when there is one. The call's host and recorder,
     /// and a participant who is in the call or left it in the last minute, are never refused.
     pub refuse_when_saturated: bool,
+    /// The node's own limits on taking more people (see `rtcd_sfu::runtime::Limits`). A process
+    /// that holds this percent of the memory it may (its control group's limit) takes no new
+    /// participant and holds video to the small layers and calls to fewer voices; 0 turns it
+    /// off. Past `refuse_hard_memory_percent` nobody is taken, not even a class's host, and calls
+    /// forward their loudest voice only: the kernel kills a process out of memory, and every
+    /// call on the node ends at once. Each is released ten points lower.
+    pub refuse_memory_percent: i64,
+    pub refuse_hard_memory_percent: i64,
+    /// Whether a join is refused while the kernel refuses datagrams the node hands it, or the
+    /// node sends at the ceiling it learned from them. The default is on: a node whose card drops
+    /// packets for everyone on it does not take more.
+    pub refuse_when_kernel_refuses: bool,
     /// Seconds to let running sessions end on shutdown before ending them; 0 waits for them
     /// without limit, as the Go service does (a second signal ends them at once).
     pub drain_timeout_seconds: i64,
@@ -351,6 +363,9 @@ impl Default for RtcConfig {
             egress_learn_min_mbps: 400,
             egress_learn_min_pps: 80_000,
             refuse_when_saturated: true,
+            refuse_memory_percent: 70,
+            refuse_hard_memory_percent: 85,
+            refuse_when_kernel_refuses: true,
             drain_timeout_seconds: 0,
         }
     }
@@ -496,6 +511,15 @@ impl Config {
         integer!("RTC_EGRESSLEARNMINMBPS", self.rtc.egress_learn_min_mbps);
         integer!("RTC_EGRESSLEARNMINPPS", self.rtc.egress_learn_min_pps);
         boolean!("RTC_REFUSEWHENSATURATED", self.rtc.refuse_when_saturated);
+        integer!("RTC_REFUSEMEMORYPERCENT", self.rtc.refuse_memory_percent);
+        integer!(
+            "RTC_REFUSEHARDMEMORYPERCENT",
+            self.rtc.refuse_hard_memory_percent
+        );
+        boolean!(
+            "RTC_REFUSEWHENKERNELREFUSES",
+            self.rtc.refuse_when_kernel_refuses
+        );
         integer!("RTC_DRAINTIMEOUTSECONDS", self.rtc.drain_timeout_seconds);
         text!("STORE_DATASOURCE", self.store.data_source);
         boolean!("RECORD_ENABLED", self.record.enabled);
@@ -621,6 +645,24 @@ impl Config {
             return Err(invalid(
                 "EgressLearnMinPps",
                 "must be between 0 and 100000000",
+            ));
+        }
+        if !(0..=100).contains(&rtc.refuse_memory_percent) {
+            return Err(invalid("RefuseMemoryPercent", "must be between 0 and 100"));
+        }
+        if !(0..=100).contains(&rtc.refuse_hard_memory_percent) {
+            return Err(invalid(
+                "RefuseHardMemoryPercent",
+                "must be between 0 and 100",
+            ));
+        }
+        if rtc.refuse_memory_percent > 0
+            && rtc.refuse_hard_memory_percent > 0
+            && rtc.refuse_hard_memory_percent < rtc.refuse_memory_percent
+        {
+            return Err(invalid(
+                "RefuseHardMemoryPercent",
+                "must not be below RefuseMemoryPercent",
             ));
         }
         if !(0..=64).contains(&rtc.audio_loudest) {
@@ -812,6 +854,15 @@ mod tests {
             c.rtc.refuse_when_saturated,
             "a saturated shard refuses joins unless told not to"
         );
+        assert_eq!(
+            (
+                c.rtc.refuse_memory_percent,
+                c.rtc.refuse_hard_memory_percent
+            ),
+            (70, 85),
+            "a node takes nobody at 70 % of its memory, not even a host at 85 %"
+        );
+        assert!(c.rtc.refuse_when_kernel_refuses);
         assert_eq!(c.store.data_source, "/tmp/rtcd_db");
         assert_eq!(c.api.security.session_cache.expiration_minutes, 1440);
         assert!(!c.record.enabled, "recording is off unless asked for");
@@ -918,6 +969,9 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
             ("RTCD_RTC_EGRESSLEARNMINMBPS", "300"),
             ("RTCD_RTC_EGRESSLEARNMINPPS", "60000"),
             ("RTCD_RTC_REFUSEWHENSATURATED", "false"),
+            ("RTCD_RTC_REFUSEMEMORYPERCENT", "60"),
+            ("RTCD_RTC_REFUSEHARDMEMORYPERCENT", "90"),
+            ("RTCD_RTC_REFUSEWHENKERNELREFUSES", "false"),
             ("RTCD_STORE_DATASOURCE", "/data/db"),
             ("RTCD_LOGGER_ENABLEFILE", "false"),
             ("RTCD_LOGGER_CONSOLEJSON", "1"),
@@ -936,6 +990,14 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
         assert_eq!(c.rtc.egress_learn_min_mbps, 300);
         assert_eq!(c.rtc.egress_learn_min_pps, 60_000);
         assert!(!c.rtc.refuse_when_saturated);
+        assert_eq!(
+            (
+                c.rtc.refuse_memory_percent,
+                c.rtc.refuse_hard_memory_percent
+            ),
+            (60, 90)
+        );
+        assert!(!c.rtc.refuse_when_kernel_refuses);
         assert_eq!(c.store.data_source, "/data/db");
         assert!(!c.logger.enable_file);
         assert!(c.logger.console_json);
@@ -1024,6 +1086,15 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
         assert!(bad(&|c| c.rtc.egress_budget_pps = -1).contains("between 0 and 100000000"));
         assert!(bad(&|c| c.rtc.egress_learn_min_mbps = -1).contains("between 0 and 100000"));
         assert!(bad(&|c| c.rtc.egress_learn_min_pps = -1).contains("between 0 and 100000000"));
+        assert!(bad(&|c| c.rtc.refuse_memory_percent = 101).contains("between 0 and 100"));
+        assert!(bad(&|c| c.rtc.refuse_hard_memory_percent = -1).contains("between 0 and 100"));
+        assert!(
+            bad(&|c| {
+                c.rtc.refuse_memory_percent = 80;
+                c.rtc.refuse_hard_memory_percent = 70;
+            })
+            .contains("must not be below")
+        );
         assert!(
             bad(&|c| c.rtc.ice_servers = vec![IceServer {
                 urls: vec!["http://x".into()],
