@@ -173,6 +173,7 @@ impl Service {
     /// What `GET /system` reports and `/metrics` exports about the node.
     pub fn status(&self) -> SystemStatus {
         let sfu = &self.sfu;
+        let queues = sfu.queues();
         SystemStatus {
             host: self.system.info(),
             sessions: sfu.session_count(),
@@ -182,6 +183,15 @@ impl Service {
             egress_bps: sfu.egress_bps(),
             egress_pps: sfu.egress_pps(),
             kernel_send_drops: sfu.kernel_send_drops(),
+            admission_closed: sfu.admission().reason(),
+            egress_capacity_bps: sfu.egress_capacity_bps(),
+            egress_headroom_bps: sfu.egress_headroom_bps(),
+            retransmits_limited: sfu.retransmits_limited(),
+            forward_queued: queues.forward_queued,
+            forward_dropped: queues.forward_dropped,
+            turn_peak_reads: queues.peak_reads,
+            turn_peak_transmits: queues.peak_transmits,
+            turn_longest_us: queues.longest_turn_us,
             egress_adapt: sfu.egress_adapts(),
             egress_squeezed: sfu.egress_squeezed(),
             egress_refusing: sfu.egress_refusing(),

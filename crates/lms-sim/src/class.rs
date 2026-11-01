@@ -53,6 +53,9 @@ pub struct Spec {
     pub voice: bool,
     pub camera: bool,
     pub screen: bool,
+    /// Names of the participants whose cameras this one watches (a `video_subscribe` once it is
+    /// connected); empty watches none, as a browser with its cameras off-screen.
+    pub watch: Vec<String>,
 }
 
 /// What a participant can be told to do while it is in the call.
@@ -198,7 +201,12 @@ pub async fn join(
         observer: false,
     }));
 
-    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("a UDP socket");
+    // On loopback, unless the participants are on another machine than rtcd: then the address
+    // they can be reached at.
+    let local = std::env::var("LMS_SIM_LOCAL_IP").unwrap_or_else(|_| "127.0.0.1".into());
+    let socket = UdpSocket::bind(format!("{local}:0"))
+        .await
+        .expect("a UDP socket");
     let addr = socket.local_addr().unwrap();
     rtcd.exempt(addr);
     let mut me = MediaEngine::default();
@@ -316,6 +324,10 @@ pub async fn join(
     let call = call.to_owned();
     let mut voice = spec.voice;
     let (mut camera_on, mut screen_on) = (true, true);
+    let mut watch = (!spec.watch.is_empty()).then(|| {
+        let ids: Vec<String> = spec.watch.iter().map(|n| format!("session-{n}")).collect();
+        serde_json::to_vec(&serde_json::json!({ "session_ids": ids })).unwrap()
+    });
     let task = tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
         let mut dc: Option<usize> = None;
@@ -391,6 +403,9 @@ pub async fn join(
 
             let now = Instant::now();
             if connected && dc.is_some() {
+                if let Some(data) = watch.take() {
+                    conn.send(message(&sid, &call, MessageType::VideoSubscribe, data));
+                }
                 if voice {
                     while next_audio <= now {
                         send_voice(

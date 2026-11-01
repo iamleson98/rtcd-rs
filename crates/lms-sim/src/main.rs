@@ -8,6 +8,7 @@
 //!
 //! `soak` runs class after class and reports the resident set after each, to find a leak.
 
+mod load;
 mod soak;
 
 use std::path::{Path, PathBuf};
@@ -95,6 +96,12 @@ async fn main() {
         soak::run(std::env::args().skip(2), assets).await;
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("load") {
+        let assets = std::env::var("LMS_SIM_ASSETS")
+            .map_or_else(|_| std::env::temp_dir().join("lms-sim-assets"), Into::into);
+        load::run(std::env::args().skip(2), assets).await;
+        return;
+    }
     let a = match parse() {
         Ok(a) => a,
         Err(e) => {
@@ -138,6 +145,7 @@ async fn run(a: Args) -> Value {
             voice: true,
             camera: i < a.cameras,
             screen: i < a.screens,
+            ..Default::default()
         };
         people.push(class::join(&rtcd, assets.clone(), CHAN_ID, spec, i).await);
         tokio::time::sleep(Duration::from_millis(100)).await;

@@ -6,7 +6,24 @@
 
 use std::sync::RwLock;
 
+use std::sync::atomic::Ordering;
+
 use super::shard::ShardHandle;
+
+/// What the shards' queues hold, summed over the running shards (the peaks are the largest of
+/// any, over the last second).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Queues {
+    /// Datagrams one shard passed on to another that the other has not yet taken up.
+    pub forward_queued: usize,
+    /// Of those, thrown away since the node started because the other shard had too many waiting.
+    pub forward_dropped: u64,
+    /// The most datagrams one turn of a shard's loop took in, the most the engine had queued to
+    /// send when it flushed, and the longest turn (microseconds).
+    pub peak_reads: u32,
+    pub peak_transmits: u32,
+    pub longest_turn_us: u32,
+}
 
 #[derive(Debug)]
 pub(crate) struct ShardTable {
@@ -59,6 +76,24 @@ impl ShardTable {
             .flatten()
             .filter(|h| h.saturated())
             .count()
+    }
+
+    /// The queues of the running shards.
+    pub fn queues(&self) -> Queues {
+        let mut q = Queues::default();
+        for h in self.read().iter().flatten() {
+            let s = h.stats();
+            q.forward_queued += s.forward_queued.load(Ordering::Relaxed);
+            q.forward_dropped += s.forward_dropped.load(Ordering::Relaxed);
+            q.peak_reads = q.peak_reads.max(s.peak_reads.load(Ordering::Relaxed));
+            q.peak_transmits = q
+                .peak_transmits
+                .max(s.peak_transmits.load(Ordering::Relaxed));
+            q.longest_turn_us = q
+                .longest_turn_us
+                .max(s.longest_turn_us.load(Ordering::Relaxed));
+        }
+        q
     }
 
     /// How many shards are running.

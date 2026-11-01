@@ -3,6 +3,7 @@
 
 mod config;
 mod directory;
+mod guard;
 mod registry;
 mod scaler;
 mod shard;
@@ -25,14 +26,17 @@ use rtcd_proto::{Message, SessionConfig};
 use tracing::{error, info, warn};
 
 pub use config::{SfuConfig, SfuConfigError};
+pub use guard::{Admission, Limits, MemorySource, Reading, Verdict};
 pub use registry::AdmitError;
 pub use scaler::ScalingPolicy;
+pub use table::Queues;
 
 use self::directory::Directory;
 use self::registry::Registry;
 use self::scaler::{Scaler, ShardLoad, Step};
 use self::shard::{
-    RecordStart, RecordStop, Shard, ShardCommand, ShardHandle, ShardParts, UdpSock, Undelivered,
+    RecordStart, RecordStop, Shard, ShardCommand, ShardHandle, ShardParts, ShardStats, UdpSock,
+    Undelivered,
 };
 use self::table::ShardTable;
 use crate::config::LocalAddress;
@@ -85,6 +89,8 @@ struct Core {
     registry: Arc<Registry>,
     directory: Option<Arc<Directory>>,
     table: Arc<ShardTable>,
+    /// What the node's own limits say about taking more people (see `guard`).
+    admission: guard::Shared,
     /// The thread of each running shard, by slot.
     threads: Mutex<Vec<(usize, JoinHandle<()>)>>,
     /// Held while shards are added or stopped, so two changes cannot interleave.
@@ -136,7 +142,8 @@ impl Core {
         let waker = Arc::new(Waker::new(poll.registry(), Token(0))?);
         let (tx, rx) = sync_channel(COMMAND_QUEUE);
         let busy = Arc::new(AtomicU32::new(0));
-        let handle = ShardHandle::new(tx, waker, busy.clone());
+        let stats = Arc::new(ShardStats::default());
+        let handle = ShardHandle::new(tx, waker, busy.clone(), stats.clone());
         let engine = Engine::new(
             Arc::new(self.cfg.engine.clone()),
             self.metrics.clone(),
@@ -155,6 +162,7 @@ impl Core {
             directory: self.directory.clone(),
             peers: self.table.clone(),
             busy,
+            stats,
         })?;
         let sink = self.sink.clone();
         let registry = self.registry.clone();
@@ -294,6 +302,52 @@ fn scale(core: Arc<Core>, stop: Arc<std::sync::atomic::AtomicBool>) {
     }
 }
 
+/// Watches the node's memory and card and keeps `Core::admission` up to date (see `guard`).
+fn watch(core: Arc<Core>, stop: Arc<std::sync::atomic::AtomicBool>) {
+    let mut admission = Admission::new(core.cfg.limits);
+    let mut last = Verdict::default();
+    while !stop.load(Ordering::Acquire) {
+        std::thread::park_timeout(guard::TICK);
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        let egress = &core.cfg.engine.egress;
+        let memory = core.cfg.memory.read();
+        let verdict = admission.update(Reading {
+            rss: memory.rss,
+            memory: if memory.limit > 0 {
+                memory.limit
+            } else {
+                memory.total
+            },
+            refusing: egress.refusing(Instant::now()),
+            bps: egress.rate_bps(),
+            pps: egress.rate_pps(),
+            ceiling_bps: egress.ceiling_bps(),
+            ceiling_pps: egress.ceiling_pps(),
+        });
+        core.admission.set(verdict);
+        egress.hold(if verdict.chokes() {
+            2
+        } else {
+            u8::from(verdict.sheds())
+        });
+        if verdict != last {
+            if verdict.refuses_newcomers() {
+                warn!(
+                    reason = verdict.reason(),
+                    rss = memory.rss,
+                    limit = memory.limit,
+                    "the node takes no new sessions"
+                );
+            } else {
+                info!("the node takes new sessions again");
+            }
+            last = verdict;
+        }
+    }
+}
+
 /// A running SFU.
 pub struct Sfu {
     core: Arc<Core>,
@@ -364,6 +418,7 @@ impl Sfu {
             ),
             directory: shared_port.then(|| Arc::new(Directory::default())),
             table: Arc::new(ShardTable::new(slots)),
+            admission: guard::Shared::default(),
             threads: Mutex::new(Vec::with_capacity(slots)),
             resize: Mutex::new(()),
             pending_records: Mutex::new(HashMap::new()),
@@ -402,6 +457,13 @@ impl Sfu {
             );
         }
 
+        let (core2, stop) = (core.clone(), scaler_stop.clone());
+        helpers.push(
+            std::thread::Builder::new()
+                .name("sfu-guard".into())
+                .spawn(move || watch(core2, stop))?,
+        );
+
         info!(shards = n, up_to = slots, addresses = ?cfg.engine.addresses.iter().map(LocalAddress::advertised_udp).collect::<std::collections::BTreeSet<_>>(), "sfu started");
         Ok(Self {
             core,
@@ -426,12 +488,27 @@ impl Sfu {
     pub fn join(&self, cfg: SessionConfig) -> Result<(), JoinError> {
         cfg.validate().map_err(JoinError::Invalid)?;
         self.core.make_room(&cfg);
-        let shard = if self.core.cfg.refuse_when_saturated {
-            self.core
-                .registry
-                .admit_unless(&cfg, &|slot| self.core.table.saturated(slot))?
-        } else {
-            self.core.registry.admit(&cfg)?
+        let verdict = self.core.admission.get();
+        if verdict.refuses_everyone() {
+            self.core.metrics.session_refused(verdict.reason());
+            return Err(AdmitError::NodeFull.into());
+        }
+        let closed = verdict.refuses_newcomers();
+        let saturated = self.core.cfg.refuse_when_saturated;
+        let shard = match self.core.registry.admit_unless(&cfg, &|slot| {
+            closed || (saturated && self.core.table.saturated(slot))
+        }) {
+            Ok(shard) => shard,
+            Err(err) => {
+                if err == AdmitError::Saturated {
+                    self.core.metrics.session_refused(if closed {
+                        verdict.reason()
+                    } else {
+                        "shard"
+                    });
+                }
+                return Err(err.into());
+            }
         };
         let session_id = cfg.session_id.clone();
         let call = (cfg.group_id.clone(), cfg.call_id.clone());
@@ -730,6 +807,35 @@ impl Sfu {
     /// How many of those are at their limit and refuse new sessions.
     pub fn shards_saturated(&self) -> usize {
         self.core.table.saturated_count()
+    }
+
+    /// Retransmissions receivers asked for that the node left unanswered since it started (see
+    /// `Gauge::allow_retransmits`).
+    pub fn retransmits_limited(&self) -> u64 {
+        self.core.cfg.engine.egress.retransmits_limited()
+    }
+
+    /// What the card is planned to carry, in bits per second (0: not said).
+    pub fn egress_capacity_bps(&self) -> u64 {
+        self.core.cfg.limits.egress_capacity_bps
+    }
+
+    /// How much more the node can send before it stops taking newcomers (`egress_refuse` of its
+    /// card less what it sends now); 0 when it is there, or when no card was said.
+    pub fn egress_headroom_bps(&self) -> u64 {
+        let limits = &self.core.cfg.limits;
+        let mark = limits.egress_capacity_bps as f64 * limits.egress_refuse;
+        (mark - self.egress_bps() as f64).max(0.0) as u64
+    }
+
+    /// What the node's own limits (memory, the card) say about taking more people.
+    pub fn admission(&self) -> Verdict {
+        self.core.admission.get()
+    }
+
+    /// What the shards' queues hold now, and their peaks over the last second.
+    pub fn queues(&self) -> Queues {
+        self.core.table.queues()
     }
 
     /// Starts one more shard, if the configuration leaves room for it. The SFU does this itself

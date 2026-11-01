@@ -234,6 +234,11 @@ impl Engine {
         }
     }
 
+    /// How many datagrams are waiting to be taken by [`poll_transmit`](Self::poll_transmit).
+    pub fn queued_transmits(&self) -> usize {
+        self.out.len()
+    }
+
     /// The next datagram to send.
     pub fn poll_transmit(&mut self) -> Option<Transmit> {
         self.out.pop_front()

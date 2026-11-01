@@ -104,6 +104,22 @@ pub struct SystemStatus {
     pub egress_pps: u64,
     /// Datagrams the kernel refused to queue since the instance started reading the count.
     pub kernel_send_drops: u64,
+    /// Why the node takes no new sessions, if it does not: `memory`, `memory_hard` (not even a
+    /// class's host) or `refusals` (the kernel refuses datagrams, or the node sends at the ceiling
+    /// it learned). Empty when it does.
+    pub admission_closed: &'static str,
+    /// What the card is planned to carry (`RTCD_RTC_EGRESSCAPACITYMBPS`; 0: not said), and how much
+    /// more the node can send before it takes no newcomer. A server placing a call that will need
+    /// bandwidth reads these.
+    pub egress_capacity_bps: u64,
+    pub egress_headroom_bps: u64,
+    /// The shards' queues (see `rtcd_sfu::runtime::Queues`).
+    pub retransmits_limited: u64,
+    pub forward_queued: usize,
+    pub forward_dropped: u64,
+    pub turn_peak_reads: u32,
+    pub turn_peak_transmits: u32,
+    pub turn_longest_us: u32,
     /// Whether the node acts on the kernel's refusals (`RTCD_RTC_EGRESSADAPT`). Off, only a send
     /// budget squeezes, `egress_choked` is never set and uploads are never slowed; the refusals
     /// are counted and `egress_refusing` is reported all the same.

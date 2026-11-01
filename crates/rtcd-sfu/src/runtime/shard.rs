@@ -4,7 +4,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,24 @@ const MAX_PEER_SOCKETS: usize = 16_384;
 const PEER_RECV_BUFFER: usize = 256 * 1024;
 /// Read rounds per socket per turn; more would starve the other sockets and the timers.
 const MAX_ROUNDS: usize = 16;
+/// Datagrams one turn of the loop takes in at most, over all its sockets. A shard that is behind
+/// would otherwise read everything the kernel holds for hundreds of sockets before it looked at a
+/// timer, and send nothing until it had.
+const MAX_TURN_READS: u32 = 8192;
+/// How long a turn keeps reading: a datagram of a call with a hundred receivers is a hundred
+/// encryptions, so a count of datagrams says little about the time a turn takes (seconds, in the
+/// lab, at 8,192). Past this the sockets that still have datagrams are read in the next turn,
+/// after the timers and with everything sent so far on its way.
+const TURN_TIME: Duration = Duration::from_millis(20);
+/// Datagrams other shards may have passed on to one shard that it has not yet taken up. Media is
+/// of use for a moment: at 40 thousand datagrams a second the shard is about 100 ms behind with
+/// this many waiting, and what comes later would be played to nobody (and cost the memory, and
+/// the work, that makes it fall further behind).
+const MAX_FORWARD_QUEUE: usize = 4096;
+/// Datagrams the engine may hold to send before the shard hands them to its sockets without
+/// waiting for the end of the turn: a video packet becomes one datagram for each receiver, and a
+/// turn that read a thousand of them held a call's worth of copies of each.
+const FLUSH_AT: usize = 2048;
 /// How often idle TCP connections are looked for.
 const SWEEP_EVERY: Duration = Duration::from_secs(1);
 /// How long the busy fraction is measured over before it is published.
@@ -54,6 +72,30 @@ pub(crate) struct Forwarded {
     pub local: SocketAddr,
     pub peer: SocketAddr,
     pub data: BytesMut,
+}
+
+/// Whether a datagram is RTP or RTCP (version 2 in the top bits of its first byte), as against
+/// STUN or DTLS (RFC 7983): what is asked for again when lost, and of no use late.
+fn is_media(data: &[u8]) -> bool {
+    data.first().is_some_and(|b| b & 0xC0 == 0x80)
+}
+
+/// Keeps in `batch` what may be passed on to a shard that has `queued` datagrams waiting already,
+/// and returns how many it left out. That shard is behind when it has this many: what goes then is
+/// what cannot be asked for again (STUN and DTLS, which the peer repeats); media is dropped, all of
+/// it past twice the limit, because a late packet costs memory and work that make the shard fall
+/// further behind, and is played to nobody.
+fn bound_forwarded(queued: usize, batch: &mut Vec<Forwarded>) -> usize {
+    if queued + batch.len() <= MAX_FORWARD_QUEUE {
+        return 0;
+    }
+    let before = batch.len();
+    if queued >= 2 * MAX_FORWARD_QUEUE {
+        batch.clear();
+    } else {
+        batch.retain(|d| !is_media(&d.data));
+    }
+    before - batch.len()
 }
 
 /// What a shard is told to do.
@@ -108,19 +150,48 @@ pub(crate) enum Undelivered {
     Stopped,
 }
 
+/// What a shard counts about its own queues, for the node's metrics and its limits.
+#[derive(Debug, Default)]
+pub(crate) struct ShardStats {
+    /// Datagrams other shards passed on to this one that it has not yet taken up.
+    pub forward_queued: AtomicUsize,
+    /// Datagrams passed on to this shard that were thrown away (counted when read).
+    pub forward_dropped: AtomicU64,
+    /// Over the last second: the most datagrams one turn of the loop took in, the most the engine
+    /// had queued to send when a turn flushed, and the longest turn in microseconds.
+    pub peak_reads: AtomicU32,
+    pub peak_transmits: AtomicU32,
+    pub longest_turn_us: AtomicU32,
+}
+
 /// The way to reach a running shard.
 #[derive(Debug, Clone)]
 pub(crate) struct ShardHandle {
     tx: SyncSender<ShardCommand>,
     waker: Arc<Waker>,
+    stats: Arc<ShardStats>,
     /// The fraction of its time the shard spent working over its last window, in parts per
     /// thousand.
     busy: Arc<AtomicU32>,
 }
 
 impl ShardHandle {
-    pub fn new(tx: SyncSender<ShardCommand>, waker: Arc<Waker>, busy: Arc<AtomicU32>) -> Self {
-        Self { tx, waker, busy }
+    pub fn new(
+        tx: SyncSender<ShardCommand>,
+        waker: Arc<Waker>,
+        busy: Arc<AtomicU32>,
+        stats: Arc<ShardStats>,
+    ) -> Self {
+        Self {
+            tx,
+            waker,
+            busy,
+            stats,
+        }
+    }
+
+    pub fn stats(&self) -> &ShardStats {
+        &self.stats
     }
 
     /// How busy the shard has been lately, 0 to 1.
@@ -189,6 +260,8 @@ pub(crate) struct ShardParts {
     pub peers: Arc<ShardTable>,
     /// Where this shard publishes how busy it is.
     pub busy: Arc<AtomicU32>,
+    /// Where it counts its queues.
+    pub stats: Arc<ShardStats>,
 }
 
 pub(crate) struct Shard {
@@ -221,6 +294,12 @@ pub(crate) struct Shard {
     /// as shards appear.
     forward: Vec<Vec<Forwarded>>,
     busy: Arc<AtomicU32>,
+    stats: Arc<ShardStats>,
+    /// Datagrams taken in by the turn that is running, and when it began.
+    turn_reads: u32,
+    turn_began: Instant,
+    /// The peaks of the window that is running (see `ShardStats`).
+    window_peaks: [u32; 3],
     /// Time spent working since `window_start`.
     worked: Duration,
     window_start: Instant,
@@ -244,6 +323,7 @@ impl Shard {
             directory,
             peers,
             busy,
+            stats,
         } = parts;
         for (i, u) in udp.iter_mut().enumerate() {
             poll.registry()
@@ -277,6 +357,10 @@ impl Shard {
             peers,
             forward: Vec::new(),
             busy,
+            stats,
+            turn_reads: 0,
+            turn_began: Instant::now(),
+            window_peaks: [0; 3],
             worked: Duration::ZERO,
             window_start: Instant::now(),
             pressure: Pressure::default(),
@@ -299,6 +383,8 @@ impl Shard {
                 continue;
             }
             let now = Instant::now();
+            self.turn_reads = 0;
+            self.turn_began = now;
 
             let mut commands_ready = false;
             for ev in events.iter() {
@@ -344,6 +430,13 @@ impl Shard {
     fn publish_busy(&mut self, woke: Instant) {
         let done = Instant::now();
         self.worked += done.saturating_duration_since(woke);
+        let [reads, _, longest] = &mut self.window_peaks;
+        *reads = (*reads).max(self.turn_reads);
+        *longest = (*longest).max(
+            done.saturating_duration_since(woke)
+                .as_micros()
+                .min(u128::from(u32::MAX)) as u32,
+        );
         let window = done.saturating_duration_since(self.window_start);
         if window >= BUSY_WINDOW {
             let fraction = (self.worked.as_secs_f32() / window.as_secs_f32()).clamp(0.0, 1.0);
@@ -360,6 +453,12 @@ impl Shard {
             };
             self.busy
                 .store((fraction * BUSY_SCALE) as u32 | flags, Ordering::Relaxed);
+            let [reads, transmits, longest] = std::mem::take(&mut self.window_peaks);
+            self.stats.peak_reads.store(reads, Ordering::Relaxed);
+            self.stats
+                .peak_transmits
+                .store(transmits, Ordering::Relaxed);
+            self.stats.longest_turn_us.store(longest, Ordering::Relaxed);
             self.worked = Duration::ZERO;
             self.window_start = done;
         }
@@ -382,6 +481,11 @@ impl Shard {
     fn drain_udp(&mut self, i: usize, now: Instant) {
         let advertised = self.udp[i].advertised;
         for round in 0..MAX_ROUNDS {
+            if self.turn_is_full() {
+                // The turn has taken in enough: what is left is read in the next one.
+                self.udp_backlog[i] = true;
+                return;
+            }
             let n = match self.recv.recv(&self.udp[i].socket) {
                 Ok(n) => n,
                 Err(err) => {
@@ -395,6 +499,7 @@ impl Shard {
                 };
                 self.traffic.udp_in_bytes += data.len() as u64;
                 self.traffic.udp_in_packets += 1;
+                self.turn_reads += 1;
                 if let Some(dir) = &self.directory
                     && !self.engine.would_route(Proto::Udp, peer, data)
                     && let Some(owner) = dir.owner(Proto::Udp, peer, data)
@@ -418,6 +523,7 @@ impl Shard {
                     peer,
                     BytesMut::from(data),
                 );
+                self.relieve();
             }
             self.send_forwards();
             if n < self.cfg.recv_batch {
@@ -497,6 +603,10 @@ impl Shard {
     /// Reads what a connected socket has queued.
     fn drain_peer(&mut self, slot: usize, now: Instant) {
         for round in 0..MAX_ROUNDS {
+            if self.turn_is_full() {
+                self.peer_ready.push(slot);
+                return;
+            }
             let Some(ps) = self.peer_socks.get(slot).and_then(Option::as_ref) else {
                 return;
             };
@@ -518,6 +628,7 @@ impl Shard {
                 };
                 self.traffic.udp_in_bytes += data.len() as u64;
                 self.traffic.udp_in_packets += 1;
+                self.turn_reads += 1;
                 self.engine.handle_datagram(
                     now,
                     Proto::Udp,
@@ -525,6 +636,7 @@ impl Shard {
                     peer,
                     BytesMut::from(data),
                 );
+                self.relieve();
             }
             if n < self.cfg.recv_batch {
                 return;
@@ -545,7 +657,24 @@ impl Shard {
             // A shard that is full or gone loses them, as a congested network would.
             match self.peers.get(owner) {
                 Some(peer) => {
-                    let _ = peer.send(ShardCommand::Datagrams(std::mem::take(batch)));
+                    let queued = peer.stats.forward_queued.load(Ordering::Relaxed);
+                    let dropped = bound_forwarded(queued, batch);
+                    if dropped > 0 {
+                        peer.stats
+                            .forward_dropped
+                            .fetch_add(dropped as u64, Ordering::Relaxed);
+                        if batch.is_empty() {
+                            continue;
+                        }
+                    }
+                    let n = batch.len();
+                    peer.stats.forward_queued.fetch_add(n, Ordering::Relaxed);
+                    if peer
+                        .send(ShardCommand::Datagrams(std::mem::take(batch)))
+                        .is_err()
+                    {
+                        peer.stats.forward_queued.fetch_sub(n, Ordering::Relaxed);
+                    }
                 }
                 None => batch.clear(),
             }
@@ -777,9 +906,14 @@ impl Shard {
                         .record_stop(now, &r.group, &r.call, &r.recording_id);
                 }
                 Ok(ShardCommand::Datagrams(batch)) => {
+                    self.stats
+                        .forward_queued
+                        .fetch_sub(batch.len(), Ordering::Relaxed);
+                    self.turn_reads += batch.len() as u32;
                     for d in batch {
                         self.engine
                             .handle_datagram(now, d.proto, d.local, d.peer, d.data);
+                        self.relieve();
                     }
                 }
                 Ok(ShardCommand::TcpHandover { conn, frames }) => {
@@ -807,6 +941,18 @@ impl Shard {
 
     // ----------------------------------------------------------------------------------- output
 
+    /// Whether the turn has taken in all it should: the timers and the sends wait behind it.
+    fn turn_is_full(&self) -> bool {
+        self.turn_reads >= MAX_TURN_READS || self.turn_began.elapsed() >= TURN_TIME
+    }
+
+    /// Sends what the engine has queued if it is a lot, without waiting for the turn to end.
+    fn relieve(&mut self) {
+        if self.engine.queued_transmits() >= FLUSH_AT {
+            self.flush();
+        }
+    }
+
     /// Sends what the engine wants sent and reports what it wants reported.
     fn flush(&mut self) {
         if self.directory.is_some() {
@@ -828,6 +974,8 @@ impl Shard {
         // same two counters, and an atomic add per datagram is a million contended writes a
         // second on a busy node.
         let (mut wire_bytes, mut wire_packets) = (0u64, 0u64);
+        let queued = self.engine.queued_transmits().min(u32::MAX as usize) as u32;
+        self.window_peaks[1] = self.window_peaks[1].max(queued);
         while let Some(t) = self.engine.poll_transmit() {
             let tcp = matches!(t.proto, Proto::Tcp);
             wire_bytes += Gauge::wire_len(t.data.len(), t.peer, tcp);
@@ -871,5 +1019,75 @@ impl Shard {
             }
             self.sink.event(event);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn forwarded(first: u8) -> Forwarded {
+        Forwarded {
+            proto: Proto::Udp,
+            local: "127.0.0.1:8443".parse().unwrap(),
+            peer: "127.0.0.1:50000".parse().unwrap(),
+            data: BytesMut::from(&[first, 0, 0, 0][..]),
+        }
+    }
+
+    /// RTP (`0x80`), RTCP (`0x81` and up), STUN (`0x00`) and DTLS (`0x16`).
+    fn mixed(n: usize) -> Vec<Forwarded> {
+        (0..n)
+            .map(|i| forwarded([0x80, 0x90, 0x00, 0x16][i % 4]))
+            .collect()
+    }
+
+    #[test]
+    fn media_is_told_from_the_handshakes_by_the_first_byte() {
+        for rtp in [0x80, 0x90, 0xbf] {
+            assert!(is_media(&[rtp, 0]), "{rtp:#x}");
+        }
+        for other in [0x00, 0x01, 0x16, 0x17, 0x40, 0xc0, 0xff] {
+            assert!(!is_media(&[other, 0]), "{other:#x}");
+        }
+        assert!(!is_media(&[]));
+    }
+
+    #[test]
+    fn a_shard_with_room_is_passed_everything() {
+        let mut batch = mixed(64);
+        assert_eq!(bound_forwarded(0, &mut batch), 0);
+        assert_eq!(batch.len(), 64);
+        assert_eq!(bound_forwarded(MAX_FORWARD_QUEUE - 64, &mut batch), 0);
+        assert_eq!(batch.len(), 64, "up to the limit exactly");
+    }
+
+    #[test]
+    fn a_shard_behind_is_passed_the_handshakes_and_not_the_media() {
+        let mut batch = mixed(64);
+        let dropped = bound_forwarded(MAX_FORWARD_QUEUE - 10, &mut batch);
+        assert_eq!(dropped, 32, "half of the mix is RTP and RTCP");
+        assert_eq!(batch.len(), 32);
+        assert!(batch.iter().all(|d| !is_media(&d.data)));
+    }
+
+    #[test]
+    fn a_shard_far_behind_is_passed_nothing() {
+        let mut batch = mixed(64);
+        assert_eq!(bound_forwarded(2 * MAX_FORWARD_QUEUE, &mut batch), 64);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn what_a_shard_may_be_owed_is_bounded_however_long_it_stays_behind() {
+        // A shard that takes nothing at all while another keeps passing 64 datagrams at a time,
+        // half of them handshakes: the queue stops growing a batch past twice the limit.
+        let mut queued = 0usize;
+        for _ in 0..100_000 {
+            let mut batch = mixed(64);
+            bound_forwarded(queued, &mut batch);
+            queued += batch.len();
+        }
+        assert!(queued < 2 * MAX_FORWARD_QUEUE + 64, "{queued}");
     }
 }

@@ -60,7 +60,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Video falls back to the small layers at this share of the budget.
@@ -114,6 +114,12 @@ const RELEASE_MAX: Duration = Duration::from_secs(300);
 /// The Ethernet header, which the network card's counters include; the IP header (20 bytes, 40
 /// for IPv6) and the UDP (8) or TCP (20) one are added per datagram.
 const LINK_OVERHEAD: u64 = 14;
+/// The share of the packets the node sends that retransmissions may be, and the least it answers
+/// (packets a second) however little it sends: a lossy receiver on a quiet node is answered in
+/// full. While the kernel refuses datagrams only the small floor is answered.
+const RTX_SHARE: f64 = 0.10;
+const RTX_FLOOR_PPS: f64 = 500.0;
+const RTX_FLOOR_REFUSING_PPS: f64 = 50.0;
 
 #[derive(Debug, Default)]
 struct State {
@@ -170,6 +176,13 @@ struct State {
     rechokes: u32,
 }
 
+/// A token bucket of packets: how many retransmissions are left to answer, and as of when.
+#[derive(Debug, Default)]
+struct RtxBucket {
+    level: f64,
+    at: Option<Instant>,
+}
+
 /// The kernel's count of refused datagrams and what it is the sum of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Drops {
@@ -218,6 +231,13 @@ pub struct Gauge {
     rate: AtomicU64,
     rate_packets: AtomicU64,
     squeezed: AtomicBool,
+    /// What the node holds regardless of the kernel (see [`Gauge::hold`]): 0 nothing, 1 squeeze,
+    /// 2 squeeze and choke.
+    held: AtomicU8,
+    /// The retransmissions the node still answers now (see [`Gauge::allow_retransmits`]), and the
+    /// ones it has left unanswered since it started.
+    rtx: Mutex<RtxBucket>,
+    rtx_limited: AtomicU64,
     /// Datagrams the kernel refused to queue since the node started (UDP `SndbufErrors`).
     kernel_drops: AtomicU64,
     /// Until when the kernel counts as refusing and the node as choked, in nanoseconds after
@@ -306,7 +326,49 @@ impl Gauge {
 
     /// Whether receivers are being held to the small layers.
     pub fn squeezed(&self) -> bool {
-        self.squeezed.load(Ordering::Relaxed)
+        self.squeezed.load(Ordering::Relaxed) || self.held.load(Ordering::Relaxed) > 0
+    }
+
+    /// Whether the node answers a request to retransmit `packets` packets at `now`.
+    ///
+    /// Retransmissions are what a node under loss sends more of: every receiver that loses asks
+    /// again, for the same packets again when the answer is lost too. At 95 % loss the lab's node
+    /// offered 20 times what its receivers had asked it to carry, 1.7 Gbit/s from 36 of them, and
+    /// what it offered was refused, which made the loss. So they are limited to a tenth of what the
+    /// node sends (never below 500 packets a second, so that a lossy receiver on a quiet node is
+    /// answered), to almost nothing while the kernel refuses datagrams, and a request is answered
+    /// whole or not at all. The receiver asks again, or its video freezes until the next keyframe,
+    /// which is what loss this deep costs anyway.
+    pub fn allow_retransmits(&self, packets: u64, now: Instant) -> bool {
+        let rate = if self.refusing(now) {
+            RTX_FLOOR_REFUSING_PPS
+        } else {
+            (self.rate_pps() as f64 * RTX_SHARE).max(RTX_FLOOR_PPS)
+        };
+        let mut b = self.rtx.lock().unwrap_or_else(|e| e.into_inner());
+        // A second's worth at most: a spell of quiet does not store up a flood.
+        let elapsed =
+            b.at.map_or(1.0, |t| now.saturating_duration_since(t).as_secs_f64());
+        b.at = Some(now);
+        b.level = (b.level + elapsed * rate).min(rate);
+        if b.level <= 0.0 {
+            self.rtx_limited.fetch_add(packets, Ordering::Relaxed);
+            return false;
+        }
+        b.level -= packets as f64;
+        true
+    }
+
+    /// Retransmissions asked for and not answered since the node started (see
+    /// [`Gauge::allow_retransmits`]).
+    pub fn retransmits_limited(&self) -> u64 {
+        self.rtx_limited.load(Ordering::Relaxed)
+    }
+
+    /// Holds the node squeezed (`1`) or squeezed and choked (`2`), or lets go (`0`), whatever the
+    /// kernel says: for a limit that is not the card's (the node's memory).
+    pub fn hold(&self, level: u8) {
+        self.held.store(level.min(2), Ordering::Relaxed);
     }
 
     /// Whether the kernel is refusing datagrams at `now`: two windows in a row refused, and the
@@ -319,6 +381,7 @@ impl Gauge {
     /// bits fell and the packets did not.
     pub fn choked(&self, now: Instant) -> bool {
         self.choked_until.load(Ordering::Relaxed) > self.nanos(now)
+            || self.held.load(Ordering::Relaxed) > 1
     }
 
     fn nanos(&self, t: Instant) -> u64 {
@@ -1373,5 +1436,57 @@ Udp6InCsumErrors                \t0\n";
         run_budget(&mut rig, 1, 0, 300);
         assert_eq!((rig.g.rate_bps(), rig.g.rate_pps()), (0, 0));
         assert!(!rig.g.squeezed());
+    }
+
+    #[test]
+    fn a_lossy_receiver_on_a_quiet_node_is_answered_in_full() {
+        let g = Gauge::default();
+        let now = Instant::now();
+        for i in 0..400 {
+            assert!(
+                g.allow_retransmits(1, now + Duration::from_millis(i * 2)),
+                "request {i}"
+            );
+        }
+        assert_eq!(g.retransmits_limited(), 0);
+    }
+
+    #[test]
+    fn retransmissions_are_limited_to_a_tenth_of_what_the_node_sends() {
+        let g = Gauge::default();
+        let t0 = Instant::now();
+        // A node sending 200,000 packets a second answers 20,000 of them: a thousand requests of
+        // 100 packets, a second, then no more until the bucket refills.
+        for s in 1..=3 {
+            g.add(1, 200_000);
+            g.update(t0 + Duration::from_secs(s), 0, 0);
+        }
+        assert!(g.rate_pps() > 100_000, "{}", g.rate_pps());
+        let now = t0 + Duration::from_secs(3);
+        let answered = (0..2_000).filter(|_| g.allow_retransmits(100, now)).count();
+        assert!(
+            (150..=260).contains(&answered),
+            "{answered} requests of 100 answered"
+        );
+        assert!(g.retransmits_limited() > 100 * 1_000);
+        // A second later the bucket is full again.
+        assert!(g.allow_retransmits(100, now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn while_the_kernel_refuses_only_a_trickle_is_answered() {
+        let refused = std::sync::Arc::new(AtomicU64::new(0));
+        let counter = refused.clone();
+        let g = Gauge::with_kernel_drops(move || Some(counter.load(Ordering::Relaxed)));
+        let t0 = Instant::now();
+        for s in 1..=6 {
+            g.add(1, 200_000);
+            refused.fetch_add(5_000, Ordering::Relaxed);
+            g.update(t0 + Duration::from_secs(s), 0, 0);
+        }
+        let now = t0 + Duration::from_secs(6);
+        assert!(g.refusing(now));
+        let answered: u64 = (0..1_000).filter(|_| g.allow_retransmits(10, now)).count() as u64;
+        assert!(answered <= 6, "{answered} answered at 50 a second");
     }
 }

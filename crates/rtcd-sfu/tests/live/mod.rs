@@ -54,6 +54,23 @@ impl Live {
         scaling: ScalingPolicy,
         egress: Arc<rtcd_sfu::egress::Gauge>,
     ) -> Live {
+        Self::start_node(
+            shards,
+            max_shards,
+            scaling,
+            egress,
+            rtcd_sfu::runtime::MemorySource::default(),
+        )
+    }
+
+    /// Like [`start_with`](Self::start_with), with the memory the node reads of itself given.
+    pub fn start_node(
+        shards: usize,
+        max_shards: usize,
+        scaling: ScalingPolicy,
+        egress: Arc<rtcd_sfu::egress::Gauge>,
+        memory: rtcd_sfu::runtime::MemorySource,
+    ) -> Live {
         let engine = EngineConfig {
             egress,
             addresses: vec![LocalAddress {
@@ -74,6 +91,7 @@ impl Live {
             scaling,
             udp_recv_buffer: 1 << 20,
             udp_send_buffer: 1 << 20,
+            memory,
             ..Default::default()
         };
         let traffic = Arc::new(Traffic::default());

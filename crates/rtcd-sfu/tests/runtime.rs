@@ -717,3 +717,90 @@ fn recordings_that_wait_for_a_call_are_bounded_in_number_and_time() {
         "the new one waits, as the first did"
     );
 }
+
+/// What the node refuses when its memory is nearly used up: nothing was refused before, and the
+/// kernel kills a process out of memory with every call on it.
+#[test]
+fn a_node_nearly_out_of_memory_takes_no_newcomer_and_then_nobody() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use rtcd_proto::{JoinRequest, SessionConfig};
+    use rtcd_sfu::hostmem::Memory;
+    use rtcd_sfu::runtime::{AdmitError, JoinError, MemorySource};
+
+    const GIB: u64 = 1 << 30;
+    let rss = Arc::new(AtomicU64::new(GIB));
+    let reading = rss.clone();
+    let memory = MemorySource::new(move || {
+        Some(Memory {
+            total: 16 * GIB,
+            available: 8 * GIB,
+            rss: reading.load(Ordering::Relaxed),
+            limit: 3 * GIB,
+        })
+    });
+    let mut live = Live::start_node(1, 0, ScalingPolicy::default(), Arc::default(), memory);
+    live.join("alice", "call1");
+
+    let cfg = |user: &str, id: &str, host: bool| {
+        let mut c = SessionConfig::from_join(
+            "",
+            &JoinRequest {
+                call_id: "call1".into(),
+                user_id: user.into(),
+                session_id: id.into(),
+                host,
+                ..Default::default()
+            },
+        );
+        c.group_id = "group".into();
+        c
+    };
+    let settle = |live: &mut Live, closed: bool| {
+        let end = Instant::now() + Duration::from_secs(5);
+        while live.sfu.admission().refuses_newcomers() != closed {
+            assert!(Instant::now() < end, "the verdict did not change");
+            live.run(Duration::from_millis(50));
+        }
+    };
+
+    // 77 % of the memory it may hold: a newcomer is turned away, a host and a participant who is
+    // in the call already are not.
+    rss.store(GIB * 23 / 10, Ordering::Relaxed);
+    settle(&mut live, true);
+    assert_eq!(live.sfu.admission().reason(), "memory");
+    assert!(matches!(
+        live.sfu.join(cfg("bob", "session-bob", false)),
+        Err(JoinError::Admit(AdmitError::Saturated))
+    ));
+    assert!(live.sfu.join(cfg("carol", "session-carol", true)).is_ok());
+    assert!(
+        live.sfu
+            .join(cfg("user-alice", "session-alice-again", false))
+            .is_ok(),
+        "a participant who is in the call is not a newcomer"
+    );
+
+    // 93 %: not even the host.
+    rss.store(GIB * 28 / 10, Ordering::Relaxed);
+    let end = Instant::now() + Duration::from_secs(5);
+    while !live.sfu.admission().refuses_everyone() {
+        assert!(Instant::now() < end, "the verdict did not change");
+        live.run(Duration::from_millis(50));
+    }
+    assert!(matches!(
+        live.sfu.join(cfg("dave", "session-dave", true)),
+        Err(JoinError::Admit(AdmitError::NodeFull))
+    ));
+    assert!(
+        live.sfu.egress_squeezed() && live.sfu.egress_choked(),
+        "what the node carries is shed meanwhile"
+    );
+
+    // The load falls: everyone is taken again, and the shedding stops.
+    rss.store(GIB, Ordering::Relaxed);
+    settle(&mut live, false);
+    assert!(live.sfu.join(cfg("bob", "session-bob", false)).is_ok());
+    assert!(!live.sfu.egress_squeezed());
+}
