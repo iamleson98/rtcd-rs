@@ -4,6 +4,7 @@ per line: what the process holds (VmRSS, the cgroup's memory.current), what the 
 its datagrams (UdpSndbufErrors, the interface's qdisc drops) and what rtcd says (/system,
 selected /metrics). Usage: sample.py [interval_seconds] [seconds]."""
 import json
+import os
 import re
 import subprocess
 import sys
@@ -12,15 +13,21 @@ import urllib.request
 
 INTERVAL = float(sys.argv[1]) if len(sys.argv) > 1 else 5
 TOTAL = float(sys.argv[2]) if len(sys.argv) > 2 else 3600
-API = "http://127.0.0.1:8045"
+API = os.environ.get("RTCD_API", "http://127.0.0.1:8045")
 
 
 def pid():
+    if os.environ.get("RTCD_PID"):
+        return os.environ["RTCD_PID"]
     out = subprocess.run(["pgrep", "-x", "rtcd"], capture_output=True, text=True).stdout.split()
     return out[0] if out else None
 
 
 def status(p):
+    if not os.path.exists(f"/proc/{p}/status"):
+        # Not Linux: ps knows the resident set, not its high-water mark.
+        out = subprocess.run(["ps", "-o", "rss=", "-p", p], capture_output=True, text=True).stdout.strip()
+        return {"rss_mb": int(out) // 1024} if out else {}
     try:
         text = open(f"/proc/{p}/status").read()
     except OSError:
@@ -48,6 +55,8 @@ def cgroup():
 
 
 def snmp_udp():
+    if not os.path.exists("/proc/net/snmp"):
+        return {}
     lines = [l.split() for l in open("/proc/net/snmp") if l.startswith("Udp:")]
     keys, vals = lines[0], lines[1]
     d = dict(zip(keys[1:], map(int, vals[1:])))

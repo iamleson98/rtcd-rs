@@ -297,6 +297,48 @@ and 12 Mbit/s for a class of 30 with 24 cameras, measured with `lms-sim`).
 `RTCD_RTC_REFUSEWHENSATURATED=false` turns the refusal off.
 `GET /system` reports `shards_pressured` and `shards_saturated`.
 
+## Large calls: a node near its limits
+
+A node that is asked for more than it carries must refuse and shed before it runs away. The kernel
+does not push back on UDP (a full qdisc is success for the sender, counted in `SndbufErrors`), so
+nothing in a shard's send path blocks; what grows is what a shard that has fallen behind keeps, and
+the lag grows with it. Measured on the OVH 4-vCPU video node (2026-11-01): ~720 sessions, offered
+rate 6.6 Gbit/s, a million refused datagrams in two minutes, resident memory 0.5 to 2.26 GB, killed
+at the 3 GiB limit with every call on it.
+
+Bounds (always on, `src/runtime/shard.rs`):
+
+- Datagrams one shard passes on to another (the kernel hands a packet to the shard its port hash
+  picks, not the one that owns the session) are limited to 4,096 waiting per receiving shard, about
+  100 ms of a busy one. Past that only handshakes (STUN, DTLS) go; past twice that, nothing. The
+  channel used to hold 65,536 batches of up to 64 datagrams with no limit in datagrams.
+- A turn of the loop takes in at most 8,192 datagrams over all sockets; the rest is read in the next
+  turn, after the timers.
+- The engine's queued datagrams are handed to the sockets at 2,048, not at the end of the turn: a
+  video packet becomes a datagram for each receiver, and a turn that read a thousand held a call's
+  worth of copies of each.
+
+Limits (`src/runtime/guard.rs`; a thread of its own reads the memory every 250 ms, not the async
+runtime a saturated node starves):
+
+- From `RTCD_RTC_REFUSEMEMORYPERCENT` (default 70) of the memory the process may hold (its control
+  group's limit) a newcomer to a call is refused as at a saturated shard (a host, a recorder and a
+  participant in the call or just gone are not) and the node sheds: small video layers, fewer voices.
+- From `RTCD_RTC_REFUSEHARDMEMORYPERCENT` (85) nobody is taken, a host included, and calls forward
+  their loudest voice only. Each limit is released ten points lower; 0 turns it off.
+- While the kernel refuses the node's datagrams (`egress_refusing`), or it sends at the ceiling it
+  learned, newcomers are refused (`RTCD_RTC_REFUSEWHENKERNELREFUSES`, default true).
+- `GET /system` reports `admission_closed` (`memory`, `memory_hard`, `refusals`; empty when open),
+  which the server reads to place new calls elsewhere. Metrics: `rtcd_admission_closed{reason}`,
+  `rtcd_rtc_sessions_refused_total{reason}` (`shard` too), `rtcd_forward_queued_packets`,
+  `rtcd_forward_dropped_packets_total`, `rtcd_shard_turn_peak_reads`, `rtcd_shard_turn_peak_transmits`,
+  `rtcd_shard_turn_longest_seconds`.
+
+A refused session is closed, as at a saturated shard; the web app treats that as a lost connection
+and tries again with growing pauses (`lms-web/src/lib/features/calls/rejoin.ts`).
+
+The lab that measured this is `scripts/overload-lab`.
+
 ## Upgrading from the previous release
 
 With no setting changed, a node that takes this release behaves differently in four ways:

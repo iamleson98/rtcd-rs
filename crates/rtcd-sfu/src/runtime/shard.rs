@@ -39,6 +39,11 @@ const MAX_ROUNDS: usize = 16;
 /// would otherwise read everything the kernel holds for hundreds of sockets before it looked at a
 /// timer, and send nothing until it had.
 const MAX_TURN_READS: u32 = 8192;
+/// How long a turn keeps reading: a datagram of a call with a hundred receivers is a hundred
+/// encryptions, so a count of datagrams says little about the time a turn takes (seconds, in the
+/// lab, at 8,192). Past this the sockets that still have datagrams are read in the next turn,
+/// after the timers and with everything sent so far on its way.
+const TURN_TIME: Duration = Duration::from_millis(20);
 /// Datagrams other shards may have passed on to one shard that it has not yet taken up. Media is
 /// of use for a moment: at 40 thousand datagrams a second the shard is about 100 ms behind with
 /// this many waiting, and what comes later would be played to nobody (and cost the memory, and
@@ -290,8 +295,9 @@ pub(crate) struct Shard {
     forward: Vec<Vec<Forwarded>>,
     busy: Arc<AtomicU32>,
     stats: Arc<ShardStats>,
-    /// Datagrams taken in by the turn that is running.
+    /// Datagrams taken in by the turn that is running, and when it began.
     turn_reads: u32,
+    turn_began: Instant,
     /// The peaks of the window that is running (see `ShardStats`).
     window_peaks: [u32; 3],
     /// Time spent working since `window_start`.
@@ -353,6 +359,7 @@ impl Shard {
             busy,
             stats,
             turn_reads: 0,
+            turn_began: Instant::now(),
             window_peaks: [0; 3],
             worked: Duration::ZERO,
             window_start: Instant::now(),
@@ -377,6 +384,7 @@ impl Shard {
             }
             let now = Instant::now();
             self.turn_reads = 0;
+            self.turn_began = now;
 
             let mut commands_ready = false;
             for ev in events.iter() {
@@ -473,7 +481,7 @@ impl Shard {
     fn drain_udp(&mut self, i: usize, now: Instant) {
         let advertised = self.udp[i].advertised;
         for round in 0..MAX_ROUNDS {
-            if self.turn_reads >= MAX_TURN_READS {
+            if self.turn_is_full() {
                 // The turn has taken in enough: what is left is read in the next one.
                 self.udp_backlog[i] = true;
                 return;
@@ -595,7 +603,7 @@ impl Shard {
     /// Reads what a connected socket has queued.
     fn drain_peer(&mut self, slot: usize, now: Instant) {
         for round in 0..MAX_ROUNDS {
-            if self.turn_reads >= MAX_TURN_READS {
+            if self.turn_is_full() {
                 self.peer_ready.push(slot);
                 return;
             }
@@ -932,6 +940,11 @@ impl Shard {
     }
 
     // ----------------------------------------------------------------------------------- output
+
+    /// Whether the turn has taken in all it should: the timers and the sends wait behind it.
+    fn turn_is_full(&self) -> bool {
+        self.turn_reads >= MAX_TURN_READS || self.turn_began.elapsed() >= TURN_TIME
+    }
 
     /// Sends what the engine has queued if it is a lot, without waiting for the turn to end.
     fn relieve(&mut self) {
