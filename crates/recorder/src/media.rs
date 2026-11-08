@@ -38,6 +38,11 @@ impl std::error::Error for FileLimit {}
 /// next frame opens a new one. Shorter gaps are bridged with silence, so a file plays as one
 /// continuous stream.
 pub const SEGMENT_GAP: Duration = Duration::from_secs(2);
+/// A voice whose RTP timestamp moves further than this from the last packet's (either way) has
+/// not kept to the clock: packets arrive in step with the wall clock, so a jump this big is a
+/// broken or forged sender, and bridging it with silence would write hours of filler. The file
+/// closes and the next packet starts a new one on the new timeline.
+const AUDIO_JUMP_MAX_MS: i64 = 5_000;
 /// A shared screen that sends nothing is still there: a still screen sends a frame a second at
 /// best and nothing at all for seconds at a time, and the player shows a file only while it
 /// covers the moment, so closing the file would blank the screen. The last picture is held (the
@@ -513,6 +518,12 @@ impl StreamRecorder {
         self.last_media = Some(now);
         if self.rotation_due(now) {
             self.close_segment("rotated", None);
+        }
+        if self.seg.as_ref().is_some_and(|seg| {
+            let jump = i64::from(ts.wrapping_sub(seg.prev_ts) as i32);
+            jump.abs() * 1000 / 48_000 > AUDIO_JUMP_MAX_MS
+        }) {
+            self.close_segment("timestamp jump", None);
         }
         if self.seg.is_none()
             && let Err(e) = self.open(now, ts, Track::Opus, (0, 0))
@@ -1026,6 +1037,37 @@ mod tests {
             1,
             "closed once the stream has been silent for the gap"
         );
+    }
+
+    #[test]
+    fn a_forged_timestamp_jump_starts_a_new_file_and_writes_no_filler() {
+        let (rec, start) = setup("jump", u64::MAX);
+        let mut s = voice(&rec);
+        speak(&mut s, start, 1, 0, 10);
+        // One packet claiming to be half a day later, arriving in step with the wall clock.
+        let jump = 1u32 << 31;
+        speak(&mut s, start + Duration::from_millis(200), 11, jump, 10);
+        s.finish(start + Duration::from_secs(1), "test");
+        let files = rec.files();
+        assert_eq!(files.len(), 2, "{files:?}");
+        for f in &files {
+            let times = block_times(&f.path);
+            assert_eq!(times.len(), 10, "no filler between the packets");
+            assert!(f.end_ms - f.start_ms < 1000);
+        }
+        // Still on the clock: a jump below the limit is bridged as before.
+        let (rec, start) = setup("jump-small", u64::MAX);
+        let mut s = voice(&rec);
+        speak(&mut s, start, 1, 0, 10);
+        speak(
+            &mut s,
+            start + Duration::from_millis(200),
+            11,
+            10 * 960 + 48_000,
+            10,
+        );
+        s.finish(start + Duration::from_secs(1), "test");
+        assert_eq!(rec.files().len(), 1);
     }
 
     #[test]
