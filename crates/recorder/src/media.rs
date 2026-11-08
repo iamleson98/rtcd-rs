@@ -404,7 +404,9 @@ impl StreamRecorder {
             match item {
                 Item::Packet(p) => {
                     if self.info.video {
-                        self.assembler.push(now, &p);
+                        if self.assembler.push(now, &p) {
+                            self.picture_broken();
+                        }
                         while let Some((f, data)) = self.assembler.frame() {
                             self.video_frame(f.arrived, f.timestamp, f.key, &data);
                             self.assembler.recycle(data);
@@ -417,14 +419,18 @@ impl StreamRecorder {
                     self.lost += u64::from(n);
                     if self.info.video {
                         self.assembler.lost();
-                        if !self.need_key {
-                            // The picture is broken until the next keyframe: ask at once.
-                            self.need_key = true;
-                            self.last_ask = None;
-                        }
+                        self.picture_broken();
                     }
                 }
             }
+        }
+    }
+
+    /// The picture is broken until the next keyframe: ask at once.
+    fn picture_broken(&mut self) {
+        if !self.need_key {
+            self.need_key = true;
+            self.last_ask = None;
         }
     }
 

@@ -56,6 +56,10 @@ pub struct Frame {
     pub arrived: Instant,
 }
 
+/// The most one frame may grow to. A real frame is far smaller (a keyframe at 4K is a few
+/// hundred KiB); the cap stops a publisher that never sets the marker from filling the memory.
+pub const MAX_FRAME: usize = 4 << 20;
+
 /// Builds frames out of ordered packets.
 #[derive(Debug)]
 pub struct Assembler {
@@ -86,9 +90,13 @@ impl Assembler {
     }
 
     /// Takes the next packet in order. A finished frame is available from [`Self::frame`].
-    pub fn push(&mut self, arrived: Instant, p: &TapPacket) {
+    ///
+    /// Returns `true` when the frame grew past [`MAX_FRAME`]: it is dropped like a lost one, and
+    /// the caller asks for a keyframe.
+    #[must_use]
+    pub fn push(&mut self, arrived: Instant, p: &TapPacket) -> bool {
         let Some((at, start)) = descriptor(&p.payload) else {
-            return;
+            return false;
         };
         if start {
             // A frame that never finished is dropped by its successor.
@@ -97,7 +105,11 @@ impl Assembler {
             self.timestamp = p.ts;
             self.arrived = arrived;
         } else if !self.in_frame || p.ts != self.timestamp {
-            return; // the rest of a frame whose start is gone
+            return false; // the rest of a frame whose start is gone
+        }
+        if self.buf.len() + (p.payload.len() - at) > MAX_FRAME {
+            self.lost();
+            return true;
         }
         self.buf.extend_from_slice(&p.payload[at..]);
         if p.marker {
@@ -110,6 +122,7 @@ impl Assembler {
                 });
             }
         }
+        false
     }
 
     /// Packets went missing: the frame being built is no good.
@@ -182,9 +195,9 @@ mod tests {
     fn frames_are_assembled_from_packets() {
         let t = Instant::now();
         let mut a = Assembler::new();
-        a.push(t, &pkt(1, 100, false, &[0x10], &[0x10, 1, 2]));
+        let _ = a.push(t, &pkt(1, 100, false, &[0x10], &[0x10, 1, 2]));
         assert!(a.frame().is_none());
-        a.push(t, &pkt(2, 100, true, &[0x00], &[3, 4]));
+        let _ = a.push(t, &pkt(2, 100, true, &[0x00], &[3, 4]));
         let (f, data) = a.frame().unwrap();
         assert!(f.key);
         assert_eq!(f.timestamp, 100);
@@ -196,11 +209,11 @@ mod tests {
     fn a_lost_packet_drops_its_frame() {
         let t = Instant::now();
         let mut a = Assembler::new();
-        a.push(t, &pkt(1, 100, false, &[0x10], &[0x11, 1]));
+        let _ = a.push(t, &pkt(1, 100, false, &[0x10], &[0x11, 1]));
         a.lost();
-        a.push(t, &pkt(3, 100, true, &[0x00], &[3]));
+        let _ = a.push(t, &pkt(3, 100, true, &[0x00], &[3]));
         assert!(a.frame().is_none(), "the tail of a frame without its start");
-        a.push(t, &pkt(4, 200, true, &[0x10], &[0x11, 7]));
+        let _ = a.push(t, &pkt(4, 200, true, &[0x10], &[0x11, 7]));
         let (f, data) = a.frame().unwrap();
         assert!(!f.key);
         assert_eq!(data, [0x11, 7]);
@@ -210,10 +223,35 @@ mod tests {
     fn a_new_start_replaces_an_unfinished_frame() {
         let t = Instant::now();
         let mut a = Assembler::new();
-        a.push(t, &pkt(1, 100, false, &[0x10], &[0x11, 1]));
-        a.push(t, &pkt(2, 200, true, &[0x10], &[0x11, 2]));
+        let _ = a.push(t, &pkt(1, 100, false, &[0x10], &[0x11, 1]));
+        let _ = a.push(t, &pkt(2, 200, true, &[0x10], &[0x11, 2]));
         let (f, data) = a.frame().unwrap();
         assert_eq!(f.timestamp, 200);
         assert_eq!(data, [0x11, 2]);
+    }
+
+    #[test]
+    fn a_frame_without_a_marker_stops_at_the_cap() {
+        let t = Instant::now();
+        let mut a = Assembler::new();
+        let chunk = vec![0u8; 1200];
+        assert!(!a.push(t, &pkt(0, 100, false, &[0x10], &chunk)));
+        let mut over = false;
+        for seq in 1..=(MAX_FRAME / 1200 + 2) as u16 {
+            over |= a.push(t, &pkt(seq, 100, false, &[0x00], &chunk));
+            if over {
+                break;
+            }
+        }
+        assert!(over, "the frame has to hit the cap");
+        assert!(a.buf.len() <= MAX_FRAME);
+        assert!(a.buf.is_empty(), "the oversized frame is dropped");
+        // The rest of the dropped frame is ignored; the next start takes up again.
+        assert!(!a.push(t, &pkt(9999, 100, true, &[0x00], &[1])));
+        assert!(a.frame().is_none());
+        assert!(!a.push(t, &pkt(10000, 200, true, &[0x10], &[0x10, 7])));
+        let (f, data) = a.frame().unwrap();
+        assert!(f.key);
+        assert_eq!(data, [0x10, 7]);
     }
 }
