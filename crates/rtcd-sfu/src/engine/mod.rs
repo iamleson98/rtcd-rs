@@ -38,7 +38,7 @@ pub(crate) use route::stun_local_ufrag;
 pub use signaling::Channel;
 pub use types::{CloseReason, Command, Event, Proto, Transmit};
 
-use self::route::Routes;
+use self::route::{Route, Routes};
 use self::session::{SessionKey, Sessions, SourceKey};
 use crate::config::EngineConfig;
 use crate::ids::Rng;
@@ -179,8 +179,10 @@ impl Engine {
         peer: std::net::SocketAddr,
         data: BytesMut,
     ) -> bool {
-        let routed = self.route(proto, local, peer, &data);
-        if let Some(key) = routed {
+        let mut routed = false;
+        let queued = self.out.len();
+        if let Some(route) = self.route(proto, peer, &data) {
+            let key = route.key();
             if let Some(s) = self.sessions.get_mut(key) {
                 s.last_rx = now;
                 use rtc::shared::{TaggedBytesMut, TransportContext};
@@ -198,11 +200,40 @@ impl Engine {
                     // Garbage on the wire is routine; it is not worth more than a debug line.
                     debug!(session = %s.cfg.session_id, %err, "datagram rejected");
                 }
+                match route {
+                    Route::Known(_) => routed = true,
+                    // The sender of a check may only have heard of the session's username
+                    // fragment: its address is the session's once the ICE agent answered it.
+                    Route::Provisional(_) if self.check_answered(key, queued, proto, peer) => {
+                        routed = true;
+                        self.learn_addr(key, proto, local, peer);
+                    }
+                    Route::Provisional(_) => {}
+                }
             }
             self.mark_dirty(key);
         }
         self.drive(now);
-        routed.is_some()
+        routed
+    }
+
+    /// Whether the session's ICE agent answered a check from `peer` with a success response: it
+    /// does so only for a check whose username and MESSAGE-INTEGRITY held, which `handle_read`
+    /// does not report. `queued` is the length of the output queue before the check was read.
+    fn check_answered(
+        &mut self,
+        key: SessionKey,
+        queued: usize,
+        proto: Proto,
+        peer: std::net::SocketAddr,
+    ) -> bool {
+        /// A STUN binding success response (RFC 5389: class 0b10, method binding).
+        const BINDING_SUCCESS: [u8; 2] = [0x01, 0x01];
+        self.flush(key);
+        self.out
+            .iter()
+            .skip(queued)
+            .any(|t| t.proto == proto && t.peer == peer && t.data.starts_with(&BINDING_SUCCESS))
     }
 
     /// Advances time: wakes every session whose deadline has passed.

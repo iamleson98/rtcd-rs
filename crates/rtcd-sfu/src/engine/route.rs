@@ -75,21 +75,48 @@ impl Routes {
     }
 }
 
+/// Where a datagram belongs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Route {
+    /// The sender's address is known.
+    Known(SessionKey),
+    /// An ICE check names the session by its username fragment, which anyone who saw the
+    /// signaling knows. The address is not the session's until the ICE agent has accepted the
+    /// check (its MESSAGE-INTEGRITY is the proof), see [`Engine::learn_addr`].
+    Provisional(SessionKey),
+}
+
+impl Route {
+    pub fn key(self) -> SessionKey {
+        match self {
+            Route::Known(k) | Route::Provisional(k) => k,
+        }
+    }
+}
+
 impl Engine {
-    /// The session `data` from `peer` is for, learning the address from a STUN check.
-    pub(super) fn route(
-        &mut self,
-        proto: Proto,
-        local: SocketAddr,
-        peer: SocketAddr,
-        data: &BytesMut,
-    ) -> Option<SessionKey> {
+    /// The session `data` from `peer` is for.
+    pub(super) fn route(&self, proto: Proto, peer: SocketAddr, data: &BytesMut) -> Option<Route> {
         if let Some(&key) = self.routes.by_addr.get(&(proto, peer)) {
-            return Some(key);
+            return Some(Route::Known(key));
         }
         let ufrag = stun_local_ufrag(data)?;
         let key = *self.routes.by_ufrag.get(ufrag)?;
-        let s = self.sessions.get_mut(key)?;
+        self.sessions.get(key)?;
+        Some(Route::Provisional(key))
+    }
+
+    /// Remembers `peer` as an address of session `key`, once an ICE check from it was accepted.
+    pub(super) fn learn_addr(
+        &mut self,
+        key: SessionKey,
+        proto: Proto,
+        local: SocketAddr,
+        peer: SocketAddr,
+    ) {
+        let Some(s) = self.sessions.get_mut(key) else {
+            return;
+        };
         if s.addrs.len() >= MAX_ADDRS_PER_SESSION {
             // Forget the oldest address; the session is alive and recently seen ones win.
             let old = s.addrs.remove(0);
@@ -107,7 +134,6 @@ impl Engine {
                 .updates
                 .push(RouteUpdate::AddAddr(proto, local, peer));
         }
-        Some(key)
     }
 
     /// Whether this engine would take `data` from `peer`: the address is known, or the datagram
