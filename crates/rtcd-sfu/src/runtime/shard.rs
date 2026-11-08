@@ -20,7 +20,7 @@ use super::directory::Directory;
 use super::registry::Registry;
 use super::scaler::{Level, Pressure};
 use super::table::ShardTable;
-use super::tcp::TcpConn;
+use super::tcp::{TcpConn, TcpSlot};
 use crate::egress::Gauge;
 use crate::engine::{Command, Engine, Event, FastMap, Load, Proto, RouteUpdate};
 use crate::metrics::{Metrics, NetTraffic};
@@ -119,6 +119,7 @@ pub(crate) enum ShardCommand {
         stream: std::net::TcpStream,
         local: SocketAddr,
         peer: SocketAddr,
+        slot: TcpSlot,
     },
     Shutdown,
 }
@@ -711,7 +712,7 @@ impl Shard {
                 .handle_datagram(now, Proto::Tcp, local, peer, frame);
         }
         if let Some(c) = self.tcp.get_mut(idx).and_then(Option::as_mut) {
-            c.identified = identified;
+            c.set_identified(identified);
         }
         if !identified {
             self.tcp_close(idx);
@@ -744,6 +745,7 @@ impl Shard {
         stream: std::net::TcpStream,
         local: SocketAddr,
         peer: SocketAddr,
+        slot: TcpSlot,
         now: Instant,
     ) {
         if stream.set_nonblocking(true).is_err() {
@@ -768,7 +770,7 @@ impl Shard {
         if let Some(old) = self.tcp_by_peer.insert(peer, idx) {
             self.tcp_close(old);
         }
-        self.tcp[idx] = Some(TcpConn::new(stream, local, peer, now));
+        self.tcp[idx] = Some(TcpConn::new(stream, local, peer, now, Some(slot)));
     }
 
     fn tcp_ready(&mut self, idx: usize, readable: bool, writable: bool, now: Instant) {
@@ -806,7 +808,7 @@ impl Shard {
                 }
             }
             if let Some(conn) = self.tcp.get_mut(idx).and_then(Option::as_mut) {
-                conn.identified = identified;
+                conn.set_identified(identified);
             }
             if !open {
                 self.tcp_close(idx);
@@ -923,7 +925,8 @@ impl Shard {
                     stream,
                     local,
                     peer,
-                }) => self.tcp_add(stream, local, peer, now),
+                    slot,
+                }) => self.tcp_add(stream, local, peer, slot, now),
                 Ok(ShardCommand::Shutdown) => {
                     self.stopping = true;
                     self.engine.shutdown(now);

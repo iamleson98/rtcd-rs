@@ -1,8 +1,10 @@
 //! ICE over TCP: media that cannot take UDP travels through a TCP connection to the same port,
 //! each packet framed as RFC 4571 describes.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use mio::net::TcpStream;
@@ -12,6 +14,75 @@ use rtcd_net::{FrameReader, encode_frame};
 /// as the bytes still owed: moving the owed bytes costs no more than the writes that made room, and
 /// the buffer holds at most twice what the connection owes (plus this many bytes).
 const COMPACT_AT: usize = 32 * 1024;
+
+/// Connections that have not yet carried an ICE check naming a session, per source address. A
+/// classroom behind one NAT connects at once, and each such connection is identified within
+/// milliseconds, so this is generous.
+pub(crate) const MAX_UNIDENTIFIED_PER_IP: usize = 64;
+/// Connections that have not yet been identified, in all. Each holds a file descriptor for up to
+/// the handshake timeout, so without a bound a flood of idle connections uses them all up.
+pub(crate) const MAX_UNIDENTIFIED: usize = 4096;
+
+/// Counts the connections nobody has claimed yet, so that accepting stops before they use up the
+/// process's file descriptors.
+#[derive(Debug)]
+pub(crate) struct TcpGate {
+    per_ip: usize,
+    total: usize,
+    state: Mutex<GateState>,
+}
+
+#[derive(Debug, Default)]
+struct GateState {
+    total: usize,
+    by_ip: HashMap<IpAddr, usize>,
+}
+
+impl TcpGate {
+    pub fn new(per_ip: usize, total: usize) -> Arc<Self> {
+        Arc::new(Self {
+            per_ip,
+            total,
+            state: Mutex::default(),
+        })
+    }
+
+    /// A place for a new, unidentified connection from `ip`, or `None` when it is full for that
+    /// address or altogether. The place is given back when the slot is dropped.
+    pub fn admit(self: &Arc<Self>, ip: IpAddr) -> Option<TcpSlot> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let n = st.by_ip.get(&ip).copied().unwrap_or(0);
+        if st.total >= self.total || n >= self.per_ip {
+            return None;
+        }
+        st.total += 1;
+        st.by_ip.insert(ip, n + 1);
+        Some(TcpSlot {
+            gate: self.clone(),
+            ip,
+        })
+    }
+}
+
+/// A connection's place among the unidentified ones; dropping it frees the place.
+#[derive(Debug)]
+pub(crate) struct TcpSlot {
+    gate: Arc<TcpGate>,
+    ip: IpAddr,
+}
+
+impl Drop for TcpSlot {
+    fn drop(&mut self) {
+        let mut st = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.total = st.total.saturating_sub(1);
+        if let Some(n) = st.by_ip.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                st.by_ip.remove(&self.ip);
+            }
+        }
+    }
+}
 
 /// Framed bytes waiting for a socket.
 #[derive(Debug, Default)]
@@ -55,12 +126,20 @@ pub(crate) struct TcpConn {
     pub last_rx: Instant,
     /// The connection has carried a packet some session claimed (an ICE check naming it).
     pub identified: bool,
+    /// The connection's place among the unidentified ones, until it is identified.
+    slot: Option<TcpSlot>,
     /// The socket is registered for writability (it has output the kernel would not take).
     pub wants_write: bool,
 }
 
 impl TcpConn {
-    pub fn new(stream: TcpStream, local: SocketAddr, peer: SocketAddr, now: Instant) -> Self {
+    pub fn new(
+        stream: TcpStream,
+        local: SocketAddr,
+        peer: SocketAddr,
+        now: Instant,
+        slot: Option<TcpSlot>,
+    ) -> Self {
         Self {
             stream,
             local,
@@ -70,7 +149,17 @@ impl TcpConn {
             opened_at: now,
             last_rx: now,
             identified: false,
+            slot,
             wants_write: false,
+        }
+    }
+
+    /// Records whether some session claimed the connection; a claimed one no longer counts among
+    /// the unidentified.
+    pub fn set_identified(&mut self, identified: bool) {
+        self.identified = identified;
+        if identified {
+            self.slot = None;
         }
     }
 
@@ -129,6 +218,50 @@ impl TcpConn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unidentified_connections_are_capped_per_address_and_in_all() {
+        let gate = TcpGate::new(2, 3);
+        let a: IpAddr = "192.0.2.1".parse().unwrap();
+        let b: IpAddr = "192.0.2.2".parse().unwrap();
+        let a1 = gate.admit(a).unwrap();
+        let _a2 = gate.admit(a).unwrap();
+        assert!(gate.admit(a).is_none(), "a third from one address");
+        let _b1 = gate.admit(b).unwrap();
+        assert!(gate.admit(b).is_none(), "the total is reached");
+        drop(a1);
+        let _b2 = gate.admit(b).expect("a place was given back");
+        assert!(gate.admit(a).is_none(), "the total is full again");
+    }
+
+    #[test]
+    fn an_identified_connection_gives_its_place_back() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = listener.local_addr().unwrap();
+        let stream = std::net::TcpStream::connect(local).unwrap();
+        let peer = stream.local_addr().unwrap();
+        let gate = TcpGate::new(1, 1);
+        let slot = gate.admit(peer.ip()).unwrap();
+        let mut conn = TcpConn::new(
+            TcpStream::from_std(stream),
+            local,
+            peer,
+            Instant::now(),
+            Some(slot),
+        );
+        assert!(gate.admit(peer.ip()).is_none());
+        conn.set_identified(true);
+        assert!(gate.admit(peer.ip()).is_some());
+    }
+
+    #[test]
+    fn a_gate_forgets_an_address_that_has_no_connections_left() {
+        let gate = TcpGate::new(1, 10);
+        let a: IpAddr = "192.0.2.1".parse().unwrap();
+        drop(gate.admit(a).unwrap());
+        assert!(gate.state.lock().unwrap().by_ip.is_empty());
+        assert_eq!(gate.state.lock().unwrap().total, 0);
+    }
 
     #[test]
     fn a_backlog_that_never_clears_does_not_keep_what_was_written() {

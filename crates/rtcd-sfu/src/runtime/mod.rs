@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use mio::{Events, Interest, Poll, Token, Waker};
 use rtcd_net::bind_udp;
 use rtcd_proto::{Message, SessionConfig};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub use config::{SfuConfig, SfuConfigError};
 pub use guard::{Admission, Limits, MemorySource, Reading, Verdict};
@@ -39,6 +39,7 @@ use self::shard::{
     Undelivered,
 };
 use self::table::ShardTable;
+use self::tcp::TcpGate;
 use crate::config::LocalAddress;
 use crate::engine::WAIT_FOR_CALL;
 use crate::engine::{CloseReason, Command, Engine, Event};
@@ -935,6 +936,7 @@ fn accept_loop(
         mio_listeners.push((l, adv));
     }
     let next = AtomicUsize::new(0);
+    let gate = TcpGate::new(tcp::MAX_UNIDENTIFIED_PER_IP, tcp::MAX_UNIDENTIFIED);
     let mut events = Events::with_capacity(64);
     while !stop.load(Ordering::Acquire) {
         if poll
@@ -950,6 +952,12 @@ fn accept_loop(
             loop {
                 match listener.accept() {
                     Ok((stream, peer)) => {
+                        // Connections that never say whose they are would use up the file
+                        // descriptors; past the cap the newcomer is dropped (closed).
+                        let Some(slot) = gate.admit(peer.ip()) else {
+                            debug!(%peer, "tcp connection dropped: too many are waiting to be identified");
+                            continue;
+                        };
                         // mio hands back a registered-type stream; the shard re-wraps a std one.
                         let std_stream = into_std(stream);
                         let taken = shards
@@ -960,6 +968,7 @@ fn accept_loop(
                                         stream: std_stream,
                                         local: *advertised,
                                         peer,
+                                        slot,
                                     })
                                     .is_ok()
                             });
