@@ -45,6 +45,9 @@ const PARTS_AT_ONCE: usize = 4;
 pub enum UploadError {
     #[error("{0}")]
     Protocol(String),
+    /// The server, asked again where a file goes, no longer offers storage URLs.
+    #[error("storage is no longer directly reachable")]
+    NotDirect,
     #[error("file {index}: {source}")]
     File {
         index: usize,
@@ -149,7 +152,14 @@ impl Api {
                     )));
                 }
             };
-            self.send_direct(index, file, t).await
+            match self.send_direct(index, file, t).await {
+                // The target changed under the upload (a refreshed one is not direct): the
+                // server takes the file instead.
+                Err(UploadError::NotDirect) => {
+                    self.upload_to_server(index, file).await.map(|()| None)
+                }
+                other => other,
+            }
         };
         sent.map_err(|e| UploadError::File {
             index,
@@ -196,9 +206,7 @@ impl Api {
         let index = req.index;
         let mut out = self.targets(&[req]).await?;
         if !out.direct || out.uploads.len() != 1 || out.uploads[0].index != index {
-            return Err(UploadError::Protocol(
-                "storage is no longer directly reachable".into(),
-            ));
+            return Err(UploadError::NotDirect);
         }
         Ok(out.uploads.remove(0))
     }
@@ -572,6 +580,40 @@ mod tests {
             [bodies[1].clone(), bodies[1].clone()],
             "the file is sent whole again after a failure"
         );
+    }
+
+    #[tokio::test]
+    async fn a_file_goes_through_the_server_when_its_refreshed_target_is_not_direct() {
+        let (files, bodies) = files("notdirect");
+        let fake = Fake::start(|r, attempt, site| {
+            if r.path.ends_with("/uploads") {
+                if attempt == 1 {
+                    let url = format!("{site}/store/voice");
+                    (
+                        200,
+                        Some(json!({"direct": true, "uploads": [
+                            {"index": 0, "content_type": "audio/webm", "url": url}
+                        ]})),
+                    )
+                } else {
+                    (200, Some(json!({"direct": false, "uploads": []})))
+                }
+            } else if r.path == "/store/voice" {
+                (403, None) // the URL ran out
+            } else {
+                (200, None)
+            }
+        })
+        .await;
+        let api = fake.api();
+        assert_eq!(api.upload_file(0, &files[0]).await.unwrap(), None);
+        let seen = fake.seen();
+        let put = seen
+            .iter()
+            .find(|r| r.method == "PUT" && r.path.ends_with("/files/0"))
+            .expect("the file went to the server");
+        assert_eq!(put.body, bodies[0]);
+        assert_eq!(put.auth, "Bearer bot-token");
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ use std::time::Duration;
 use recorder::media::Entry;
 use recorder::upload::UploadError;
 use rtcd_proto::{ClientMessage, RecordEnded, RecordFile};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tracing::{debug, info, warn};
 
 use super::pending::Pending;
@@ -25,12 +25,18 @@ use super::reports::Reports;
 use super::{Cmd, Ended, Registry, Run};
 use crate::metrics::Metrics;
 
+/// The longest wait between the rounds of tries of one file.
+const MAX_ROUND_PAUSE: Duration = Duration::from_secs(300);
+
 /// How a file's upload is retried, beyond the retries inside each request.
 #[derive(Debug, Clone, Copy)]
 pub struct Policy {
-    /// Times a whole file is tried before it is given up on.
+    /// Times a whole file is tried in a round. A file that still fails is kept on disk and tried
+    /// again in another round, until the node's time to shut down runs out or the files waiting
+    /// fill the disk budget.
     pub attempts: u32,
-    /// The wait before the second try; the n-th is n times as long.
+    /// The wait before the second try; the n-th is n times as long. Between rounds the wait is
+    /// this long, doubled after each round.
     pub pause: Duration,
     /// Files uploaded at once, all recordings together.
     pub concurrency: usize,
@@ -78,6 +84,7 @@ pub fn spawn(deps: Deps) -> mpsc::UnboundedSender<Cmd> {
 async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, tx: mpsc::WeakUnboundedSender<Cmd>, deps: Deps) {
     let slots = Arc::new(Semaphore::new(deps.policy.concurrency.max(1)));
     let mut runs: HashMap<u64, State> = HashMap::new();
+    let (out_of_time, deadline) = watch::channel(false);
     while let Some(cmd) = rx.recv().await {
         let id = match cmd {
             Cmd::File { run, index, entry } => {
@@ -91,7 +98,15 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, tx: mpsc::WeakUnboundedSender
                     .outstanding += 1;
                 match tx.upgrade() {
                     Some(tx) => {
-                        tokio::spawn(upload(run, index, entry, slots.clone(), tx, deps.clone()));
+                        tokio::spawn(upload(
+                            run,
+                            index,
+                            entry,
+                            slots.clone(),
+                            tx,
+                            deadline.clone(),
+                            deps.clone(),
+                        ));
                     }
                     // Nobody can hear the answer any more: the service is going away.
                     None => return,
@@ -115,8 +130,10 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Cmd>, tx: mpsc::WeakUnboundedSender
                 run
             }
             Cmd::Deadline => {
-                // The node is out of time: a capture that is over is reported now, with the
-                // files that are in. The rest are not coming (the server leaves them out).
+                // The node is out of time: files still failing are given up on, and a capture
+                // that is over is reported now, with the files that are in. The rest are not
+                // coming (the server leaves them out).
+                out_of_time.send_replace(true);
                 let over: Vec<u64> = runs
                     .iter()
                     .filter(|(_, s)| s.ended.is_some())
@@ -183,23 +200,43 @@ fn hopeless(e: &UploadError) -> bool {
     match e {
         UploadError::Api(a) => !a.retryable(),
         UploadError::File { source, .. } | UploadError::Part { source, .. } => hopeless(source),
-        UploadError::Protocol(_) => true,
+        UploadError::Protocol(_) | UploadError::NotDirect => true,
         UploadError::Io(_) => false,
     }
 }
 
 /// Uploads one file, reports it, removes it, and tells the uploader it is done with.
+///
+/// A file that fails for a reason that may pass (the server or the network is down) stays on disk
+/// and is tried again, round after round, so that a node shutting down hands over what it can once
+/// the server is back. It is given up on when the node is out of time, when the failure is for
+/// good, or when the files waiting fill the disk budget (removing it makes room).
 async fn upload(
     run: Arc<Run>,
     index: u32,
     entry: Entry,
     slots: Arc<Semaphore>,
     tx: mpsc::UnboundedSender<Cmd>,
+    mut deadline: watch::Receiver<bool>,
     deps: Deps,
 ) {
-    let stored = {
-        let _slot = slots.acquire().await;
-        send(&run, index, &entry, &deps.policy).await
+    let mut round = 0u32;
+    let stored = loop {
+        let tried = {
+            let _slot = slots.acquire().await;
+            send(&run, index, &entry, &deps.policy).await
+        };
+        let Err(e) = tried else { break Ok(()) };
+        if hopeless(&e) || deps.pending.over() || *deadline.borrow() {
+            break Err(e);
+        }
+        let wait = round_pause(deps.policy.pause, round);
+        round += 1;
+        warn!(recording = %run.recording_id, index, round, wait_ms = wait.as_millis() as u64, error = %e, "a file could not be uploaded; keeping it to try again");
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            _ = deadline.wait_for(|out| *out) => break Err(e),
+        }
     };
     match stored {
         Ok(()) => {
@@ -233,6 +270,14 @@ async fn upload(
     }
     deps.pending.release(entry.size);
     let _ = tx.send(Cmd::Uploaded { run: run.id });
+}
+
+/// The wait after the `round`-th failed round (counted from 0): `pause`, doubled each round, up
+/// to [`MAX_ROUND_PAUSE`].
+fn round_pause(pause: Duration, round: u32) -> Duration {
+    pause
+        .saturating_mul(1u32 << round.min(10))
+        .min(MAX_ROUND_PAUSE)
 }
 
 async fn send(run: &Run, index: u32, entry: &Entry, policy: &Policy) -> Result<(), UploadError> {
@@ -275,6 +320,10 @@ mod tests {
     }
 
     fn harness(tag: &str, policy: Policy) -> Harness {
+        harness_with_cap(tag, policy, u64::MAX)
+    }
+
+    fn harness_with_cap(tag: &str, policy: Policy, cap: u64) -> Harness {
         let dir = std::env::temp_dir().join(format!("rtcd-uploader-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -282,7 +331,7 @@ mod tests {
         let reports = Arc::new(Reports::new(metrics.clone()));
         let (tx, out) = mpsc::channel(64);
         reports.attach("c1", ConnHandle::new("mm".into(), tx));
-        let pending = Arc::new(Pending::new(u64::MAX, metrics.clone()));
+        let pending = Arc::new(Pending::new(cap, metrics.clone()));
         let unfinished = Arc::new(AtomicUsize::new(0));
         let registry = Arc::new(Registry::default());
         let cmds = spawn(Deps {
@@ -612,6 +661,159 @@ mod tests {
                 .render()
                 .contains("rtcd_record_upload_failures_total 1")
         );
+    }
+
+    /// A server that refuses every request to place a file while `down` is set, and counts them.
+    async fn flaky(down: Arc<std::sync::atomic::AtomicBool>, asked: Arc<AtomicUsize>) -> Fake {
+        Fake::start(move |r, _, _| {
+            if r.path == format!("{REC_PATH}/uploads") {
+                asked.fetch_add(1, Ordering::SeqCst);
+                if down.load(Ordering::SeqCst) {
+                    return (503, None);
+                }
+                return (200, Some(json!({"direct": false, "uploads": []})));
+            }
+            (200, None)
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_file_that_keeps_failing_stays_on_disk_until_the_server_is_back() {
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let fake = flaky(down.clone(), asked.clone()).await;
+        let mut h = harness("keep", quick());
+        let api = fake.api().retrying(0, Duration::from_millis(1));
+        let run = h.run(api, 7);
+        let file = h.file(&run, "a.webm", b"aaa", "voice");
+        let path = file.path.clone();
+        h.cmds
+            .send(Cmd::File {
+                run: run.clone(),
+                index: 7,
+                entry: file,
+            })
+            .unwrap();
+        h.cmds
+            .send(Cmd::Ended {
+                run: run.clone(),
+                ended: ended("stopped", 1),
+            })
+            .unwrap();
+        // More tries than one round has (3), all failed.
+        let until = tokio::time::Instant::now() + Duration::from_secs(10);
+        while asked.load(Ordering::SeqCst) < 5 {
+            assert!(
+                tokio::time::Instant::now() < until,
+                "the file is tried again"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(path.exists(), "a failed file is kept");
+        assert_eq!(
+            h.pending.bytes(),
+            3,
+            "and still counted against the disk budget"
+        );
+        h.quiet().await;
+        down.store(false, Ordering::SeqCst);
+        let ClientMessage::RecordFile(f) = h.next().await else {
+            panic!("the file is reported once it is in")
+        };
+        assert_eq!(f.index, 7);
+        let ClientMessage::RecordEnded(_) = h.next().await else {
+            panic!("then the end")
+        };
+        assert_eq!(h.pending.bytes(), 0);
+        assert!(!path.exists());
+        assert!(
+            h.metrics
+                .render()
+                .contains("rtcd_record_upload_failures_total 0")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_file_is_given_up_on_when_the_disk_budget_is_full() {
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let fake = flaky(down, asked.clone()).await;
+        // The budget is the size of the file itself: nothing may wait.
+        let mut h = harness_with_cap("full", quick(), 3);
+        let api = fake.api().retrying(0, Duration::from_millis(1));
+        let run = h.run(api, 7);
+        let file = h.file(&run, "a.webm", b"aaa", "voice");
+        let path = file.path.clone();
+        h.cmds
+            .send(Cmd::File {
+                run: run.clone(),
+                index: 7,
+                entry: file,
+            })
+            .unwrap();
+        h.cmds
+            .send(Cmd::Ended {
+                run: run.clone(),
+                ended: ended("stopped", 1),
+            })
+            .unwrap();
+        let ClientMessage::RecordEnded(_) = h.next().await else {
+            panic!("the end is reported without the file")
+        };
+        assert_eq!(asked.load(Ordering::SeqCst), 3, "one round, no more");
+        assert!(!path.exists());
+        assert_eq!(h.pending.bytes(), 0);
+        assert!(
+            h.metrics
+                .render()
+                .contains("rtcd_record_upload_failures_total 1")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_file_is_given_up_on_at_the_deadline() {
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let fake = flaky(down, asked.clone()).await;
+        let mut h = harness(
+            "deadline-retry",
+            Policy {
+                attempts: 1,
+                pause: Duration::from_secs(3600),
+                ..quick()
+            },
+        );
+        h.unfinished.store(1, Ordering::SeqCst);
+        let api = fake.api().retrying(0, Duration::from_millis(1));
+        let run = h.run(api, 7);
+        let file = h.file(&run, "a.webm", b"aaa", "voice");
+        let path = file.path.clone();
+        h.cmds
+            .send(Cmd::File {
+                run: run.clone(),
+                index: 7,
+                entry: file,
+            })
+            .unwrap();
+        h.cmds
+            .send(Cmd::Ended {
+                run: run.clone(),
+                ended: ended("call_ended", 1),
+            })
+            .unwrap();
+        h.quiet().await;
+        assert!(path.exists(), "waiting for its next round");
+        h.cmds.send(Cmd::Deadline).unwrap();
+        let ClientMessage::RecordEnded(_) = h.next().await else {
+            panic!("the end is reported at the deadline")
+        };
+        let gone = tokio::time::Instant::now() + Duration::from_secs(2);
+        while (path.exists() || h.pending.bytes() != 0) && tokio::time::Instant::now() < gone {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!path.exists());
+        assert_eq!(h.pending.bytes(), 0);
     }
 
     #[tokio::test]
