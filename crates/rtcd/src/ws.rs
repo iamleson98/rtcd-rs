@@ -91,7 +91,8 @@ async fn serve(svc: Arc<Service>, client_id: String, socket: WebSocket) {
             }
             Ok(None) | Ok(Some(Err(_))) => break,
             Ok(Some(Ok(Message::Binary(data)))) => svc.on_frame(&conn_id, &client_id, &data),
-            Ok(Some(Ok(Message::Text(_)))) => warn!(conn = %conn_id, "unexpected text message"),
+            // A client controls how often this happens, so it is not worth a warning.
+            Ok(Some(Ok(Message::Text(_)))) => debug!(conn = %conn_id, "unexpected text message"),
             Ok(Some(Ok(Message::Close(_)))) => break,
             Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
         }
