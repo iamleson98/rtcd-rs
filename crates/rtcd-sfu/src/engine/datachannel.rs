@@ -95,7 +95,9 @@ impl Engine {
         let msg = match DcMessage::decode(&data) {
             Ok(m) => m,
             Err(err) => {
-                warn!(session = %self.session_id(key), %err, "unreadable data channel frame");
+                // A participant controls how often this happens: the counter keeps the tally and
+                // the log keeps its level for debugging.
+                debug!(session = %self.session_id(key), %err, "unreadable data channel frame");
                 self.metrics.error(&self.group_id(key), "dc");
                 return;
             }
