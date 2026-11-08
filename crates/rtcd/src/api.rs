@@ -177,10 +177,16 @@ async fn register(
     if method != axum::http::Method::POST {
         return not_found();
     }
-    if !svc.cfg.api.security.allow_self_registration
-        && let Err((code, msg)) = authenticate(&svc, &headers).await
-    {
-        return failure(code, msg);
+    // Without self registration only the administrator adds clients: a client has its own key,
+    // which is not authority to create others.
+    if !svc.cfg.api.security.allow_self_registration {
+        match authenticate(&svc, &headers).await {
+            Ok(Caller::Admin) => {}
+            Ok(Caller::Client(_)) => {
+                return failure(StatusCode::FORBIDDEN, "registration not allowed");
+            }
+            Err((code, msg)) => return failure(code, msg),
+        }
     }
     let req = match client_request(&body) {
         Ok(r) => r,

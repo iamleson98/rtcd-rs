@@ -232,6 +232,15 @@ async fn registering_needs_authority_when_self_registration_is_off() {
         .await
         .unwrap();
     assert_eq!(r.status(), 201, "the administrator may register");
+    let r = s
+        .http
+        .post(s.url("/register"))
+        .header("Authorization", TestServer::basic("mm", KEY))
+        .json(&json!({ "clientID": "other", "authKey": KEY }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "a registered client may not add another");
     s.shutdown().await;
 }
 
