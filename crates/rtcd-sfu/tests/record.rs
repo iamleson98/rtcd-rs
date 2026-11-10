@@ -679,3 +679,99 @@ fn an_ended_recording_whose_writer_never_takes_its_last_events_is_forgotten() {
         "nothing keeps retrying for the dead recording"
     );
 }
+
+const ALL: [Layer; 3] = [Layer::Low, Layer::High, Layer::Record];
+
+/// The markers (see `layers_recorded`) of the layers of video: small 1, large 2, record 3.
+const LARGE: u8 = 2;
+const RECORD: u8 = 3;
+
+#[test]
+fn the_record_layer_is_what_a_recording_takes_while_it_flows() {
+    let mut w = World::new();
+    w.record_layer = true;
+    let a = w.join_with_camera("alice", "call1");
+    let mut rx = start(&mut w, "call1", "rec1", 16384);
+    let mut items = Vec::new();
+    stream_taking(&mut w, &mut rx, &mut items, a, 14, &ALL);
+    let got = layers_recorded(&items);
+    assert!(!got.is_empty());
+    assert!(
+        got.iter().all(|(_, layer)| *layer != 1),
+        "never the small layer of a camera that has the others"
+    );
+    // The large layer first, as the others appear, then the record layer once it has been the
+    // choice for ten seconds (a sender's layers come and go at first).
+    assert_eq!(got.first().map(|p| p.1), Some(LARGE));
+    assert!(
+        got.iter().rev().take(60).all(|(_, layer)| *layer == RECORD),
+        "and the record layer for good: {:?}",
+        got.iter().map(|p| p.1).collect::<Vec<_>>()
+    );
+    // A move to another layer ends the stream and opens the next one, as the move to the large
+    // layer from the small always did: a file holds one size of picture.
+    let streams: std::collections::BTreeSet<u32> = got.iter().map(|p| p.0).collect();
+    assert_eq!(
+        streams.len(),
+        2,
+        "the large layer's stream, then the record layer's"
+    );
+    let last = got.last().unwrap().0;
+    assert!(
+        got.iter().filter(|p| p.0 == last).all(|p| p.1 == RECORD),
+        "each stream has one layer"
+    );
+}
+
+#[test]
+fn a_record_layer_that_stops_returns_the_recording_to_the_large_layer_at_once() {
+    let mut w = World::new();
+    w.record_layer = true;
+    let a = w.join_with_camera("alice", "call1");
+    let mut rx = start(&mut w, "call1", "rec1", 16384);
+    let mut items = Vec::new();
+    stream_taking(&mut w, &mut rx, &mut items, a, 14, &ALL);
+    // The sender's uplink is short: the browser drops its top layer.
+    items.clear();
+    stream_taking(&mut w, &mut rx, &mut items, a, 5, &BOTH);
+    let got = layers_recorded(&items);
+    assert!(
+        got.iter().rev().take(30).all(|(_, layer)| *layer == LARGE),
+        "after the silence it waits for, the large layer: {:?}",
+        got.iter().map(|p| p.1).collect::<Vec<_>>()
+    );
+    // It comes back: the recording moves up only after the layer has held for a while.
+    items.clear();
+    stream_taking(&mut w, &mut rx, &mut items, a, 5, &ALL);
+    assert!(
+        layers_recorded(&items)
+            .iter()
+            .all(|(_, layer)| *layer == LARGE),
+        "not at once, so a sender that swings does not cut a file at every swing"
+    );
+    items.clear();
+    stream_taking(&mut w, &mut rx, &mut items, a, 8, &ALL);
+    assert!(
+        layers_recorded(&items)
+            .iter()
+            .rev()
+            .take(30)
+            .all(|(_, layer)| *layer == RECORD)
+    );
+}
+
+#[test]
+fn a_screen_with_a_record_layer_is_recorded_at_it_too() {
+    let mut w = World::new();
+    w.record_layer = true;
+    let a = w.join("alice", "call1");
+    w.share_screen(a);
+    let mut rx = start(&mut w, "call1", "rec1", 16384);
+    let mut items = Vec::new();
+    for _ in 0..14 {
+        w.stream_video(a, true, 1.0, 30, &ALL);
+        items.extend(drain(&mut rx));
+    }
+    let got = layers_recorded(&items);
+    assert!(got.iter().rev().take(60).all(|(_, layer)| *layer == RECORD));
+}

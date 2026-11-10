@@ -58,6 +58,11 @@ impl Engine {
         for msg in queued {
             self.dc_send(key, msg, now);
         }
+        self.dc_send(
+            key,
+            DcMessage::Features(rtcd_proto::dc::FEATURE_RECORD_LAYER),
+            now,
+        );
         self.attach_existing_tracks(key, now);
         self.mark_dirty(key);
     }
@@ -103,7 +108,10 @@ impl Engine {
         let group = self.group_id(key);
         match msg {
             DcMessage::Ping => self.dc_send(key, DcMessage::Pong, now),
-            DcMessage::Pong | DcMessage::MediaMap(_) | DcMessage::Lock(Some(_)) => {}
+            DcMessage::Pong
+            | DcMessage::MediaMap(_)
+            | DcMessage::Lock(Some(_))
+            | DcMessage::Features(_) => {}
             DcMessage::Sdp(json) => self.remote_description(key, &json, Channel::Dc, now),
             DcMessage::SharpScreen(on) => {
                 if let Some(s) = self.sessions.get_mut(key) {

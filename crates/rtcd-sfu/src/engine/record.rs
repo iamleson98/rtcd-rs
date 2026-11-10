@@ -43,6 +43,10 @@ pub(crate) const WAIT_FOR_CALL: Duration = Duration::from_secs(10);
 /// one has been the right choice for this long without a break, so a fluctuating sender does not
 /// cut a file at every swing.
 const HIGH_HOLD: Duration = Duration::from_secs(10);
+/// The layer made for the recording is taken only while it flows: a sender that cannot afford it
+/// stops sending it (a browser drops its top layer first), and the recording goes back to the large
+/// layer once it has been silent this long.
+const RECORD_LAYER_SILENCE: Duration = Duration::from_secs(2);
 /// Dropped packets are logged at most this often for one recording.
 const DROP_LOG_EVERY: Duration = Duration::from_secs(10);
 
@@ -497,10 +501,17 @@ impl Engine {
                 .find(|x| x.ty == ty && x.layer == layer && recordable(x))
         };
         let paused = ty == TrackType::Video && p.up.camera_stall.stalled();
+        let flowing = |x: &Source| {
+            x.last_packet
+                .is_some_and(|t| now.saturating_duration_since(t) < RECORD_LAYER_SILENCE)
+        };
         let chosen = if paused {
             of_type(Layer::Low).or_else(|| of_type(Layer::High))
         } else {
-            of_type(Layer::High).or_else(|| of_type(Layer::Low))
+            of_type(Layer::Record)
+                .filter(|x| flowing(x))
+                .or_else(|| of_type(Layer::High))
+                .or_else(|| of_type(Layer::Low))
         };
         let young = |x: &Source| {
             ty.is_video()
@@ -519,11 +530,16 @@ impl Engine {
                 .map(|tap| (x.id, tap))
         });
         let layer_of = |id: u32| p.up.sources.iter().find(|x| x.id == id).map(|x| x.layer);
-        // Back up to the large layer only once it has been the choice for a while; every other
-        // change (the large layer pausing, a stream ending) is made at once.
+        // Move up to a sharper layer only once it has been the choice for a while; every other
+        // change (the sharper layer pausing, a stream ending) is made at once.
         let back_up = ty.is_video()
-            && have.and_then(|(id, _)| layer_of(id)) == Some(Layer::Low)
-            && want.and_then(layer_of) == Some(Layer::High);
+            && match (
+                have.and_then(|(id, _)| layer_of(id)),
+                want.and_then(layer_of),
+            ) {
+                (Some(have), Some(want)) => want.rank() > have.rank(),
+                _ => false,
+            };
         if let Some((_, tap)) = have
             && let Some(t) = self
                 .recordings
