@@ -380,6 +380,16 @@ impl Engine {
 
     /// Acts on a session's expired deadlines.
     fn check_deadlines(&mut self, key: SessionKey, now: Instant) {
+        let Some(s) = self.sessions.get(key) else {
+            return;
+        };
+        // Before the lock: the SFU's hold on it ends with the wait for the answer, and waiting on
+        // is renewing it.
+        if let signaling::Phase::Offering { deadline, .. } = s.phase
+            && now >= deadline
+        {
+            self.offer_timed_out(key, now);
+        }
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
@@ -396,18 +406,13 @@ impl Engine {
         let Some(silent_since) = self.sessions.get(key).map(|s| s.last_rx) else {
             return;
         };
-        match phase {
-            signaling::Phase::AwaitingFirstOffer { deadline } if now >= deadline => {
-                warn!(session = %self.session_id(key), "timed out waiting for the first offer");
-                self.metrics.error(&self.group_id(key), "signaling");
-                self.close_session(key, CloseReason::SignalingFailed, now);
-                return;
-            }
-            signaling::Phase::Offering { deadline, .. } if now >= deadline => {
-                self.offer_timed_out(key, now);
-                return;
-            }
-            _ => {}
+        if let signaling::Phase::AwaitingFirstOffer { deadline } = phase
+            && now >= deadline
+        {
+            warn!(session = %self.session_id(key), "timed out waiting for the first offer");
+            self.metrics.error(&self.group_id(key), "signaling");
+            self.close_session(key, CloseReason::SignalingFailed, now);
+            return;
         }
         if lifecycle == session::Lifecycle::Connecting
             && now >= created_at + self.cfg.connect_timeout

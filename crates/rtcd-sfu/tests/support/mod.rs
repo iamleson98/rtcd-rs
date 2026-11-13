@@ -121,6 +121,12 @@ pub struct Browser {
     pub dc_frames: Vec<DcMessage>,
     pub offers_received: usize,
     pub answers_sent: usize,
+    /// While set, the browser receives the SFU's offers without answering them; the last one waits
+    /// for [`World::answer_late`].
+    pub hold_answers: bool,
+    held_offer: Option<(RTCSessionDescription, bool)>,
+    /// When each offer from the SFU arrived, and its text.
+    pub offers: Vec<(Instant, String)>,
     /// The text of every description the SFU sent this browser, in order.
     pub descriptions: Vec<String>,
     pub mic: RTCRtpSenderId,
@@ -439,6 +445,9 @@ impl World {
             dc_frames: vec![],
             offers_received: 0,
             answers_sent: 0,
+            hold_answers: false,
+            held_offer: None,
+            offers: Vec::new(),
             descriptions: Vec::new(),
             mic,
             mic_ssrc,
@@ -790,28 +799,50 @@ impl World {
             }
             RTCSdpType::Offer => {
                 b.offers_received += 1;
-                if b.pc.signaling_state() != RTCSignalingState::Stable {
-                    b.signaling_conflicts += 1;
+                b.offers.push((now, desc.sdp.clone()));
+                if b.hold_answers {
+                    b.held_offer = Some((desc, over_dc));
                     return;
                 }
-                b.pc.set_remote_description(now, desc)
-                    .expect("the SFU's offer applies");
-                let answer = b.pc.create_answer(None).unwrap();
-                b.pc.set_local_description(now, answer.clone()).unwrap();
-                b.answers_sent += 1;
-                let json = serde_json::to_vec(&answer).unwrap();
-                if let (true, Some(id)) = (over_dc, b.dc) {
-                    let frame = DcMessage::Sdp(json).encode();
-                    b.pc.data_channel(id)
-                        .unwrap()
-                        .send(now, BytesMut::from(&frame[..]))
-                        .unwrap();
-                } else {
-                    self.signal(i, MessageType::Sdp, json);
-                }
+                self.answer_offer(i, desc, over_dc);
             }
             other => panic!("unexpected description {other:?}"),
         }
+    }
+
+    fn answer_offer(&mut self, i: usize, offer: RTCSessionDescription, over_dc: bool) {
+        let now = self.now;
+        let b = &mut self.browsers[i];
+        if b.pc.signaling_state() != RTCSignalingState::Stable {
+            b.signaling_conflicts += 1;
+            return;
+        }
+        b.pc.set_remote_description(now, offer)
+            .expect("the SFU's offer applies");
+        let answer = b.pc.create_answer(None).unwrap();
+        b.pc.set_local_description(now, answer.clone()).unwrap();
+        b.answers_sent += 1;
+        let json = serde_json::to_vec(&answer).unwrap();
+        if let (true, Some(id)) = (over_dc, b.dc) {
+            let frame = DcMessage::Sdp(json).encode();
+            b.pc.data_channel(id)
+                .unwrap()
+                .send(now, BytesMut::from(&frame[..]))
+                .unwrap();
+        } else {
+            self.signal(i, MessageType::Sdp, json);
+        }
+    }
+
+    /// Browser `i` stops holding answers back and answers the offer it kept: a late answer.
+    pub fn answer_late(&mut self, i: usize) {
+        self.browsers[i].hold_answers = false;
+        let (offer, over_dc) = self.browsers[i]
+            .held_offer
+            .take()
+            .expect("an offer was held");
+        self.answer_offer(i, offer, over_dc);
+        self.run_for(Duration::from_millis(100));
     }
 
     fn pump_browser(&mut self, i: usize) -> bool {
@@ -1010,6 +1041,31 @@ impl World {
         });
         assert!(ok, "the SFU never answered");
         self.unlock(i);
+    }
+
+    /// Browser `i` offers without asking for the lock, as one does that gave up waiting for it, and
+    /// waits for the SFU's answer.
+    pub fn offer_without_lock(&mut self, i: usize) {
+        let now = self.now;
+        let offer = self.browsers[i].pc.create_offer(None).unwrap();
+        self.browsers[i]
+            .pc
+            .set_local_description(now, offer.clone())
+            .unwrap();
+        self.dc_send(i, DcMessage::Sdp(serde_json::to_vec(&offer).unwrap()));
+        let ok = self.run_until(Duration::from_secs(5), |w| {
+            w.browsers[i].pc.signaling_state() == RTCSignalingState::Stable
+        });
+        assert!(ok, "the SFU never answered");
+    }
+
+    /// Browser `i` closes its data channel, which the SFU signals through from then on by the
+    /// websocket.
+    pub fn close_data_channel(&mut self, i: usize) {
+        let b = &mut self.browsers[i];
+        let id = b.dc.take().expect("data channel is open");
+        b.pc.data_channel(id).unwrap().close().unwrap();
+        self.run_for(Duration::from_millis(200));
     }
 
     /// Sends one frame of `packets` RTP packets on a layer of a video sender. A keyframe begins with

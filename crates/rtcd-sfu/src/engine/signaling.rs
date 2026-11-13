@@ -19,9 +19,11 @@ pub enum Channel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Holder {
     Free,
-    /// The SFU, while an offer of its own is unanswered.
+    /// The SFU, while an offer of its own is unanswered. The hold runs until `until`, the end of
+    /// the wait for the answer, which each extension of the wait pushes out.
     Server {
         since: Instant,
+        until: Instant,
     },
     /// The participant, between its lock request and its unlock.
     Client {
@@ -52,11 +54,7 @@ impl SignalingLock {
     /// Clears a hold that has lasted too long (a participant that took the lock and vanished would
     /// otherwise stop the SFU from ever offering again). Returns who lost it.
     pub fn expire(&mut self, now: Instant) -> Option<Holder> {
-        let since = match self.holder {
-            Holder::Client { since } | Holder::Server { since } => since,
-            Holder::Free => return None,
-        };
-        if now.saturating_duration_since(since) >= self.max_hold {
+        if self.deadline().is_some_and(|until| now >= until) {
             Some(std::mem::replace(&mut self.holder, Holder::Free))
         } else {
             None
@@ -85,22 +83,40 @@ impl SignalingLock {
         }
     }
 
-    /// The SFU takes the lock for an offer of its own. It waits (returns false) while the
-    /// participant holds it.
-    pub fn server_lock(&mut self, now: Instant) -> bool {
+    /// The SFU takes the lock for an offer of its own, which it waits `wait` for the answer to. It
+    /// waits (returns false) while the participant holds it.
+    pub fn server_lock(&mut self, now: Instant, wait: Duration) -> bool {
         self.expire(now);
         if self.holder == Holder::Free {
-            self.holder = Holder::Server { since: now };
+            self.holder = Holder::Server {
+                since: now,
+                until: now + wait,
+            };
             true
         } else {
             false
         }
     }
 
+    /// The SFU keeps waiting `wait` more for the answer to its offer, so the participant is not
+    /// given the lock while the answer is still on its way. A hold that ran out in the meantime is
+    /// taken again; the participant's is left alone.
+    pub fn server_renew(&mut self, now: Instant, wait: Duration) {
+        let since = match self.holder {
+            Holder::Server { since, .. } => since,
+            Holder::Free => now,
+            Holder::Client { .. } => return,
+        };
+        self.holder = Holder::Server {
+            since,
+            until: now + wait,
+        };
+    }
+
     /// The SFU releases the lock; returns how long it held it, if it did.
     pub fn server_unlock(&mut self, now: Instant) -> Option<Duration> {
         match self.holder {
-            Holder::Server { since } => {
+            Holder::Server { since, .. } => {
                 self.holder = Holder::Free;
                 Some(now.saturating_duration_since(since))
             }
@@ -112,7 +128,8 @@ impl SignalingLock {
     pub fn deadline(&self) -> Option<Instant> {
         match self.holder {
             Holder::Free => None,
-            Holder::Client { since } | Holder::Server { since } => Some(since + self.max_hold),
+            Holder::Client { since } => Some(since + self.max_hold),
+            Holder::Server { until, .. } => Some(until),
         }
     }
 }
@@ -125,10 +142,13 @@ pub enum Phase {
         deadline: Instant,
     },
     Idle,
-    /// An offer of the SFU's is out, waiting for the participant's answer.
+    /// An offer of the SFU's is out, waiting for the participant's answer. At `deadline` the wait
+    /// is extended (`attempt` counts the waits so far) or, after the longest ones, the offer is
+    /// given up on.
     Offering {
         deadline: Instant,
         via: Channel,
+        attempt: u8,
     },
 }
 
@@ -144,12 +164,15 @@ mod tests {
         let mut lock = SignalingLock::new(HOLD);
         assert!(lock.client_lock(t));
         assert!(!lock.client_lock(t), "already held");
-        assert!(!lock.server_lock(t), "the SFU waits for the participant");
+        assert!(
+            !lock.server_lock(t, HOLD),
+            "the SFU waits for the participant"
+        );
         assert_eq!(
             lock.client_unlock(t + Duration::from_millis(40)),
             Some(Duration::from_millis(40))
         );
-        assert!(lock.server_lock(t));
+        assert!(lock.server_lock(t, HOLD));
         assert!(
             !lock.client_lock(t),
             "the participant waits for the SFU's answer"
@@ -162,7 +185,7 @@ mod tests {
         let t = Instant::now();
         let mut lock = SignalingLock::new(HOLD);
         assert_eq!(lock.client_unlock(t), None);
-        assert!(lock.server_lock(t));
+        assert!(lock.server_lock(t, HOLD));
         assert_eq!(
             lock.client_unlock(t),
             None,
@@ -179,14 +202,49 @@ mod tests {
         assert_eq!(lock.deadline(), Some(t + HOLD));
         assert_eq!(lock.expire(t + HOLD - Duration::from_millis(1)), None);
         assert!(matches!(lock.expire(t + HOLD), Some(Holder::Client { .. })));
-        assert!(lock.server_lock(t + HOLD));
+        assert!(lock.server_lock(t + HOLD, HOLD));
+    }
+
+    #[test]
+    fn a_renewed_server_hold_lasts_through_the_new_wait() {
+        let t = Instant::now();
+        let mut lock = SignalingLock::new(HOLD);
+        assert!(lock.server_lock(t, HOLD));
+        lock.server_renew(t + HOLD, HOLD * 2);
+        assert_eq!(lock.expire(t + HOLD * 3 - Duration::from_millis(1)), None);
+        assert!(!lock.client_lock(t + HOLD * 2), "still the SFU's");
+        assert!(matches!(
+            lock.expire(t + HOLD * 3),
+            Some(Holder::Server { .. })
+        ));
+    }
+
+    #[test]
+    fn a_hold_that_ran_out_as_it_was_renewed_is_not_lost() {
+        let t = Instant::now();
+        let mut lock = SignalingLock::new(HOLD);
+        assert!(lock.server_lock(t, HOLD));
+        assert!(matches!(lock.expire(t + HOLD), Some(Holder::Server { .. })));
+        lock.server_renew(t + HOLD, HOLD * 2);
+        assert!(!lock.client_lock(t + HOLD), "the participant is refused");
+        assert_eq!(lock.deadline(), Some(t + HOLD * 3));
+    }
+
+    #[test]
+    fn renewing_does_not_take_the_lock_from_the_participant() {
+        let t = Instant::now();
+        let mut lock = SignalingLock::new(HOLD);
+        assert!(lock.client_lock(t));
+        lock.server_renew(t, HOLD * 2);
+        assert_eq!(lock.deadline(), Some(t + HOLD));
+        assert!(matches!(lock.holder(), Holder::Client { .. }));
     }
 
     #[test]
     fn asking_after_the_hold_ran_out_succeeds_without_an_explicit_expire() {
         let t = Instant::now();
         let mut lock = SignalingLock::new(HOLD);
-        assert!(lock.server_lock(t));
+        assert!(lock.server_lock(t, HOLD));
         assert!(lock.client_lock(t + HOLD));
     }
 }

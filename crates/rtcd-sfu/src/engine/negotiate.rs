@@ -23,7 +23,17 @@ use super::types::CloseReason;
 use crate::ids::parse_track_id;
 use crate::metrics::Direction;
 
-/// Offers that went unanswered before the session is given up on.
+/// Puts a connection that is waiting for an answer back to stable.
+fn roll_back(pc: &mut rtc::peer_connection::RTCPeerConnection, now: Instant) {
+    if pc.signaling_state() != RTCSignalingState::Stable
+        && let Ok(rollback) = RTCSessionDescription::rollback(None)
+    {
+        let _ = pc.set_local_description(now, rollback);
+    }
+}
+
+/// Offers that failed to apply (an answer or an offer the connection refused) or went unanswered for
+/// good before the session is given up on. An offer that is merely late never counts.
 const MAX_OFFER_FAILURES: u8 = 3;
 
 impl Engine {
@@ -100,11 +110,18 @@ impl Engine {
             return;
         };
         let first = matches!(s.phase, Phase::AwaitingFirstOffer { .. });
-        // Both sides offering at once: the SFU's offer stands, the participant's is dropped (a
-        // polite client retries once it has our answer).
-        if matches!(s.phase, Phase::Offering { .. })
-            || s.pc.signaling_state() != RTCSignalingState::Stable
-        {
+        // Both sides offering at once (the participant gives up waiting for the lock and offers
+        // anyway, and never sends a dropped offer again): the SFU's offer yields. It is taken back
+        // without counting against the session, and what it carried goes into the next offer, which
+        // follows once the participant's is answered.
+        if matches!(s.phase, Phase::Offering { .. }) {
+            debug!(session = %s.cfg.session_id, "signaling conflict, withdrawing our offer");
+            self.withdraw_offer(key, now);
+        }
+        let Some(s) = self.sessions.get_mut(key) else {
+            return;
+        };
+        if s.pc.signaling_state() != RTCSignalingState::Stable {
             debug!(session = %s.cfg.session_id, "signaling conflict, ignoring offer");
             return;
         }
@@ -208,38 +225,64 @@ impl Engine {
             self.close_session(key, CloseReason::SignalingFailed, now);
             return;
         }
-        // Leave the connection as it was, so the next offer starts clean.
         let s = self.sessions.get_mut(key).expect("checked above");
-        if s.pc.signaling_state() != RTCSignalingState::Stable
-            && let Ok(rollback) = RTCSessionDescription::rollback(None)
-        {
-            let _ = s.pc.set_local_description(now, rollback);
-        }
         if matches!(s.phase, Phase::Offering { .. }) {
             self.offer_unanswered(key, now);
+        } else {
+            // Leave the connection as it was, so the next offer starts clean.
+            roll_back(&mut s.pc, now);
         }
     }
 
-    /// The SFU's offer got no answer in time.
+    /// The SFU's offer got no answer in time. The answer may only be late: a lossy path delays it
+    /// for as long as the data channel's retransmission timer backs off to, and the channel is
+    /// reliable, so the offer itself is not lost while the connection lives. The offer is therefore
+    /// kept, and the wait for its answer (and the SFU's hold on the signaling lock) extended: each
+    /// wait twice the last, up to `answer_timeout_max`. The offer is sent again only when the
+    /// channel it went by is gone, by the websocket. Once the longest wait has run out twice the
+    /// signaling is taken to be dead and the offer is given up on, which counts as a failure; a
+    /// participant that is truly gone ends the session through its connection, not through this.
     pub(super) fn offer_timed_out(&mut self, key: SessionKey, now: Instant) {
-        warn!(session = %self.session_id(key), "timed out waiting for an answer");
-        self.metrics.error(&self.group_id(key), "signaling");
-        if let Some(s) = self.sessions.get_mut(key)
-            && s.pc.signaling_state() != RTCSignalingState::Stable
-            && let Ok(rollback) = RTCSessionDescription::rollback(None)
-        {
-            let _ = s.pc.set_local_description(now, rollback);
-        }
-        self.offer_unanswered(key, now);
-    }
-
-    /// Gives up on the offer in flight: its changes go back to pending, and after repeated
-    /// failures the session ends.
-    fn offer_unanswered(&mut self, key: SessionKey, now: Instant) {
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
-        s.offer_failures += 1;
+        let Phase::Offering { via, attempt, .. } = s.phase else {
+            return;
+        };
+        if self.cfg.answer_wait_exhausted(attempt) {
+            warn!(session = %s.cfg.session_id, attempt, "no answer after the longest waits, giving up on the offer");
+            self.metrics.error(&s.cfg.group_id, "signaling");
+            self.offer_unanswered(key, now);
+            return;
+        }
+        let attempt = attempt.saturating_add(1);
+        let wait = self.cfg.answer_wait(attempt);
+        // The channel the offer went by is gone: the participant never saw it. Over the websocket it
+        // arrives without its media map (that is data channel only), which does not matter: a
+        // session without a data channel has no lock and no pings either.
+        let resend = via == Channel::Dc && s.dc.is_none();
+        let via = if resend { Channel::Ws } else { via };
+        debug!(session = %s.cfg.session_id, attempt, ?wait, resend, "still waiting for an answer");
+        s.phase = Phase::Offering {
+            deadline: now + wait,
+            via,
+            attempt,
+        };
+        s.lock.server_renew(now, wait);
+        if resend {
+            // The frame waiting for a channel that never came would arrive as a second offer.
+            s.dc_queue.retain(|m| !matches!(m, DcMessage::Sdp(_)));
+            self.send_local_description(key, via, now);
+        }
+    }
+
+    /// Takes the SFU's own offer back: the connection returns to stable, what the offer carried goes
+    /// back to pending and the lock is released. Nothing counts against the session.
+    fn withdraw_offer(&mut self, key: SessionKey, now: Instant) {
+        let Some(s) = self.sessions.get_mut(key) else {
+            return;
+        };
+        roll_back(&mut s.pc, now);
         s.phase = Phase::Idle;
         s.lock.server_unlock(now);
         for ds in s.down.streams.iter_mut().flatten() {
@@ -249,6 +292,17 @@ impl Engine {
                 other => other,
             };
         }
+    }
+
+    /// Gives up on the offer in flight after a failure to apply it or its answer, or after it went
+    /// unanswered for good: its changes go back to pending, and after repeated failures the
+    /// session ends.
+    fn offer_unanswered(&mut self, key: SessionKey, now: Instant) {
+        self.withdraw_offer(key, now);
+        let Some(s) = self.sessions.get_mut(key) else {
+            return;
+        };
+        s.offer_failures += 1;
         if s.offer_failures >= MAX_OFFER_FAILURES {
             self.close_session(key, CloseReason::SignalingFailed, now);
         } else {
@@ -303,7 +357,7 @@ impl Engine {
             return;
         }
         let waiting_since = *s.wants_offer_since.get_or_insert(now);
-        if !s.lock.server_lock(now) {
+        if !s.lock.server_lock(now, self.cfg.answer_wait(0)) {
             // The participant holds the lock; its unlock (or its expiry) wakes us.
             return;
         }
@@ -328,6 +382,7 @@ impl Engine {
             s.phase = Phase::Offering {
                 deadline: now,
                 via: Channel::Ws,
+                attempt: 0,
             };
             self.negotiation_failed(key, false, "offer", &err.to_string(), now);
             return;
@@ -338,8 +393,9 @@ impl Engine {
             Channel::Ws
         };
         s.phase = Phase::Offering {
-            deadline: now + self.cfg.answer_timeout,
+            deadline: now + self.cfg.answer_wait(0),
             via,
+            attempt: 0,
         };
         info!(session = %s.cfg.session_id, "offering");
         self.register_ufrag(key);
@@ -359,6 +415,11 @@ impl Engine {
         };
         for slot in s.down.streams.iter_mut().flatten() {
             match slot.phase {
+                DownPhase::PendingAdd if slot.sender.is_some() => {
+                    // An offer that was withdrawn kept the transceiver with its track; it is in the
+                    // next offer as it was, and adding the track again would make a second one.
+                    slot.phase = DownPhase::Adding;
+                }
                 DownPhase::PendingAdd => {
                     let kind = if slot.codec.mime_type.starts_with("audio/") {
                         RtpCodecKind::Audio
@@ -394,7 +455,8 @@ impl Engine {
                         }
                         slot.phase = DownPhase::Removing;
                     } else {
-                        // Never reached the connection.
+                        // Never reached the connection, or a withdrawn offer already took the
+                        // sender off its transceiver, which the next offer shows as it stands.
                         slot.phase = DownPhase::Removing;
                     }
                 }
