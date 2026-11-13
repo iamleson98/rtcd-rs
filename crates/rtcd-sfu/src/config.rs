@@ -52,8 +52,13 @@ pub struct EngineConfig {
     pub nack_buffer_size: u16,
     /// How long a new session may take to send its first offer.
     pub signaling_timeout: Duration,
-    /// How long an offer to a participant may wait for its answer.
+    /// How long an offer to a participant waits for its answer the first time. Each further wait
+    /// doubles, up to `answer_timeout_max`: under loss a late answer is the usual case, and a
+    /// connection that still carries media is not given up on for it.
     pub answer_timeout: Duration,
+    /// The longest single wait for an answer. Once one this long has run out twice, the offer is
+    /// given up on.
+    pub answer_timeout_max: Duration,
     /// How long a participant may hold the signaling lock before the SFU takes it back.
     pub lock_max_hold: Duration,
     /// How long a new session may take to connect before it is dropped.
@@ -98,6 +103,7 @@ impl Default for EngineConfig {
             nack_buffer_size: 256,
             signaling_timeout: Duration::from_secs(10),
             answer_timeout: Duration::from_secs(10),
+            answer_timeout_max: Duration::from_secs(60),
             lock_max_hold: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(30),
@@ -137,11 +143,53 @@ impl EngineConfig {
         }
         Ok(())
     }
+
+    /// The first wait for an answer and the longest one. Neither is taken below a second, so a zero
+    /// cannot make the engine spin.
+    fn answer_bounds(&self) -> (Duration, Duration) {
+        let first = self.answer_timeout.max(Duration::from_secs(1));
+        (first, self.answer_timeout_max.max(first))
+    }
+
+    /// How long an offer waits for its answer the `attempt`th time (counting from 0): the first
+    /// wait is `answer_timeout`, each further one twice the last, up to `answer_timeout_max`.
+    pub fn answer_wait(&self, attempt: u8) -> Duration {
+        let (first, longest) = self.answer_bounds();
+        first.saturating_mul(1 << attempt.min(16)).min(longest)
+    }
+
+    /// Whether the wait number `attempt`, which has run out, followed one that was already the
+    /// longest: the offer has been unanswered for so long that its signaling path is taken to be
+    /// dead.
+    pub fn answer_wait_exhausted(&self, attempt: u8) -> bool {
+        attempt > 0 && self.answer_wait(attempt - 1) >= self.answer_bounds().1
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_wait_for_an_answer_doubles_up_to_its_cap_and_then_gives_up() {
+        let c = EngineConfig::default();
+        let waits: Vec<_> = (0..6).map(|n| c.answer_wait(n).as_secs()).collect();
+        assert_eq!(waits, [10, 20, 40, 60, 60, 60]);
+        let exhausted: Vec<_> = (0..6).map(|n| c.answer_wait_exhausted(n)).collect();
+        assert_eq!(exhausted, [false, false, false, false, true, true]);
+    }
+
+    #[test]
+    fn a_zero_wait_for_an_answer_is_a_second() {
+        let c = EngineConfig {
+            answer_timeout: Duration::ZERO,
+            answer_timeout_max: Duration::ZERO,
+            ..Default::default()
+        };
+        assert_eq!(c.answer_wait(0), Duration::from_secs(1));
+        assert_eq!(c.answer_wait(5), Duration::from_secs(1));
+        assert!(c.answer_wait_exhausted(1));
+    }
 
     #[test]
     fn defaults_are_valid() {
