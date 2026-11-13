@@ -39,12 +39,12 @@ impl Pending {
     pub fn release(&self, n: u64) {
         let _ = self
             .files
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |f| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |f| {
                 Some(f.saturating_sub(1))
             });
         let before = self
             .bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
                 Some(b.saturating_sub(n))
             })
             .unwrap_or(0);

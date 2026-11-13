@@ -170,7 +170,7 @@ impl Recording {
         let max = self.max_files;
         let n = self
             .next
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 (max == 0 || n < max).then_some(n + 1)
             })
             .ok()?
