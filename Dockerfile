@@ -3,16 +3,33 @@
 #
 #   docker build -t lms-rtcd-rust compare/rtcd-rust      # needs the vendor/rtc submodule checked out
 #
-# Build on the machine's own architecture; nothing here is architecture specific.
+# Builds for linux/amd64 and linux/arm64 (docker buildx build --platform linux/amd64,linux/arm64).
 # The latest stable Rust (2026-10-13); raise it with --build-arg RUST_VERSION=...
 ARG RUST_VERSION=1.99.1
-FROM rust:${RUST_VERSION}-bookworm AS builder
+# The builder runs on the machine's own platform and cross-compiles for the one the image is for
+# (BuildKit sets TARGETARCH from --platform): an arm64 laptop building the amd64 image, or the
+# reverse, needs no emulation, and where the two match nothing is cross-compiled.
+FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-bookworm AS builder
+ARG TARGETARCH
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p rtcd \
-    && cp target/release/rtcd /rtcd
+    set -eux; \
+    case "${TARGETARCH}" in \
+      amd64) triple=x86_64-unknown-linux-gnu;  gcc_pkg=gcc-x86-64-linux-gnu;  libc_pkg=libc6-dev-amd64-cross; gcc_bin=x86_64-linux-gnu-gcc ;; \
+      arm64) triple=aarch64-unknown-linux-gnu; gcc_pkg=gcc-aarch64-linux-gnu; libc_pkg=libc6-dev-arm64-cross; gcc_bin=aarch64-linux-gnu-gcc ;; \
+      *) echo "unsupported TARGETARCH ${TARGETARCH}"; exit 1 ;; \
+    esac; \
+    rustup target add "${triple}"; \
+    if [ "$(uname -m)" != "${triple%%-*}" ]; then \
+      apt-get update; \
+      apt-get install -y --no-install-recommends "${gcc_pkg}" "${libc_pkg}"; \
+      upper="$(echo "${triple}" | tr 'a-z-' 'A-Z_')"; \
+      export "CARGO_TARGET_${upper}_LINKER=${gcc_bin}" "CC_$(echo "${triple}" | tr '-' '_')=${gcc_bin}"; \
+    fi; \
+    cargo build --release --locked -p rtcd --target "${triple}"; \
+    cp "target/${triple}/release/rtcd" /rtcd
 
 FROM debian:bookworm-slim
 RUN apt-get update \
