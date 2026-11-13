@@ -173,7 +173,7 @@ async fn finish(run: &Run, ended: Ended, deps: &Deps) {
     }
     let _ = deps
         .unfinished
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
             Some(n.saturating_sub(1))
         });
 }
