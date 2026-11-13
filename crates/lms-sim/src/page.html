@@ -1,0 +1,176 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>lesson receiver</title>
+<style>video { width: 160px; height: 90px; background: #222; }</style>
+<body>
+<script>
+// A browser in the lesson, as lms-web's call client is: it joins the SFU through the signaling
+// relay of lms-sim (which passes messages on the way the LMS server does), answers the SFU's
+// offers over the "calls-dc" data channel, watches the teacher and reports what Chrome measures.
+const q = new URLSearchParams(location.search);
+const group = q.get('group') || 'clean';
+const teacher = q.get('teacher') || 'session-teacher';
+const ws = new WebSocket(`ws://127.0.0.1:${q.get('ws')}/`);
+const send = (o) => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(o));
+const event = (what, detail) => send({ t: 'event', what, detail: String(detail) });
+
+// ---- the data channel's framing (lms-web: features/calls/sfu-channel.ts) ----
+const SDP = 3;
+async function transform(data, stream) {
+	const writer = stream.writable.getWriter();
+	writer.write(data).catch(() => {});
+	writer.close().catch(() => {});
+	return new Uint8Array(await new Response(stream.readable).arrayBuffer());
+}
+const deflate = (text) => transform(new TextEncoder().encode(text), new CompressionStream('deflate'));
+const inflate = async (data) => new TextDecoder().decode(await transform(data, new DecompressionStream('deflate')));
+function encodeSdp(payload) {
+	const n = payload.length;
+	const header = n < 0x100 ? [SDP, 0xc4, n]
+		: n < 0x10000 ? [SDP, 0xc5, n >> 8, n & 0xff]
+		: [SDP, 0xc6, n >>> 24, (n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff];
+	const out = new Uint8Array(header.length + n);
+	out.set(header);
+	out.set(payload, header.length);
+	return out;
+}
+function decodeSdp(bytes) {
+	let i = 0;
+	let type;
+	if (bytes[0] <= 0x7f) type = bytes[i++];
+	else if (bytes[0] === 0xcc) { type = bytes[1]; i = 2; } else return null;
+	if (type !== SDP) return null;
+	const code = bytes[i];
+	const size = code === 0xc4 ? 1 : code === 0xc5 ? 2 : code === 0xc6 ? 4 : 0;
+	if (!size) return null;
+	let n = 0;
+	for (let k = 0; k < size; k++) n = n * 0x100 + bytes[i + 1 + k];
+	return bytes.subarray(i + 1 + size, i + 1 + size + n);
+}
+
+// ---- the call ----
+let pc, dc;
+let chain = Promise.resolve();
+const queue = (fn) => (chain = chain.then(fn).catch((e) => event('error', e)));
+const pending = [];
+
+async function onDescription(json, viaDc) {
+	const desc = JSON.parse(json);
+	if (desc.type === 'answer') {
+		await pc.setRemoteDescription(desc);
+	} else if (desc.type === 'offer' && pc.signalingState === 'stable') {
+		await pc.setRemoteDescription(desc);
+		await pc.setLocalDescription(await pc.createAnswer());
+		const answer = JSON.stringify(pc.localDescription);
+		if (viaDc && dc.readyState === 'open') dc.send(encodeSdp(await deflate(answer)));
+		else send({ t: 'sdp', data: answer });
+	} else {
+		return;
+	}
+	for (const c of pending.splice(0)) await pc.addIceCandidate(c);
+}
+
+async function onIce(json) {
+	const msg = JSON.parse(json);
+	const init = msg.candidate && typeof msg.candidate === 'object' ? msg.candidate : msg;
+	if (!init.candidate) return;
+	if (init.sdpMid == null && init.sdpMLineIndex == null) init.sdpMLineIndex = 0;
+	if (pc.remoteDescription) await pc.addIceCandidate(init);
+	else pending.push(init);
+}
+
+function show(e) {
+	const el = document.createElement(e.track.kind === 'video' ? 'video' : 'audio');
+	el.autoplay = true;
+	el.playsInline = true;
+	el.muted = e.track.kind === 'video';
+	el.srcObject = e.streams[0] ?? new MediaStream([e.track]);
+	document.body.append(el);
+	el.play().catch(() => {});
+}
+
+async function start() {
+	pc = new RTCPeerConnection({ iceServers: [], bundlePolicy: 'max-bundle' });
+	dc = pc.createDataChannel('calls-dc');
+	dc.binaryType = 'arraybuffer';
+	// The microphone slot: a student listening has it muted, so it sends nothing.
+	pc.addTransceiver('audio', { direction: 'sendonly' });
+	pc.onicecandidate = (e) => e.candidate && send({ t: 'ice', data: JSON.stringify(e.candidate.toJSON()) });
+	pc.onconnectionstatechange = () => event('ice_state', `connection:${pc.connectionState}`);
+	pc.oniceconnectionstatechange = () => event('ice_state', `ice:${pc.iceConnectionState}`);
+	pc.ontrack = show;
+	dc.onopen = () => {
+		event('join', 'connected');
+		send({ t: 'subscribe', data: [teacher] });
+	};
+	dc.onmessage = (e) => {
+		const json = decodeSdp(new Uint8Array(e.data));
+		if (json) queue(async () => onDescription(await inflate(json), true));
+	};
+	await pc.setLocalDescription(await pc.createOffer());
+	send({ t: 'sdp', data: JSON.stringify(pc.localDescription) });
+	setInterval(poll, 1000);
+}
+
+// ---- what Chrome measures, once a second, written every fifth ----
+const seen = new Map();
+let ticks = 0;
+async function poll() {
+	const report = await pc.getStats();
+	const now = performance.now();
+	let rtt = null;
+	report.forEach((r) => {
+		if (r.type === 'candidate-pair' && (r.nominated || r.selected) && typeof r.currentRoundTripTime === 'number') {
+			rtt = r.currentRoundTripTime * 1000;
+		}
+	});
+	report.forEach((r) => {
+		if (r.type !== 'inbound-rtp') return;
+		const [kind, session] = String(r.trackIdentifier || '').split('_');
+		if (!['video', 'screen', 'voice'].includes(kind) || !session) return;
+		if (kind === 'voice' && session !== teacher) return;
+		const key = `${kind}:${session.replace(/^session-/, '')}`;
+		const prev = seen.get(r.ssrc);
+		const changed = prev && prev.packets === r.packetsReceived ? prev.changed : now;
+		seen.set(r.ssrc, { key, r, packets: r.packetsReceived, changed });
+	});
+	if (++ticks % 5) return;
+	// A renegotiation can give a stream a new track: only the one that moved last is reported.
+	const current = new Map();
+	for (const e of seen.values()) {
+		if (!current.has(e.key) || e.changed > current.get(e.key).changed) current.set(e.key, e);
+	}
+	for (const [key, { r, changed }] of current) {
+		const audio = r.kind === 'audio';
+		send({
+			t: 'recv',
+			id: `chrome-${group}/${key}`,
+			fields: {
+				media: audio ? 'audio' : 'video',
+				group,
+				frames: r.framesDecoded ?? 0,
+				freezes: r.freezeCount ?? 0,
+				freeze_ms: Math.round((r.totalFreezesDuration ?? 0) * 1000),
+				packets: r.packetsReceived ?? 0,
+				lost: Math.max(0, r.packetsLost ?? 0),
+				nack: r.nackCount ?? 0,
+				pli: r.pliCount ?? 0,
+				jitter_ms: Math.round((r.jitter ?? 0) * 10000) / 10,
+				rtt_ms: rtt,
+				// Samples the browser made up for the ones that did not come, at 48 kHz.
+				audio_gap_ms: audio ? Math.round((r.concealedSamples ?? 0) / 48) : 0,
+				stalled: now - changed > 2000,
+			},
+		});
+	}
+}
+
+ws.onopen = () => queue(start);
+ws.onclose = () => event('error', 'the relay closed');
+ws.onmessage = (e) => {
+	const m = JSON.parse(e.data);
+	if (m.t === 'sdp') queue(() => onDescription(m.data, false));
+	else if (m.t === 'ice') queue(() => onIce(m.data));
+};
+</script>
+</body>

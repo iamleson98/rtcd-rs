@@ -117,6 +117,7 @@ pub async fn run(args: impl Iterator<Item = String>, assets: std::path::PathBuf)
                 camera: i < a.cameras,
                 screen: false,
                 watch,
+                ..Default::default()
             };
             people.push(class::join(&rtcd, assets.clone(), &call, spec, index).await);
             index += 1;
