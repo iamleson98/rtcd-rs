@@ -1,0 +1,9 @@
+{
+  "name": "lesson-soak-chrome",
+  "private": true,
+  "description": "Opens the lesson receiver page in headless Chromium (see ../README.md)",
+  "type": "module",
+  "dependencies": {
+    "playwright": "1.65.0"
+  }
+}

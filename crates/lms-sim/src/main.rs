@@ -7,7 +7,10 @@
 //! ```
 //!
 //! `soak` runs class after class and reports the resident set after each, to find a leak.
+//! `load` puts classes on an rtcd that runs elsewhere; `lesson` plays one real lesson on it for hours
+//! and measures what the receivers see (see `lesson.rs`).
 
+mod lesson;
 mod load;
 mod soak;
 
@@ -89,6 +92,12 @@ fn ffprobe(path: &Path) -> Value {
     }
 }
 
+/// Where the media is: `LMS_SIM_ASSETS`, or a directory in the temporary one.
+fn assets_dir() -> PathBuf {
+    std::env::var("LMS_SIM_ASSETS")
+        .map_or_else(|_| std::env::temp_dir().join("lms-sim-assets"), Into::into)
+}
+
 #[tokio::main]
 async fn main() {
     if std::env::args().nth(1).as_deref() == Some("soak") {
@@ -96,10 +105,18 @@ async fn main() {
         soak::run(std::env::args().skip(2), assets).await;
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("lesson") {
+        lesson::run(std::env::args().skip(2), assets_dir()).await;
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("assets") {
+        // Makes the media (needs ffmpeg), for an image that has none.
+        let dir = std::env::args().nth(2).expect("usage: lms-sim assets DIR");
+        Assets::load(Path::new(&dir)).expect("the media is made (ffmpeg)");
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("load") {
-        let assets = std::env::var("LMS_SIM_ASSETS")
-            .map_or_else(|_| std::env::temp_dir().join("lms-sim-assets"), Into::into);
-        load::run(std::env::args().skip(2), assets).await;
+        load::run(std::env::args().skip(2), assets_dir()).await;
         return;
     }
     let a = match parse() {

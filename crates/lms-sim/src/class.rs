@@ -2,6 +2,7 @@
 //! and send what a browser would: a microphone (Opus packets with the audio level extension), a
 //! camera and a screen share (VP8 frames, in two layers for a screen), at the real frame rates.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,7 +15,7 @@ use rtc::peer_connection::configuration::interceptor_registry::{
     configure_keyframe_request_forwarding, register_default_interceptors,
 };
 use rtc::peer_connection::configuration::media_engine::MediaEngine;
-use rtc::peer_connection::event::{RTCDataChannelEvent, RTCPeerConnectionEvent};
+use rtc::peer_connection::event::{RTCDataChannelEvent, RTCPeerConnectionEvent, RTCTrackEvent};
 use rtc::peer_connection::message::RTCMessage;
 use rtc::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
 use rtc::peer_connection::state::{RTCPeerConnectionState, RTCSignalingState};
@@ -28,9 +29,12 @@ use rtc::rtp_transceiver::rtp_sender::{
     RTCRtpCodec, RTCRtpCodingParameters, RTCRtpEncodingParameters, RTCRtpHeaderExtensionCapability,
     RtpCodecKind,
 };
-use rtc::rtp_transceiver::{RTCRtpSenderId, RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
+use rtc::rtp_transceiver::{
+    RTCRtpReceiverId, RTCRtpSenderId, RTCRtpTransceiverDirection, RTCRtpTransceiverInit,
+};
 use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
+use rtc::statistics::StatsSelector;
 use rtcd_proto::dc::DcMessage;
 use rtcd_proto::{ClientMessage, JoinRequest, Message, MessageType, SessionRef};
 use tokio::net::UdpSocket;
@@ -38,13 +42,19 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::assets::{Assets, Clip};
-use crate::host::Rtcd;
+use crate::host::{Rtcd, RtcdConn};
+use crate::stats::{Probe, Receiver};
 
 const AUDIO_LEVEL_URI: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
 const MID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
 const RID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id";
 /// The largest payload of a VP8 packet.
 const MTU_PAYLOAD: usize = 1100;
+/// Where a sender that starts near the wrap begins: its sequence numbers wrap after 300 packets,
+/// its timestamps after 20 s, so a run crosses every wrap.
+const WRAP_SEQ: u16 = 0u16.wrapping_sub(300);
+const WRAP_VIDEO_TS: u32 = 0u32.wrapping_sub(20 * 90_000);
+const WRAP_AUDIO_TS: u32 = 0u32.wrapping_sub(20 * 48_000);
 
 /// What a participant sends.
 #[derive(Debug, Clone, Default)]
@@ -56,6 +66,10 @@ pub struct Spec {
     /// Names of the participants whose cameras this one watches (a `video_subscribe` once it is
     /// connected); empty watches none, as a browser with its cameras off-screen.
     pub watch: Vec<String>,
+    /// Starts every stream's sequence numbers and timestamps just short of their wrap.
+    pub wrap: bool,
+    /// Measures what it receives and reports what it sends and sees (see [`crate::stats`]).
+    pub probe: Option<Probe>,
 }
 
 /// What a participant can be told to do while it is in the call.
@@ -93,6 +107,8 @@ impl Participant {
 
 struct Video {
     sender: RTCRtpSenderId,
+    /// `camera` or `screen`, for the events.
+    label: &'static str,
     ssrcs: Vec<u32>,
     seq: Vec<u16>,
     ts: Vec<u32>,
@@ -166,7 +182,8 @@ fn video_track(
     RTCRtpSenderId::from(id)
 }
 
-fn message(session: &str, call: &str, kind: MessageType, data: Vec<u8>) -> ClientMessage {
+/// A message for the SFU, the way the LMS server passes a client's on.
+pub fn message(session: &str, call: &str, kind: MessageType, data: Vec<u8>) -> ClientMessage {
     ClientMessage::Rtc(Message {
         group_id: "default".into(),
         user_id: String::new(),
@@ -177,16 +194,11 @@ fn message(session: &str, call: &str, kind: MessageType, data: Vec<u8>) -> Clien
     })
 }
 
-/// Joins `call` and keeps sending until it is told to leave.
-pub async fn join(
-    rtcd: &Rtcd,
-    assets: Arc<Assets>,
-    call: &str,
-    spec: Spec,
-    index: u32,
-) -> Participant {
-    let session_id = format!("session-{}", spec.name);
-    let user_id = format!("user-{}", spec.name);
+/// Opens a websocket to rtcd and joins `call` as `name`; returns the connection and the session
+/// and user ids.
+pub async fn open_session(rtcd: &Rtcd, call: &str, name: &str) -> (RtcdConn, String, String) {
+    let session_id = format!("session-{name}");
+    let user_id = format!("user-{name}");
     let mut conn = rtcd.connect().await;
     // The hello comes first.
     let _ = tokio::time::timeout(Duration::from_secs(10), conn.rx.recv()).await;
@@ -200,7 +212,18 @@ pub async fn join(
         host: false,
         observer: false,
     }));
+    (conn, session_id, user_id)
+}
 
+/// Joins `call` and keeps sending until it is told to leave.
+pub async fn join(
+    rtcd: &Rtcd,
+    assets: Arc<Assets>,
+    call: &str,
+    spec: Spec,
+    index: u32,
+) -> Participant {
+    let (mut conn, session_id, user_id) = open_session(rtcd, call, &spec.name).await;
     // On loopback, unless the participants are on another machine than rtcd: then the address
     // they can be reached at.
     let local = std::env::var("LMS_SIM_LOCAL_IP").unwrap_or_else(|_| "127.0.0.1".into());
@@ -268,8 +291,9 @@ pub async fn join(
         ));
         Video {
             sender,
-            seq: vec![100],
-            ts: vec![1000],
+            label: "camera",
+            seq: vec![if spec.wrap { WRAP_SEQ } else { 100 }],
+            ts: vec![if spec.wrap { WRAP_VIDEO_TS } else { 1000 }],
             ssrcs,
             picture_id: 10,
             pos: 0,
@@ -291,8 +315,17 @@ pub async fn join(
         ));
         Video {
             sender,
-            seq: vec![100, 5000],
-            ts: vec![1000, 900_000],
+            label: "screen",
+            seq: if spec.wrap {
+                vec![WRAP_SEQ; 2]
+            } else {
+                vec![100, 5000]
+            },
+            ts: if spec.wrap {
+                vec![WRAP_VIDEO_TS; 2]
+            } else {
+                vec![1000, 900_000]
+            },
             ssrcs,
             picture_id: 90,
             pos: 0,
@@ -323,6 +356,7 @@ pub async fn join(
     let sid = session_id.clone();
     let call = call.to_owned();
     let mut voice = spec.voice;
+    let (wrap, probe, me) = (spec.wrap, spec.probe, spec.name);
     let (mut camera_on, mut screen_on) = (true, true);
     let mut watch = (!spec.watch.is_empty()).then(|| {
         let ids: Vec<String> = spec.watch.iter().map(|n| format!("session-{n}")).collect();
@@ -332,10 +366,19 @@ pub async fn join(
         let mut buf = vec![0u8; 2048];
         let mut dc: Option<usize> = None;
         let mut connected = false;
-        let mut mic_seq = 0u16;
-        let mut mic_ts = 0u32;
+        let mut mic_seq = if wrap { WRAP_SEQ } else { 0u16 };
+        let mut mic_ts = if wrap { WRAP_AUDIO_TS } else { 0u32 };
         let mut mic_pos = 0usize;
         let mut next_audio = Instant::now();
+        // What this participant measures of what it receives, and where to ask for a keyframe.
+        let mut rx = probe
+            .as_ref()
+            .filter(|p| p.measure)
+            .map(|_| Receiver::default());
+        let mut receivers: HashMap<String, (RTCRtpReceiverId, u32)> = HashMap::new();
+        let mut joined = false;
+        let mut next_probe = Instant::now() + Duration::from_secs(1);
+        let mut probe_ticks = 0u32;
         loop {
             // Everything the connection wants sent, and its events.
             let mut moved = true;
@@ -349,7 +392,18 @@ pub async fn join(
                     moved = true;
                     match ev {
                         RTCPeerConnectionEvent::OnConnectionStateChangeEvent(s) => {
-                            connected = s == RTCPeerConnectionState::Connected
+                            connected = s == RTCPeerConnectionState::Connected;
+                            if let Some(p) = &probe {
+                                p.event(&me, "ice_state", &format!("connection:{s}"));
+                            }
+                        }
+                        RTCPeerConnectionEvent::OnIceConnectionStateChangeEvent(s) => {
+                            if let Some(p) = &probe {
+                                p.event(&me, "ice_state", &format!("ice:{s}"));
+                            }
+                        }
+                        RTCPeerConnectionEvent::OnTrack(RTCTrackEvent::OnOpen(init)) => {
+                            receivers.insert(init.track_id, (init.receiver_id, init.ssrc));
                         }
                         RTCPeerConnectionEvent::OnIceCandidateEvent(e) => {
                             if let Ok(init) = e.candidate.to_json() {
@@ -369,7 +423,27 @@ pub async fn join(
                 }
                 while let Some(m) = pc.poll_read() {
                     moved = true;
+                    let arrived = m.now;
                     match m.message {
+                        RTCMessage::RtpPacket(track, packet) => {
+                            if let (Some(rx), Some(p)) = (rx.as_mut(), &probe)
+                                && let Some((what, w)) = rx.on_rtp(
+                                    p,
+                                    arrived,
+                                    &track,
+                                    packet.header.sequence_number,
+                                    packet.header.timestamp,
+                                    packet.header.marker,
+                                )
+                                && p.leader
+                            {
+                                for (on, name) in [(w.seq, "seq"), (w.ts, "timestamp")] {
+                                    if on {
+                                        p.event(&me, "wrap", &format!("rx {name} {what}"));
+                                    }
+                                }
+                            }
+                        }
                         RTCMessage::RtcpPacket(_, packets) => {
                             for p in &packets {
                                 let asked: Vec<u32> = if let Some(pli) =
@@ -403,11 +477,18 @@ pub async fn join(
 
             let now = Instant::now();
             if connected && dc.is_some() {
+                if !joined {
+                    joined = true;
+                    if let Some(p) = &probe {
+                        p.event(&me, "join", "connected");
+                    }
+                }
                 if let Some(data) = watch.take() {
                     conn.send(message(&sid, &call, MessageType::VideoSubscribe, data));
                 }
                 if voice {
                     while next_audio <= now {
+                        let seq = mic_seq;
                         send_voice(
                             &mut pc,
                             mic,
@@ -416,14 +497,29 @@ pub async fn join(
                             mic_ts,
                             &assets.voice.packets[mic_pos % assets.voice.packets.len()],
                         );
+                        if mic_seq < seq
+                            && let Some(p) = &probe
+                        {
+                            p.event(&me, "wrap", "tx seq voice");
+                        }
                         mic_pos += 1;
                         mic_ts = mic_ts.wrapping_add(960);
+                        if mic_ts < 960
+                            && let Some(p) = &probe
+                        {
+                            p.event(&me, "wrap", "tx timestamp voice");
+                        }
                         next_audio += Duration::from_millis(20);
                     }
                 } else {
                     // A muted microphone sends nothing, and time goes on.
                     while next_audio <= now {
                         mic_ts = mic_ts.wrapping_add(960);
+                        if mic_ts < 960
+                            && let Some(p) = &probe
+                        {
+                            p.event(&me, "wrap", "tx timestamp voice");
+                        }
                         next_audio += Duration::from_millis(20);
                     }
                 }
@@ -431,7 +527,17 @@ pub async fn join(
                     let Some(v) = v else { continue };
                     while v.next <= now {
                         if on {
+                            let (seq, ts) = (v.seq[0], v.ts[0]);
                             send_frame(&mut pc, v);
+                            if let Some(p) = &probe {
+                                for (wrapped, name) in
+                                    [(v.seq[0] < seq, "seq"), (v.ts[0] < ts, "timestamp")]
+                                {
+                                    if wrapped {
+                                        p.event(&me, "wrap", &format!("tx {name} {}", v.label));
+                                    }
+                                }
+                            }
                         } else {
                             // The camera is off, and time goes on.
                             let tick = 90_000 / v.clip.fps;
@@ -453,6 +559,9 @@ pub async fn join(
             if let Some(t) = pc.poll_timeout() {
                 wake = wake.min(t);
             }
+            if rx.is_some() {
+                wake = wake.min(next_probe);
+            }
             if connected && dc.is_some() {
                 if voice {
                     wake = wake.min(next_audio);
@@ -465,6 +574,9 @@ pub async fn join(
             tokio::pin!(sleep);
             tokio::select! {
                 _ = &mut stop_rx => {
+                    if let Some(p) = &probe {
+                        p.event(&me, "leave", "stop");
+                    }
                     conn.send(ClientMessage::Leave(SessionRef { session_id: sid.clone() }));
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     return;
@@ -497,13 +609,52 @@ pub async fn join(
                         }
                         _ => {}
                     },
-                    Some(ClientMessage::Close(r)) if r.session_id == sid => return,
+                    Some(ClientMessage::Close(r)) if r.session_id == sid => {
+                        if let Some(p) = &probe {
+                            p.event(&me, "error", "the SFU closed the session");
+                        }
+                        return;
+                    }
                     Some(_) => {}
-                    None => return,
+                    None => {
+                        if let Some(p) = &probe {
+                            p.event(&me, "error", "the signaling connection closed");
+                        }
+                        return;
+                    }
                 },
                 () = &mut sleep => {}
             }
             let _ = pc.handle_timeout(Instant::now());
+            if let (Some(rx), Some(p)) = (rx.as_mut(), &probe)
+                && Instant::now() >= next_probe
+            {
+                let now = Instant::now();
+                next_probe = now + Duration::from_secs(1);
+                probe_ticks += 1;
+                // A decoder that has no frame for a second asks for a keyframe.
+                for id in rx.keyframes_due(now) {
+                    if let Some((receiver, ssrc)) = receivers.get(&id)
+                        && let Some(mut r) = pc.rtp_receiver(*receiver)
+                    {
+                        let _ = r.write_rtcp(
+                            now,
+                            vec![Box::new(PictureLossIndication {
+                                sender_ssrc: 0,
+                                media_ssrc: *ssrc,
+                            })],
+                        );
+                    }
+                }
+                if probe_ticks.is_multiple_of(5) {
+                    let rtt = pc
+                        .get_stats(now, StatsSelector::None)
+                        .candidate_pairs()
+                        .map(|c| c.current_round_trip_time)
+                        .fold(0.0, f64::max);
+                    rx.write(p, &me, now, (rtt > 0.0).then_some(rtt * 1000.0));
+                }
+            }
         }
     });
     Participant {

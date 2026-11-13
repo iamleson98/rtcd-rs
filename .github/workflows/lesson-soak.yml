@@ -1,0 +1,124 @@
+name: lesson-soak
+
+# A real lesson for two hours against this repository's rtcd and against the upstream Go rtcd it
+# replaced, on x64 and on arm64: a teacher, 25 students, Chromium receivers, a network that
+# misbehaves for part of the class (see scripts/lesson-soak/README.md). The report compares the
+# first and the last clean stretch of each service and fails when rtcd-rs drifts or behaves worse.
+
+on:
+  schedule:
+    - cron: '0 2 * * 6'
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Length of the lesson in minutes"
+        required: false
+        default: "120"
+      cycle:
+        description: "Minutes in one cycle of network phases"
+        required: false
+        default: "20"
+  pull_request:
+    paths:
+      - 'crates/lms-sim/**'
+      - 'scripts/lesson-soak/**'
+      - '.github/workflows/lesson-soak.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      minutes: ${{ steps.plan.outputs.minutes }}
+      cycle: ${{ steps.plan.outputs.cycle }}
+    steps:
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          MINUTES: ${{ inputs.minutes }}
+          CYCLE: ${{ inputs.cycle }}
+        run: |
+          case "$EVENT" in
+            pull_request) minutes=10 cycle=5 ;;
+            workflow_dispatch) minutes=$MINUTES cycle=$CYCLE ;;
+            *) minutes=120 cycle=20 ;;
+          esac
+          case "$minutes$cycle" in *[!0-9]*|'') echo "minutes and cycle must be whole numbers"; exit 1 ;; esac
+          [ "$minutes" -le 150 ] || { echo "a lesson is at most 150 minutes (the job's timeout is 180)"; exit 1; }
+          echo "minutes=$minutes" >> "$GITHUB_OUTPUT"
+          echo "cycle=$cycle" >> "$GITHUB_OUTPUT"
+
+  soak:
+    name: Lesson (${{ matrix.impl }}, ${{ matrix.arch }})
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    # A lesson is at most 150 minutes (checked in Plan); expressions have no arithmetic.
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { impl: rs, arch: x64, os: ubuntu-latest }
+          - { impl: go, arch: x64, os: ubuntu-latest }
+          - { impl: rs, arch: arm64, os: ubuntu-24.04-arm }
+          - { impl: go, arch: arm64, os: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Kernel modules for the network shaping
+        run: |
+          sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)" || true
+          sudo modprobe ifb sch_netem act_mirred cls_u32 || true
+          lsmod | grep -E '^(ifb|sch_netem|act_mirred|cls_u32) ' || true
+      - name: Run the lesson
+        run: >
+          $GITHUB_WORKSPACE/scripts/ci-run.sh
+          $GITHUB_WORKSPACE/scripts/lesson-soak/run.sh
+          ${{ matrix.impl }} ${{ needs.plan.outputs.minutes }} ${{ needs.plan.outputs.cycle }} out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lesson-soak-${{ matrix.impl }}-${{ matrix.arch }}
+          path: out/
+          retention-days: 30
+
+  report:
+    name: Report
+    needs: soak
+    if: always() && needs.soak.result != 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lesson-soak-*
+          path: soak
+      - name: Compare
+        id: report
+        run: |
+          set +e
+          python3 vendor/rtc/benchmarks/soak/report.py --rules scripts/lesson-soak/rules.json --out report soak/*/rtcd-*.jsonl
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+          [ -f report/summary.md ] && cat report/summary.md >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lesson-soak-report
+          path: |
+            report/report.html
+            soak/*/rtcd-*.jsonl
+          retention-days: 30
+      - name: Fail when rtcd-rs breached a rule
+        if: steps.report.outputs.status != '0'
+        run: exit ${{ steps.report.outputs.status }}
