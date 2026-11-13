@@ -9,9 +9,11 @@
 //! `soak` runs class after class and reports the resident set after each, to find a leak.
 //! `load` puts classes on an rtcd that runs elsewhere; `lesson` plays one real lesson on it for hours
 //! and measures what the receivers see (see `lesson.rs`).
+//! `abuse` attacks that same call from a container of its own (see `lms_sim::abuse`).
 
 mod lesson;
 mod load;
+mod ramp;
 mod soak;
 
 use std::path::{Path, PathBuf};
@@ -109,6 +111,10 @@ async fn main() {
         lesson::run(std::env::args().skip(2), assets_dir()).await;
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("abuse") {
+        lms_sim::abuse::run(std::env::args().skip(2), assets_dir()).await;
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("assets") {
         // Makes the media (needs ffmpeg), for an image that has none.
         let dir = std::env::args().nth(2).expect("usage: lms-sim assets DIR");
@@ -117,6 +123,10 @@ async fn main() {
     }
     if std::env::args().nth(1).as_deref() == Some("load") {
         load::run(std::env::args().skip(2), assets_dir()).await;
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("ramp") {
+        ramp::run(std::env::args().skip(2), assets_dir()).await;
         return;
     }
     let a = match parse() {

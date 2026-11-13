@@ -10,7 +10,8 @@
 //! * the **audio gap** is the time, summed, that no audio packet arrived for more than 60 ms;
 //! * **stalled** is no media for more than 2 s;
 //! * **lost** is the packets the sequence numbers say were sent and never came, as the RTP receiver
-//!   report counts them (a late packet that comes after all takes one off);
+//!   report counts them (a late packet that comes after all takes one off; a number that comes
+//!   twice counts once, and the second time is a **duplicate**, so a loss is not hidden by a copy);
 //! * **nack** is the packets asked for again: every sequence number the receiver saw skipped.
 
 use std::collections::{HashMap, VecDeque};
@@ -22,6 +23,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 
+/// How far back a repeated sequence number is told from a new one.
+const SEEN_BITS: i64 = 2048;
 /// How many frames the freeze threshold averages over.
 const FREEZE_WINDOW: usize = 30;
 /// A freeze needs this many intervals to average over first.
@@ -96,7 +99,20 @@ impl Probe {
             &self.imp,
             "event",
             id,
-            json!({ "what": what, "detail": detail }),
+            json!({ "what": what, "detail": detail, "group": self.group }),
+        );
+    }
+
+    /// A participant that lost its seat is back: `downtime_ms` since it lost it, after `attempts`.
+    pub fn rejoined(&self, id: &str, downtime_ms: u64, attempts: u32) {
+        self.sink.write(
+            &self.imp,
+            "event",
+            id,
+            json!({
+                "what": "rejoin", "detail": "connected again", "group": self.group,
+                "downtime_ms": downtime_ms, "attempts": attempts,
+            }),
         );
     }
 
@@ -133,6 +149,11 @@ pub struct RecvTrack {
     freezes: u64,
     freeze_ms: f64,
     audio_gap_ms: f64,
+    bytes: u64,
+    /// Arrivals of a sequence number that had come already (a retransmission that was not needed,
+    /// or the network's duplicate), and which of the last [`SEEN_BITS`] numbers have arrived.
+    duplicates: u64,
+    seen: [u64; (SEEN_BITS / 64) as usize],
 }
 
 impl RecvTrack {
@@ -155,7 +176,35 @@ impl RecvTrack {
             freezes: 0,
             freeze_ms: 0.0,
             audio_gap_ms: 0.0,
+            bytes: 0,
+            duplicates: 0,
+            seen: [0; (SEEN_BITS / 64) as usize],
         }
+    }
+
+    /// Counts the size of a packet that arrived (RTP header and payload).
+    pub fn add_bytes(&mut self, n: usize) {
+        self.bytes += n as u64;
+    }
+
+    fn slot(ext: i64) -> (usize, u64) {
+        let i = ext.rem_euclid(SEEN_BITS) as usize;
+        (i / 64, 1 << (i % 64))
+    }
+
+    fn mark(&mut self, ext: i64) {
+        let (w, b) = Self::slot(ext);
+        self.seen[w] |= b;
+    }
+
+    fn clear(&mut self, ext: i64) {
+        let (w, b) = Self::slot(ext);
+        self.seen[w] &= !b;
+    }
+
+    fn seen(&self, ext: i64) -> bool {
+        let (w, b) = Self::slot(ext);
+        self.seen[w] & b != 0
     }
 
     /// Takes a packet that arrived at `now`.
@@ -166,6 +215,7 @@ impl RecvTrack {
             self.base = i64::from(seq);
             self.max = i64::from(seq);
             self.last_ts = ts;
+            self.mark(self.max);
         } else {
             // The distance to the highest number so far, as a signed 16-bit step: a packet that
             // overtook another is behind, one after a gap ahead, the wrap included.
@@ -177,7 +227,20 @@ impl RecvTrack {
                 if (self.max + step) >> 16 > self.max >> 16 {
                     wrapped.seq = true;
                 }
+                // The numbers the step skips have not arrived: their bits are free again.
+                for skipped in self.max + 1..=self.max + step.min(SEEN_BITS) {
+                    self.clear(skipped);
+                }
                 self.max += step;
+                self.mark(self.max);
+            } else if -step < SEEN_BITS {
+                let late = self.max + step;
+                if self.seen(late) {
+                    self.duplicates += 1;
+                } else {
+                    self.mark(late);
+                }
+                self.base = self.base.min(late);
             }
             if ts.wrapping_sub(self.last_ts) as i32 > 0 {
                 if ts < self.last_ts {
@@ -277,7 +340,9 @@ impl RecvTrack {
             gap_ms += open.as_secs_f64() * 1000.0;
         }
         let expected = self.max - self.base + 1;
-        let lost = (expected - self.packets as i64).max(0);
+        // Every number that never arrived, retransmissions that made it taken off; a number that
+        // arrived twice counts once, and is reported as a duplicate.
+        let lost = expected - (self.packets - self.duplicates) as i64;
         json!({
             "media": if self.video { "video" } else { "audio" },
             "group": group,
@@ -285,6 +350,8 @@ impl RecvTrack {
             "freezes": freezes,
             "freeze_ms": freeze_ms.round() as u64,
             "packets": self.packets,
+            "bytes": self.bytes,
+            "duplicates": self.duplicates,
             "lost": lost,
             "nack": self.nack,
             "pli": pli,
@@ -356,6 +423,13 @@ impl Receiver {
         let t = self.tracks.get_mut(track)?;
         let wrapped = t.stats.on_packet(now, seq, ts, marker);
         Some((format!("{}:{}", t.kind, t.sender), wrapped))
+    }
+
+    /// Counts the size of an RTP packet of `track` (after [`on_rtp`](Self::on_rtp) took it).
+    pub fn count_bytes(&mut self, track: &str, n: usize) {
+        if let Some(t) = self.tracks.get_mut(track) {
+            t.stats.add_bytes(n);
+        }
     }
 
     /// The video tracks that have been without a frame for a second and that a keyframe was not
@@ -521,5 +595,67 @@ mod tests {
         // The SFU names the track anew: the old one is dropped, not left to report a stall.
         r.on_rtp(&probe, now, "screen_session-teacher_zzzzzzzz", 1, 1, true);
         assert_eq!(r.tracks.len(), 2);
+    }
+
+    #[test]
+    fn bytes_are_counted_and_events_name_their_group() {
+        let path = std::env::temp_dir().join("lms-sim-stats-bytes-test.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let probe = Probe {
+            sink: Sink::open(&path).unwrap(),
+            imp: "rtcd-rs".into(),
+            group: "impaired",
+            teacher: "session-teacher".into(),
+            measure: true,
+            leader: false,
+        };
+        let mut r = Receiver::default();
+        let now = clock();
+        let track = "video_session-teacher_abcdefgh";
+        r.on_rtp(&probe, now, track, 1, 1, true);
+        r.count_bytes(track, 1000);
+        r.count_bytes(track, 200);
+        r.count_bytes("video_session-nobody_abcdefgh", 5);
+        r.write(&probe, "s17", now, None);
+        probe.rejoined("s17", 4200, 2);
+        let lines: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines[0]["bytes"], 1200);
+        assert_eq!(lines[1]["what"], "rejoin");
+        assert_eq!(lines[1]["group"], "impaired");
+        assert_eq!(lines[1]["downtime_ms"], 4200);
+    }
+
+    #[test]
+    fn a_duplicate_does_not_hide_a_loss() {
+        let t0 = clock();
+        let mut t = RecvTrack::new(false);
+        // 1 2 2 4 (3 never comes, 2 comes twice) and then 3 late, then 3 again.
+        for (n, seq) in [1u16, 2, 2, 4].into_iter().enumerate() {
+            t.on_packet(t0 + Duration::from_millis(20 * n as u64), seq, 0, false);
+        }
+        let f = t.fields(t0 + Duration::from_millis(80), "impaired", 0, None);
+        assert_eq!(
+            (
+                f["packets"].as_u64(),
+                f["duplicates"].as_u64(),
+                f["lost"].as_i64()
+            ),
+            (Some(4), Some(1), Some(1))
+        );
+        t.on_packet(t0 + Duration::from_millis(100), 3, 0, false);
+        t.on_packet(t0 + Duration::from_millis(120), 3, 0, false);
+        let f = t.fields(t0 + Duration::from_millis(120), "impaired", 0, None);
+        assert_eq!(
+            (
+                f["packets"].as_u64(),
+                f["duplicates"].as_u64(),
+                f["lost"].as_i64()
+            ),
+            (Some(6), Some(2), Some(0))
+        );
     }
 }
