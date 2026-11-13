@@ -85,7 +85,7 @@ pub async fn run(args: impl Iterator<Item = String>, assets: std::path::PathBuf)
     };
     let assets = Arc::new(Assets::load(&assets).expect("the media is made (ffmpeg)"));
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let rtcd = Rtcd::remote(&a.http, a.media).await;
+    let rtcd = Arc::new(Rtcd::remote(&a.http, a.media).await);
     let started = Instant::now();
     let gap = Duration::from_micros(1_000_000 / u64::from(a.per_second));
     let mut people = Vec::new();

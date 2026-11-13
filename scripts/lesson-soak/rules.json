@@ -1,12 +1,14 @@
 {
-  "gate_impls": ["rtcd-rs", "rtcd-rs/chrome"],
+  "compare": [
+    {"subject": "rtcd-rs", "baseline": "rtcd-go"},
+    {"subject": "rtcd-rs/chrome", "baseline": "rtcd-go/chrome"}
+  ],
+  "require_groups": ["clean", "impaired"],
+  "ratio": 1.25,
   "warmup_min": 15,
   "window_min": 20,
-  "freeze_rate_ratio_max": 2.0,
-  "freeze_rate_abs_slack_per_min": 0.5,
-  "audio_gap_ratio_max": 2.0,
-  "audio_gap_abs_slack_pct": 0.5,
+  "min_clean_window_min": 5,
   "rss_slope_mb_per_h_max": 30,
-  "stall_max_s": 10,
-  "recover_max_s": 10
+  "rss_slope_min_span_min": 30,
+  "clean_zero": ["stalls", "freezes", "closes", "ice_disc"]
 }

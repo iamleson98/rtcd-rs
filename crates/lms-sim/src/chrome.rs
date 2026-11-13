@@ -3,10 +3,10 @@
 //! joins, answers the SFU's offers and watches the teacher exactly as the web app does. The page
 //! reports what Chrome measures; those lines are written next to the synthetic receivers'.
 //!
-//! Page and relay are on loopback: Chrome runs in the same network namespace as this process
-//! (`--network container:...`), so whatever shapes that namespace shapes Chrome's media too.
+//! Page and relay are on loopback when Chrome runs in the same network namespace as this process
+//! (`--network container:...`), so whatever shapes that namespace shapes Chrome's media too; a Chrome
+//! in a namespace of its own (which a network can shape for it alone) reaches them on `--chrome-bind`.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
@@ -18,16 +18,23 @@ use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::class::{message, open_session};
+use crate::class::{message, try_open_session};
 use crate::host::Rtcd;
 use crate::stats::Probe;
 
 const PAGE: &str = include_str!("page.html");
 
-/// Serves the page on `port` and the relay on `port + 1`, for as long as the process lives.
-pub async fn serve(rtcd: Arc<Rtcd>, call: String, probe: Probe, port: u16) -> std::io::Result<()> {
-    let http = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;
-    let relay = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port + 1))).await?;
+/// Serves the page on `bind:port` and the relay on `bind:port + 1`, for as long as the process
+/// lives.
+pub async fn serve(
+    rtcd: Arc<Rtcd>,
+    call: String,
+    probe: Probe,
+    bind: &str,
+    port: u16,
+) -> std::io::Result<()> {
+    let http = TcpListener::bind(format!("{bind}:{port}")).await?;
+    let relay = TcpListener::bind(format!("{bind}:{}", port + 1)).await?;
     tokio::spawn(async move {
         let app = Router::new().route("/", get(|| async { Html(PAGE) }));
         let _ = axum::serve(http, app).await;
@@ -47,7 +54,9 @@ async fn session(rtcd: Arc<Rtcd>, call: String, probe: Probe, stream: TcpStream)
     };
     let (mut page_tx, mut page_rx) = socket.split();
     let name = format!("chrome-{}", probe.group);
-    let (mut conn, sid, _) = open_session(&rtcd, &call, &name).await;
+    let Some((mut conn, sid, _)) = try_open_session(&rtcd, &call, &name).await else {
+        return;
+    };
     loop {
         tokio::select! {
             m = page_rx.next() => {
@@ -68,6 +77,11 @@ async fn session(rtcd: Arc<Rtcd>, call: String, probe: Probe, stream: TcpStream)
                             probe.recv(id, v["fields"].clone());
                         }
                     }
+                    Some("rejoin") => probe.rejoined(
+                        &name,
+                        v["ms"].as_u64().unwrap_or_default(),
+                        v["tries"].as_u64().unwrap_or_default() as u32,
+                    ),
                     Some("event") => probe.event(
                         &name,
                         v["what"].as_str().unwrap_or("error"),

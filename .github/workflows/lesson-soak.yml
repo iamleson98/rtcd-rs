@@ -1,9 +1,16 @@
 name: lesson-soak
 
-# A real lesson for two hours against this repository's rtcd and against the upstream Go rtcd it
-# replaced, on x64 and on arm64: a teacher, 25 students, Chromium receivers, a network that
-# misbehaves for part of the class (see scripts/lesson-soak/README.md). The report compares the
-# first and the last clean stretch of each service and fails when rtcd-rs drifts or behaves worse.
+# Two profiles, each for two hours against this repository's rtcd and against the upstream Go rtcd
+# it replaced, on x64 and on arm64 (see scripts/lesson-soak/README.md):
+#   lesson: a real lesson: a teacher, 25 students, Chromium receivers, a network that misbehaves
+#           for part of the class.
+#   abuse:  the same lesson with the SFU held at the limit: a background load of 90 % of the lower of
+#           the two services' ceilings (found by `calibrate` on the same runner type), churn, hostile
+#           clients, junk and signaling abuse, and a network abuse profile for each participant, from
+#           one seed (the run id) so both services meet the same attacks.
+# The report compares the first and the last clean stretch of each service, holds rtcd-rs against the
+# Go rtcd (the same lesson, the same network, the same machine type) and fails when rtcd-rs drifts,
+# crashes or is less stable.
 
 on:
   schedule:
@@ -38,6 +45,9 @@ jobs:
     outputs:
       minutes: ${{ steps.plan.outputs.minutes }}
       cycle: ${{ steps.plan.outputs.cycle }}
+      ramp_step: ${{ steps.plan.outputs.ramp_step }}
+      ramp_per_step: ${{ steps.plan.outputs.ramp_per_step }}
+      ramp_max: ${{ steps.plan.outputs.ramp_max }}
     steps:
       - id: plan
         env:
@@ -46,16 +56,23 @@ jobs:
           CYCLE: ${{ inputs.cycle }}
         run: |
           case "$EVENT" in
-            pull_request) minutes=10 cycle=5 ;;
-            workflow_dispatch) minutes=$MINUTES cycle=$CYCLE ;;
-            *) minutes=120 cycle=20 ;;
+            pull_request) minutes=10 cycle=5 ramp_step=20 ramp_per_step=1 ramp_max=6 ;;
+            workflow_dispatch) minutes=$MINUTES cycle=$CYCLE ramp_step=40 ramp_per_step=2 ramp_max=30 ;;
+            *) minutes=120 cycle=20 ramp_step=40 ramp_per_step=2 ramp_max=30 ;;
           esac
           case "$minutes$cycle" in *[!0-9]*|'') echo "minutes and cycle must be whole numbers"; exit 1 ;; esac
           [ "$minutes" -le 150 ] || { echo "a lesson is at most 150 minutes (the job's timeout is 180)"; exit 1; }
-          echo "minutes=$minutes" >> "$GITHUB_OUTPUT"
-          echo "cycle=$cycle" >> "$GITHUB_OUTPUT"
+          # The calibration ramp: at most ramp_max / ramp_per_step steps of ramp_step seconds for each
+          # service, so the two of them fit the calibrate job's 60 minutes with the image builds.
+          {
+            echo "minutes=$minutes"
+            echo "cycle=$cycle"
+            echo "ramp_step=$ramp_step"
+            echo "ramp_per_step=$ramp_per_step"
+            echo "ramp_max=$ramp_max"
+          } >> "$GITHUB_OUTPUT"
 
-  soak:
+  lesson:
     name: Lesson (${{ matrix.impl }}, ${{ matrix.arch }})
     needs: plan
     runs-on: ${{ matrix.os }}
@@ -64,11 +81,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        impl: [rs, go]
+        arch: [x64, arm64]
         include:
-          - { impl: rs, arch: x64, os: ubuntu-latest }
-          - { impl: go, arch: x64, os: ubuntu-latest }
-          - { impl: rs, arch: arm64, os: ubuntu-24.04-arm }
-          - { impl: go, arch: arm64, os: ubuntu-24.04-arm }
+          - { arch: x64, os: ubuntu-latest }
+          - { arch: arm64, os: ubuntu-24.04-arm }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -76,49 +93,173 @@ jobs:
       - name: Kernel modules for the network shaping
         run: |
           sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)" || true
-          sudo modprobe ifb sch_netem act_mirred cls_u32 || true
-          lsmod | grep -E '^(ifb|sch_netem|act_mirred|cls_u32) ' || true
+          sudo modprobe ifb sch_netem sch_htb act_mirred cls_u32 || true
+          lsmod | grep -E '^(ifb|sch_netem|sch_htb|act_mirred|cls_u32) ' || true
       - name: Run the lesson
         run: >
-          $GITHUB_WORKSPACE/scripts/ci-run.sh
-          $GITHUB_WORKSPACE/scripts/lesson-soak/run.sh
+          scripts/ci-run.sh
+          scripts/lesson-soak/run.sh
           ${{ matrix.impl }} ${{ needs.plan.outputs.minutes }} ${{ needs.plan.outputs.cycle }} out
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: lesson-soak-${{ matrix.impl }}-${{ matrix.arch }}
+          name: lesson-soak-lesson-${{ matrix.impl }}-${{ matrix.arch }}
+          path: out/
+          retention-days: 30
+
+  calibrate:
+    name: Calibrate (${{ matrix.arch }})
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    # Both services are ramped one after the other on this runner; the ramp is budgeted in Plan.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        include:
+          - { arch: x64, os: ubuntu-latest }
+          - { arch: arm64, os: ubuntu-24.04-arm }
+    env:
+      RAMP_STEP_SECS: ${{ needs.plan.outputs.ramp_step }}
+      RAMP_CLASSES_PER_STEP: ${{ needs.plan.outputs.ramp_per_step }}
+      RAMP_MAX_CLASSES: ${{ needs.plan.outputs.ramp_max }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Ramp rtcd-rs
+        run: scripts/ci-run.sh scripts/lesson-soak/calibrate.sh rs out
+      - name: Ramp the Go rtcd
+        run: scripts/ci-run.sh scripts/lesson-soak/calibrate.sh go out
+      # 90 % of the lower ceiling, the same load for both services. (A job output cannot carry it: the
+      # outputs of the matrix legs overwrite each other, so the abuse jobs read hold.txt from the artifact.)
+      - name: The load to hold
+        run: |
+          arch=$(uname -m)
+          python3 scripts/lesson-soak/hold.py "$arch" "out/ceiling-rs-$arch.json" "out/ceiling-go-$arch.json" --out out/hold.txt
+      - name: Ceilings in the summary
+        if: always()
+        run: |
+          {
+            echo "### Ceilings (${{ matrix.arch }})"
+            cat out/ceiling-*.json out/hold.txt 2>/dev/null || echo "none"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lesson-soak-calibrate-${{ matrix.arch }}
+          path: out/
+          retention-days: 30
+
+  abuse:
+    name: Abuse (${{ matrix.impl }}, ${{ matrix.arch }})
+    needs: [plan, calibrate]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        impl: [rs, go]
+        arch: [x64, arm64]
+        include:
+          - { arch: x64, os: ubuntu-latest }
+          - { arch: arm64, os: ubuntu-24.04-arm }
+    env:
+      PROFILE: abuse
+      # One seed for every service and architecture of this run, so that all meet the same attacks.
+      SEED: ${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Kernel modules for the network shaping
+        run: |
+          sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)" || true
+          sudo modprobe ifb sch_netem sch_htb act_mirred cls_u32 || true
+          lsmod | grep -E '^(ifb|sch_netem|sch_htb|act_mirred|cls_u32) ' || true
+      - uses: actions/download-artifact@v4
+        with:
+          name: lesson-soak-calibrate-${{ matrix.arch }}
+          path: calibrate
+      - name: The load to hold
+        run: |
+          hold=$(sed -n 's/^hold_classes=//p' calibrate/hold.txt)
+          case "$hold" in ''|*[!0-9]*) echo "::error::no hold_classes from the calibration"; exit 1 ;; esac
+          echo "LOAD_CLASSES=$hold" >> "$GITHUB_ENV"
+          echo "holding $hold background classes, seed $SEED"
+      - name: Run the abuse soak
+        run: >
+          scripts/ci-run.sh
+          scripts/lesson-soak/run.sh
+          ${{ matrix.impl }} ${{ needs.plan.outputs.minutes }} ${{ needs.plan.outputs.cycle }} out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lesson-soak-abuse-${{ matrix.impl }}-${{ matrix.arch }}
           path: out/
           retention-days: 30
 
   report:
-    name: Report
-    needs: soak
-    if: always() && needs.soak.result != 'skipped'
+    name: Report (${{ matrix.profile }}, ${{ matrix.arch }})
+    needs: [lesson, abuse]
+    if: always() && (needs.lesson.result != 'skipped' || needs.abuse.result != 'skipped')
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [lesson, abuse]
+        arch: [x64, arm64]
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - uses: actions/download-artifact@v4
         with:
-          pattern: lesson-soak-*
+          pattern: lesson-soak-${{ matrix.profile }}-*-${{ matrix.arch }}
           path: soak
+      - name: Every soak produced its measurements
+        id: inputs
+        run: |
+          set +e
+          missing=0
+          for impl in rs go; do
+            dir=soak/lesson-soak-${{ matrix.profile }}-$impl-${{ matrix.arch }}
+            if [ -z "$(find "$dir" -name 'rtcd-*.jsonl' -size +0 2>/dev/null)" ]; then
+              echo "::error::no measurements from the $impl ${{ matrix.profile }} soak on ${{ matrix.arch }}"
+              missing=1
+            fi
+          done
+          echo "missing=$missing" >> "$GITHUB_OUTPUT"
+          exit 0
       - name: Compare
         id: report
         run: |
           set +e
-          python3 vendor/rtc/benchmarks/soak/report.py --rules scripts/lesson-soak/rules.json --out report soak/*/rtcd-*.jsonl
+          rules=scripts/lesson-soak/rules.json
+          [ "${{ matrix.profile }}" = abuse ] && rules=scripts/lesson-soak/rules-abuse.json
+          python3 vendor/rtc/benchmarks/soak/report.py --rules "$rules" --out report soak/*/rtcd-*.jsonl
           echo "status=$?" >> "$GITHUB_OUTPUT"
-          [ -f report/summary.md ] && cat report/summary.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -f report/summary.md ]; then
+            {
+              echo "## ${{ matrix.profile }}, ${{ matrix.arch }}"
+              cat report/summary.md
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
           exit 0
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: lesson-soak-report
+          name: lesson-soak-report-${{ matrix.profile }}-${{ matrix.arch }}
           path: |
             report/report.html
+            report/summary.md
             soak/*/rtcd-*.jsonl
+            soak/*/machine.txt
+            soak/*/seed.txt
           retention-days: 30
-      - name: Fail when rtcd-rs breached a rule
-        if: steps.report.outputs.status != '0'
-        run: exit ${{ steps.report.outputs.status }}
+      - name: Fail when a soak failed, left nothing, or rtcd-rs breached a rule
+        if: always() && (matrix.profile == 'lesson' && needs.lesson.result != 'success' || matrix.profile == 'abuse' && needs.abuse.result != 'success' || steps.inputs.outputs.missing != '0' || steps.report.outputs.status != '0')
+        run: |
+          echo "soak jobs: lesson ${{ needs.lesson.result }}, abuse ${{ needs.abuse.result }}; missing measurements: ${{ steps.inputs.outputs.missing }}; report status: ${{ steps.report.outputs.status }}"
+          exit 1

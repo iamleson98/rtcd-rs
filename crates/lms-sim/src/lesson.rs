@@ -14,16 +14,27 @@
 //!     --group impaired --first 17 --students 8 --out impaired.jsonl --chrome 8099
 //! ```
 //!
+//! With `--udp-base PORT` (a multiple of four) student `k` of the process binds its media sockets to
+//! the ports `PORT + 4k` to `PORT + 4k + 3`, so that a network that shapes each participant on its own
+//! (`vendor/rtc/benchmarks/soak/netem.sh` with `NETEM_PORTS`) can tell them apart.
+//!
+//! Attacks of the lesson's own, each logged as `attack` rows into `--out` (see `lms_sim::abuse`), all
+//! seeded by `--seed` (printed, and the `seed` event): `--teacher-reconnect-every MIN` (the teacher
+//! drops its session and joins again with the same session id), `--nat-rebind-every SECS` (each
+//! student of an impaired group changes its UDP source port now and then) and `--mtu` (an impaired
+//! group sends datagrams of MTU size and over).
+//!
 //! The first `--measure` students of a process measure what they receive (the teacher's voice,
 //! camera and screen, and the student cameras) and write it every 5 s, see `lms_sim::stats`. With
-//! `--chrome PORT` the process also serves the page for a headless Chrome in the same network
-//! namespace, which joins as one more student and writes what the browser measures.
+//! `--chrome PORT` the process also serves the page for a headless Chrome (on loopback, for one in the
+//! same network namespace, or on `--chrome-bind ADDR` for one in a namespace of its own), which joins as one more student and writes what the browser measures.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use lms_sim::abuse::{LessonAttacks, Rows};
 use lms_sim::assets::Assets;
 use lms_sim::chrome;
 use lms_sim::class::{self, Ctl, Spec};
@@ -44,6 +55,12 @@ struct Args {
     measure: u32,
     talk_secs: u64,
     chrome: Option<u16>,
+    chrome_bind: String,
+    udp_base: Option<u16>,
+    seed: Option<u64>,
+    teacher_reconnect_mins: Option<u64>,
+    nat_rebind_secs: Option<u64>,
+    mtu: bool,
     call: String,
     out: PathBuf,
 }
@@ -63,6 +80,12 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
         measure: 6,
         talk_secs: 30,
         chrome: None,
+        chrome_bind: "127.0.0.1".into(),
+        udp_base: None,
+        seed: None,
+        teacher_reconnect_mins: None,
+        nat_rebind_secs: None,
+        mtu: false,
         call: "channel-lesson".into(),
         out: PathBuf::new(),
     };
@@ -70,6 +93,10 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
     while let Some(k) = it.next() {
         if k == "--teacher" {
             a.teacher = true;
+            continue;
+        }
+        if k == "--mtu" {
+            a.mtu = true;
             continue;
         }
         let v = it.next().ok_or_else(|| format!("{k} needs a value"))?;
@@ -100,6 +127,11 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--measure" => a.measure = n()? as u32,
             "--talk-secs" => a.talk_secs = n()?.max(1),
             "--chrome" => a.chrome = Some(n()? as u16),
+            "--chrome-bind" => a.chrome_bind = v.clone(),
+            "--udp-base" => a.udp_base = Some(n()? as u16),
+            "--seed" => a.seed = Some(n()?),
+            "--teacher-reconnect-every" => a.teacher_reconnect_mins = Some(n()?.max(1)),
+            "--nat-rebind-every" => a.nat_rebind_secs = Some(n()?.max(1)),
             "--call" => a.call = v.clone(),
             "--out" => a.out = v.into(),
             other => return Err(format!("unknown option {other}")),
@@ -107,6 +139,11 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
     }
     if a.http.is_empty() || a.out.as_os_str().is_empty() {
         return Err("--http and --out are required".into());
+    }
+    if (a.mtu || a.nat_rebind_secs.is_some() || a.teacher_reconnect_mins.is_some())
+        && a.seed.is_none()
+    {
+        return Err("--mtu, --nat-rebind-every and --teacher-reconnect-every need --seed".into());
     }
     Ok(a)
 }
@@ -134,13 +171,42 @@ pub async fn run(args: impl Iterator<Item = String>, assets: PathBuf) {
 
     if let Some(port) = a.chrome {
         let chrome_probe = probe(&format!("{}/chrome", a.imp), false, false);
-        chrome::serve(rtcd.clone(), a.call.clone(), chrome_probe, port)
-            .await
-            .expect("the page for Chrome is served");
+        chrome::serve(
+            rtcd.clone(),
+            a.call.clone(),
+            chrome_probe,
+            &a.chrome_bind,
+            port,
+        )
+        .await
+        .expect("the page for Chrome is served");
     }
 
     let started = Instant::now();
     let mut people = Vec::new();
+    // The attacks of the lesson's own: those on students are for the impaired group.
+    let seed = a.seed.unwrap_or_default();
+    let impaired: Vec<(String, u32)> = if a.group == "impaired" {
+        (a.first..a.first + a.students)
+            .map(|i| (format!("s{i:02}"), i))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut attacks = a.seed.map(|seed| {
+        let rows = Rows::new(sink.clone(), a.group, seed, &a.imp);
+        rows.seed_event(&format!("lesson {} seed {seed}", a.group));
+        LessonAttacks::new(
+            rows,
+            &impaired,
+            a.nat_rebind_secs,
+            a.teacher_reconnect_mins,
+            a.teacher,
+            a.mtu,
+            a.minutes,
+        )
+    });
+    let mut teacher_spec = None;
     // The teacher is on the clean network, and sends everything a teacher does.
     if a.teacher {
         let spec = Spec {
@@ -152,6 +218,7 @@ pub async fn run(args: impl Iterator<Item = String>, assets: PathBuf) {
             probe: Some(probe(&a.imp, false, false)),
             ..Default::default()
         };
+        teacher_spec = Some(spec.clone());
         people.push((
             u32::MAX,
             class::join(&rtcd, assets.clone(), &a.call, spec, 0).await,
@@ -169,6 +236,9 @@ pub async fn run(args: impl Iterator<Item = String>, assets: PathBuf) {
             watch,
             wrap: true,
             probe: Some(probe(&a.imp, i - a.first < a.measure, i == a.first)),
+            udp_base: a.udp_base.map(|b| b + 4 * (i - a.first) as u16),
+            mtu: a.mtu && a.group == "impaired",
+            seed: seed ^ u64::from(i),
             ..Default::default()
         };
         people.push((
@@ -197,6 +267,19 @@ pub async fn run(args: impl Iterator<Item = String>, assets: PathBuf) {
             _ = &mut stop => break,
         }
         let turn = ((unix_ms() / 1000 / a.talk_secs) % u64::from(a.total)) as u32;
+        if let Some(at) = attacks.as_mut() {
+            at.tick(&people);
+            if let Some(spec) = &teacher_spec
+                && at.teacher_due()
+                && let Some(pos) = people.iter().position(|(i, _)| *i == u32::MAX)
+            {
+                let (_, old) = people.remove(pos);
+                let back = at
+                    .teacher_reconnect(&rtcd, assets.clone(), &a.call, spec.clone(), old)
+                    .await;
+                people.push((u32::MAX, back));
+            }
+        }
         if speaker != Some(turn) {
             for (i, p) in &people {
                 if *i == turn || Some(*i) == speaker {
@@ -205,6 +288,9 @@ pub async fn run(args: impl Iterator<Item = String>, assets: PathBuf) {
             }
             speaker = Some(turn);
         }
+    }
+    if let Some(at) = attacks.as_mut() {
+        at.finish();
     }
     for (_, p) in people {
         p.leave().await;

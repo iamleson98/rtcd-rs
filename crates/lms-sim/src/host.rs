@@ -194,6 +194,11 @@ impl Rtcd {
 
     /// Opens a websocket as the registered client.
     pub async fn connect(&self) -> RtcdConn {
+        self.try_connect().await.expect("the websocket opens")
+    }
+
+    /// Like [`connect`](Self::connect); `None` when the websocket does not open.
+    pub async fn try_connect(&self) -> Option<RtcdConn> {
         let auth = format!(
             "Basic {}",
             base64::engine::general_purpose::STANDARD.encode(format!("{CLIENT}:{KEY}"))
@@ -203,9 +208,7 @@ impl Rtcd {
             .unwrap();
         req.headers_mut()
             .insert("Authorization", auth.parse().unwrap());
-        let (stream, _) = tokio_tungstenite::connect_async(req)
-            .await
-            .expect("the websocket opens");
+        let (stream, _) = tokio_tungstenite::connect_async(req).await.ok()?;
         let (mut write, mut read) = stream.split();
         let (tx, mut out) = mpsc::unbounded_channel::<ClientMessage>();
         let (in_tx, rx) = mpsc::unbounded_channel::<ClientMessage>();
@@ -242,7 +245,7 @@ impl Rtcd {
                 }
             }
         });
-        RtcdConn { tx, rx }
+        Some(RtcdConn { tx, rx })
     }
 
     /// The recording reports (`record_file`, `record_ended`) received on any connection so far.
