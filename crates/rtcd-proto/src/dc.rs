@@ -50,6 +50,14 @@ pub enum DcMessage {
     /// estimate says (the session recorder: it keeps what it gets). An extension of this
     /// service; the Go service never sends or receives it.
     SharpScreen(bool),
+    /// Sent to a receiver when the SFU stops sending it a sender's camera because its connection
+    /// cannot carry it (`paused`), and when it starts again. `sender_id` is the session id the
+    /// media map names for the camera. An extension of this service; the Go service never sends
+    /// it, and a client that does not know it ignores it.
+    CameraPaused {
+        sender_id: String,
+        paused: bool,
+    },
 }
 
 impl DcMessage {
@@ -65,6 +73,7 @@ impl DcMessage {
             Self::Unlock => 8,
             Self::MediaMap(_) => 9,
             Self::SharpScreen(_) => 10,
+            Self::CameraPaused { .. } => 11,
         }
     }
 
@@ -88,6 +97,13 @@ impl DcMessage {
                 z.write_all(json).expect("vec write");
                 rmp::encode::write_bin(&mut out, &z.finish().expect("vec write"))
                     .expect("vec write");
+            }
+            Self::CameraPaused { sender_id, paused } => {
+                rmp::encode::write_map_len(&mut out, 2).expect("vec write");
+                rmp::encode::write_str(&mut out, "sender_id").expect("vec write");
+                rmp::encode::write_str(&mut out, sender_id).expect("vec write");
+                rmp::encode::write_str(&mut out, "paused").expect("vec write");
+                rmp::encode::write_bool(&mut out, *paused).expect("vec write");
             }
             Self::MediaMap(map) => {
                 rmp::encode::write_map_len(&mut out, map.len() as u32).expect("vec write");
@@ -172,6 +188,24 @@ impl DcMessage {
                 field: "dc payload",
                 expected: "boolean",
             })?),
+            11 => {
+                let value = payload()?;
+                let info = as_map(&value, "camera paused")?;
+                let paused =
+                    lookup(info, "paused")
+                        .and_then(Value::as_bool)
+                        .ok_or(ProtoError::Type {
+                            field: "paused",
+                            expected: "boolean",
+                        })?;
+                let sender_id = lookup(info, "sender_id")
+                    .ok_or(ProtoError::Type {
+                        field: "sender_id",
+                        expected: "string",
+                    })
+                    .and_then(|v| as_string(v, "sender_id"))?;
+                Self::CameraPaused { sender_id, paused }
+            }
             other => return Err(ProtoError::UnknownDcMessage(other)),
         })
     }

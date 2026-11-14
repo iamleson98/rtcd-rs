@@ -284,10 +284,39 @@ fn paused_cameras_start_again_at_a_keyframe_when_the_link_has_room() {
         .filter(|s| !held.flowing(10).contains(&s.as_str()))
         .collect();
     assert!(!paused.is_empty(), "nothing was paused: {held:?}");
+    // The viewer was told of each camera still paused (the budget may have moved others on the way).
+    let notices = |c: &Class| -> Vec<(String, bool)> {
+        c.w.browsers[c.viewer]
+            .dc_frames
+            .iter()
+            .filter_map(|f| match f {
+                rtcd_proto::dc::DcMessage::CameraPaused { sender_id, paused } => {
+                    Some((sender_id.clone(), *paused))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let told = notices(&c);
+    for camera in &paused {
+        assert_eq!(
+            told.iter().rev().find(|(id, _)| id == camera),
+            Some(&(camera.clone(), true)),
+            "{camera}: {told:?}"
+        );
+    }
 
     // The link now carries everything: the paused cameras start again, one at a time.
     c.w.set_path(c.viewer, limited(20_000_000));
     let back = c.measure(60);
+    let told = notices(&c);
+    for camera in &paused {
+        assert_eq!(
+            told.iter().rev().find(|(id, _)| id == camera),
+            Some(&(camera.clone(), false)),
+            "{camera} was not told to resume: {told:?}"
+        );
+    }
     back.print("recovered", 60);
     let sent: usize = back.packets.values().sum();
     assert!(back.drops * 100 <= sent, "{} of {sent} dropped", back.drops);

@@ -162,6 +162,22 @@ fn data_channel_frames_decode_and_reencode_like_go() {
 }
 
 #[test]
+fn a_camera_pause_notice_round_trips() {
+    for paused in [true, false] {
+        let msg = DcMessage::CameraPaused {
+            sender_id: "s1".into(),
+            paused,
+        };
+        assert_eq!(DcMessage::decode(&msg.encode()).unwrap(), msg);
+    }
+    // Missing fields are refused, not guessed.
+    let mut frame = vec![0xcc, 11, 0x81];
+    rmp::encode::write_str(&mut frame, "paused").unwrap();
+    rmp::encode::write_bool(&mut frame, true).unwrap();
+    assert!(DcMessage::decode(&frame).is_err());
+}
+
+#[test]
 fn an_sdp_we_compress_inflates_back() {
     let json = br#"{"type":"answer","sdp":"v=0\r\n"}"#.to_vec();
     assert_eq!(
