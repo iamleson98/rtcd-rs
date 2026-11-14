@@ -1,7 +1,7 @@
 //! How much of this node's disk the files waiting for upload hold.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::metrics::Metrics;
 
@@ -16,6 +16,9 @@ pub struct Pending {
     files: AtomicU64,
     cap: u64,
     metrics: Arc<Metrics>,
+    /// Held across a change and its gauge update: uploads of two files end on two tasks, and the
+    /// one that changed the count first could otherwise set the gauge last, to a stale value.
+    gauge: Mutex<()>,
 }
 
 impl Pending {
@@ -25,11 +28,13 @@ impl Pending {
             files: AtomicU64::new(0),
             cap,
             metrics,
+            gauge: Mutex::new(()),
         }
     }
 
     /// A file of `n` bytes closed and waits for upload.
     pub fn add(&self, n: u64) {
+        let _gauge = self.gauge.lock().unwrap_or_else(|e| e.into_inner());
         self.files.fetch_add(1, Ordering::Relaxed);
         let now = self.bytes.fetch_add(n, Ordering::Relaxed) + n;
         self.metrics.record_pending(now);
@@ -37,6 +42,7 @@ impl Pending {
 
     /// A file of `n` bytes was uploaded or given up on, and removed.
     pub fn release(&self, n: u64) {
+        let _gauge = self.gauge.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self
             .files
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |f| {
@@ -90,5 +96,25 @@ mod tests {
         p.release(u64::MAX);
         assert_eq!(p.bytes(), 0, "a release never goes below nothing");
         assert!(m.render().contains("rtcd_record_pending_bytes 0"));
+    }
+
+    #[test]
+    fn the_gauge_ends_at_what_is_pending_when_uploads_end_together() {
+        let m = Arc::new(Metrics::new());
+        let p = Arc::new(Pending::new(u64::MAX, m.clone()));
+        for _ in 0..1000 {
+            let sizes = [1936, 1947, 2048, 4096];
+            for n in sizes {
+                p.add(n);
+            }
+            std::thread::scope(|s| {
+                for n in sizes {
+                    let p = &p;
+                    s.spawn(move || p.release(n));
+                }
+            });
+            assert_eq!(p.bytes(), 0);
+            assert!(m.render().contains("rtcd_record_pending_bytes 0"));
+        }
     }
 }
