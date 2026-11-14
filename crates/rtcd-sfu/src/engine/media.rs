@@ -725,7 +725,7 @@ impl Engine {
                 self.complete_switch(sk, sub);
             }
             for sub in pausing {
-                self.finish_pause(sub.session, sub.stream);
+                self.finish_pause(sub.session, sub.stream, now);
             }
         }
     }

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use rtcd_proto::dc::DcMessage;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
@@ -640,7 +641,7 @@ impl Engine {
             return;
         };
         if camera.level == 0 {
-            self.pause_camera(key, id);
+            self.pause_camera(key, id, now);
             return;
         }
         ds.temporal.set_limit(camera.limit(camera.level));
@@ -652,7 +653,7 @@ impl Engine {
 
     /// Stops sending a receiver a camera: at the end of the frame it is in, or at once when it is
     /// still waiting for a keyframe and nothing is sent.
-    fn pause_camera(&mut self, receiver: SessionKey, stream: u32) {
+    fn pause_camera(&mut self, receiver: SessionKey, stream: u32, now: Instant) {
         let Some(ds) = self
             .sessions
             .get_mut(receiver)
@@ -666,13 +667,13 @@ impl Engine {
         if ds.source.is_some() {
             ds.pausing = true;
         } else {
-            self.finish_pause(receiver, stream);
+            self.finish_pause(receiver, stream, now);
         }
     }
 
     /// Takes a camera out of the stream, to wait where a stream waits for its keyframe, but is not
     /// started by one.
-    pub(super) fn finish_pause(&mut self, receiver: SessionKey, stream: u32) {
+    pub(super) fn finish_pause(&mut self, receiver: SessionKey, stream: u32, now: Instant) {
         let Some(ds) = self
             .sessions
             .get_mut(receiver)
@@ -692,6 +693,7 @@ impl Engine {
         };
         ds.target = Some(held);
         ds.paused = true;
+        let sender_id = ds.publisher_session_id.clone();
         if let Some(fan) = feeding.and_then(|src| {
             self.fanout.get_mut(&SourceKey {
                 session: publisher,
@@ -707,6 +709,14 @@ impl Engine {
         {
             fan.waiting.push(sub);
         }
+        self.dc_send(
+            receiver,
+            DcMessage::CameraPaused {
+                sender_id,
+                paused: true,
+            },
+            now,
+        );
     }
 
     /// Lets a paused camera start again at the next keyframe of its sender, which is asked for.
@@ -720,6 +730,15 @@ impl Engine {
         };
         ds.paused = false;
         let publisher = ds.publisher;
+        let sender_id = ds.publisher_session_id.clone();
+        self.dc_send(
+            receiver,
+            DcMessage::CameraPaused {
+                sender_id,
+                paused: false,
+            },
+            now,
+        );
         // The camera may have another layer to be sent by now.
         self.sync_stream(receiver, publisher, TrackType::Video, now);
         let target = self
