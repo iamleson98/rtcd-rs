@@ -551,8 +551,8 @@ impl Engine {
             return;
         };
         let e = s.estimate.snapshot();
-        // A path that is down, or has just come back, is not read.
-        if camera_budget::path_unreadable(now, e.fed_at, e.resumed_at) {
+        // A path that has just come back from an outage is not read.
+        if camera_budget::path_settling(now, e.resumed_at) {
             return;
         }
         let path = ScreenInputs {
@@ -620,9 +620,25 @@ impl Engine {
         if cameras.is_empty() {
             return;
         }
-        let path = ScreenInputs {
-            other: self.screen_rate(key, now),
-            ..path
+        // A path that is down is not read, but only while the receiver is sent something its
+        // feedback would come for: one sent nothing (every camera paused, no screen share) has no
+        // feedback and says nothing of its path, which is idle, so the cameras are tried again.
+        let screen = self.screen_rate(key, now);
+        let silent = screen == 0.0 && cameras.iter().all(|c| c.level == 0);
+        let stopped = camera_budget::feedback_stopped(now, e.fed_at);
+        if stopped && !silent {
+            return;
+        }
+        let path = if stopped {
+            ScreenInputs {
+                queue: Some(0.0),
+                ..Default::default()
+            }
+        } else {
+            ScreenInputs {
+                other: screen,
+                ..path
+            }
         };
         let before: Vec<usize> = cameras.iter().map(|c| c.level).collect();
         let Some(s) = self.sessions.get_mut(key) else {
@@ -645,7 +661,7 @@ impl Engine {
                 n if n < camera.steps.count() => thinned += 1,
                 _ => {}
             }
-            if camera.level != was {
+            if camera.level != was || camera.off_step() {
                 self.apply_camera_level(key, id, camera, now);
             }
         }

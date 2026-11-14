@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use rtcd_proto::MessageType;
+use rtcd_sfu::camera_budget::MAX_PAUSE;
 use rtcd_sfu::config::EngineConfig;
 use rtcd_sfu::ids::{TrackType, parse_track_id};
 use rtcd_sfu::vp8::Descriptor;
@@ -33,6 +34,10 @@ const KEYFRAME_EVERY: u32 = 2 * FPS;
 const LARGE_PACKETS: usize = 3 * FRAME_PACKETS;
 const LARGE_KEYFRAME_PACKETS: usize = 3 * KEYFRAME_PACKETS;
 const LINK: u64 = 2_500_000;
+/// The longest wait after a step that failed (`layers::MAX_BACKOFF`), and how long a step is on
+/// trial (`layers::TRIAL`).
+const LONGEST_WAIT: Duration = Duration::from_secs(20);
+const TRIAL: Duration = Duration::from_secs(3);
 
 /// A viewer, the teacher and the students, and what the viewer was sent.
 struct Class {
@@ -456,10 +461,10 @@ fn a_link_that_swings_a_tenth_either_way_moves_no_camera_back_and_forth() {
         "{} of {sent} dropped",
         seen.drops
     );
-    // A camera paused for ten seconds is tried again where it fits the link's rate, and is paused
-    // again when the narrow half of the swing does not carry it: a keyframe each time.
+    // A camera is tried again only where it fits the link's rate with a tenth to spare, which the
+    // narrow half of the swing carries: one that does not fit is not tried at all.
     assert!(
-        seen.keyframe_requests <= 6,
+        seen.keyframe_requests <= 3,
         "{} keyframes asked",
         seen.keyframe_requests
     );
@@ -893,7 +898,7 @@ fn an_outage_is_not_taken_for_congestion() {
     // Four cameras a link of 2.5 Mb/s carries with room to spare. The path then drops everything
     // both ways for five seconds: the first feedback after it reports every packet sent meanwhile
     // as lost, which says nothing of what the link carries.
-    let mut c = Class::of(World::new(), limited(LINK), true, 3);
+    let mut c = Class::of(World::with_config(budget_on()), limited(LINK), true, 3);
     c.run(25);
     let before = c.measure(5);
     assert!(c.all_whole(&before), "{before:?}");
@@ -927,7 +932,7 @@ fn a_link_that_flaps_never_pauses_the_host_nor_holds_a_camera_back_for_long() {
     c.run(20);
     let during = flap(&mut c, 3_000_000, 300_000, 60);
     c.w.set_path(c.viewer, limited(20_000_000));
-    let after = c.timeline(30);
+    let after = c.timeline(100);
     let longest: Vec<usize> = (0..c.senders.len())
         .map(|k| c.longest_pause(&during, k))
         .collect();
@@ -943,22 +948,63 @@ fn a_link_that_flaps_never_pauses_the_host_nor_holds_a_camera_back_for_long() {
          {flowing:?}, is whole from {whole:?}"
     );
     assert_eq!(longest[0], 0, "the host's camera was paused");
-    // A camera paused for ten seconds is tried at its lowest step the next time the path has
-    // nothing queued, and the trial that fails (the narrow half comes) is waited out.
+    // A camera paused for MAX_PAUSE is tried at its lowest step the next time the path has
+    // nothing queued, and the trial that fails (the narrow half comes) is waited out for at most
+    // the longest wait after a step that failed: the longest a camera is paused is those two and
+    // two trials' worth of seconds.
+    let most = (MAX_PAUSE + LONGEST_WAIT + 2 * TRIAL).as_secs() as usize;
     assert!(
-        longest.iter().all(|&n| n <= 35),
-        "pauses over thirty-five seconds: {longest:?}"
+        longest.iter().all(|&n| n <= most),
+        "pauses over {most} seconds: {longest:?}"
     );
+    // The trial that failed last (in the last narrow half) is waited out, at the longest.
+    let back = (LONGEST_WAIT + TRIAL).as_secs() as usize;
     assert!(
-        flowing.is_some_and(|s| s <= 15),
+        flowing.is_some_and(|s| s <= back),
         "every camera flows from second {flowing:?} after the flap"
     );
+    // Cameras are taken up one at a time (each needs the path to stay clear for a few seconds,
+    // and a step or two each), so being whole again takes a while longer.
+    assert!(
+        whole.is_some_and(|s| s <= 90),
+        "every camera is whole from second {whole:?} after the flap"
+    );
+}
+
+#[test]
+fn a_viewer_that_is_sent_nothing_has_its_paused_cameras_tried_again() {
+    // The host's camera is not sent to the viewer (it is off), the viewer's link carries none of
+    // the three students' cameras, and nobody speaks: every camera is paused, nothing is sent, and
+    // so no feedback comes. That says nothing of the link, and when it opens, the cameras return.
+    let mut c = Class::of(World::with_config(budget_on()), limited(300_000), true, 3);
+    let students: Vec<String> = (0..3).map(|n| format!("session-student{n}")).collect();
+    let subscription = serde_json::json!({ "session_ids": students, "low": [] });
+    c.w.signal(
+        c.viewer,
+        MessageType::VideoSubscribe,
+        serde_json::to_vec(&subscription).unwrap(),
+    );
+    // Every camera is paused after a while; one is tried now and then (and paused again).
+    c.run(30);
+    let mut quiet = false;
+    for _ in 0..60 {
+        quiet = c.measure(3).packets.is_empty();
+        if quiet {
+            break;
+        }
+    }
+    assert!(quiet, "every camera was never paused");
+    c.w.set_path(c.viewer, limited(20_000_000));
+    c.run(40);
+    let back = c.measure(10);
+    back.print("a silent viewer, link open", 10);
+    assert_eq!(back.flowing(10).len(), 3, "{back:?}");
 }
 
 /// What a lesson of the teacher and four students, each camera a single layer of 528 kb/s, and
 /// the teacher's screen share, sends to a viewer behind `link`.
 fn five_cameras_and_a_screen(link: u64) -> Class {
-    let mut c = Class::of(World::new(), limited(link), true, 4);
+    let mut c = Class::of(World::with_config(budget_on()), limited(link), true, 4);
     c.rates = vec![[528_000, 0]; 5];
     c.w.share_screen(c.senders[0]);
     c.screen = true;
@@ -1027,31 +1073,51 @@ fn a_lesson_with_two_layers_pauses_nobody_where_the_small_layers_fit() {
 }
 
 #[test]
-fn a_lesson_with_two_layers_never_pauses_the_host_on_a_link_for_its_small_layer_and_a_few_more() {
-    // 1 Mb/s carries the small layers of all eight cameras with their frames thinned, but the
-    // budget gives the host's camera what it asks for first (its large layer, 600 kb/s), which
-    // leaves less than the students' small layers need: some students are paused.
-    let mut c = Class::production(limited(1_000_000));
+fn a_lesson_with_two_layers_pauses_nobody_on_a_link_for_all_its_small_layers_and_a_little_more() {
+    // 1.5 Mb/s carries the small layers of all eight cameras (1.2 Mb/s) with room to spare, with
+    // their frames thinned: the cameras are thinned or on their small layers, none is paused.
+    let mut c = Class::production(limited(1_500_000));
     c.run(90);
     let line = c.timeline(30);
     let (at_once, seconds) = paused_in(&c, &line);
-    eprintln!("production lesson at 1 Mb/s: {at_once} paused at once, {seconds} camera-seconds");
-    assert_eq!(c.longest_pause(&line, 0), 0, "the host's camera was paused");
+    eprintln!("production lesson at 1.5 Mb/s: {at_once} paused at once, {seconds} camera-seconds");
+    assert_eq!(seconds, 0, "a camera was paused");
 }
 
-#[test]
-fn a_lesson_with_two_layers_pauses_only_students_where_not_even_all_the_small_layers_fit() {
-    let mut c = Class::production(limited(500_000));
+/// The longest pauses of the students of a lesson of two layers on `link`, and whether the host was
+/// ever paused or sent its large layer.
+fn narrow_lesson(link: u64) -> (Vec<usize>, usize, usize) {
+    let mut c = Class::production(limited(link));
     c.run(40);
     let from = c.w.browsers[c.viewer].rtp.len();
     let line = c.timeline(30);
     let students: Vec<usize> = (1..c.senders.len())
         .map(|k| c.longest_pause(&line, k))
         .collect();
-    eprintln!("production lesson at 0.5 Mb/s: students' longest pauses {students:?} s");
-    assert_eq!(c.longest_pause(&line, 0), 0, "the host's camera was paused");
-    assert!(students.iter().any(|&n| n > 0), "no student was paused");
     let teacher = c.teacher_packets(from);
     let large = teacher.iter().filter(|&&(l, _)| l == Layer::High).count();
+    (students, c.longest_pause(&line, 0), large)
+}
+
+#[test]
+fn a_lesson_with_two_layers_on_half_a_megabit_holds_the_host_on_its_small_layer() {
+    // The lowest steps of all eight cameras (a base layer of each small layer) fit, or all but one:
+    // the host, whose large layer would not leave the others room, is on its small one.
+    let (students, host_paused, large) = narrow_lesson(500_000);
+    eprintln!("production lesson at 0.5 Mb/s: students' longest pauses {students:?} s");
+    assert_eq!(host_paused, 0, "the host's camera was paused");
+    assert!(
+        students.iter().filter(|&&n| n > 0).count() <= 1,
+        "{students:?}"
+    );
+    assert_eq!(large, 0, "the host was sent its large layer");
+}
+
+#[test]
+fn a_lesson_with_two_layers_pauses_only_students_where_not_even_all_the_lowest_steps_fit() {
+    let (students, host_paused, large) = narrow_lesson(300_000);
+    eprintln!("production lesson at 0.3 Mb/s: students' longest pauses {students:?} s");
+    assert_eq!(host_paused, 0, "the host's camera was paused");
+    assert!(students.iter().any(|&n| n > 0), "no student was paused");
     assert_eq!(large, 0, "the host was sent its large layer");
 }

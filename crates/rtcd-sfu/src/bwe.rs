@@ -330,11 +330,14 @@ impl PathMeter {
         }
     }
 
-    /// Forgets what arrived: the path was down, and what it delivered before says nothing of what
-    /// it delivers now.
+    /// Forgets what arrived, and the rates the bursts arrived at: the path was down, and what it
+    /// delivered before says nothing of what it delivers now (it may be another route altogether,
+    /// a phone that moved from its wifi to the mobile network).
     fn forget_arrivals(&mut self) {
         self.arrivals.clear();
         self.arrived_bytes = 0;
+        self.train = Train::default();
+        self.trains.clear();
     }
 
     /// The rate of the narrowest link: the median of what the last bursts arrived at.
@@ -735,6 +738,33 @@ mod tests {
         gcc.on_reports(late, &batch(100, 2, late));
         assert_eq!(estimate.snapshot().resumed_at, None);
         assert_eq!(estimate.snapshot().delivery, Some(0.75));
+    }
+
+    /// Frames of 10 packets of 1000 bytes every 100 ms from `from` to `to` (frames), over a link
+    /// that takes `ms_a_packet` a packet, fed as they arrive.
+    fn frames(gcc: &mut SharedGcc, t0: Instant, from: u64, to: u64, ms_a_packet: u64) {
+        for frame in from..to {
+            let at = frame * 100;
+            let reports: Vec<_> = (0..10)
+                .map(|n| timed(t0, at, 115 + n * ms_a_packet))
+                .collect();
+            gcc.on_reports(t0 + Duration::from_millis(at + 115 + 100), &reports);
+        }
+    }
+
+    #[test]
+    fn the_rate_of_the_narrowest_link_before_an_outage_is_not_the_rate_after_it() {
+        let (mut gcc, estimate) = SharedGcc::new(300_000.0, 100_000.0, 4_000_000.0);
+        let t0 = Instant::now();
+        // 1.6 Mbit/s, then the path is down for ten seconds and comes back on a link of 4.
+        frames(&mut gcc, t0, 0, 20, 5);
+        let before = estimate.snapshot().capacity.expect("measured");
+        assert!((1_550_000.0..1_650_000.0).contains(&before), "{before}");
+        frames(&mut gcc, t0, 120, 121, 2);
+        assert_eq!(estimate.snapshot().capacity, None, "the old rate is gone");
+        frames(&mut gcc, t0, 121, 140, 2);
+        let after = estimate.snapshot().capacity.expect("measured again");
+        assert!((3_800_000.0..4_200_000.0).contains(&after), "{after}");
     }
 
     #[test]

@@ -28,9 +28,10 @@
 //! link set is not kept long after the link has changed.
 //!
 //! An outage is not a measurement. Both directions drop everything, and the first feedback after it
-//! reports every packet sent meanwhile as lost: while the feedback has stopped, and for a few
-//! seconds after it comes back (see [`path_unreadable`]) the cameras are left as they are, and the
-//! first feedback to follow says nothing of the path (see `bwe`).
+//! reports every packet sent meanwhile as lost: while the feedback has stopped (see
+//! [`feedback_stopped`]), and for a few seconds after it comes back (see [`path_settling`]) the
+//! cameras are left as they are, and the first feedback to follow says nothing of the path (see
+//! `bwe`).
 
 use std::time::{Duration, Instant};
 
@@ -55,21 +56,26 @@ const CUT_SETTLES: Duration = Duration::from_millis(3500);
 /// How long after the cameras were cut the narrowest link's rate (see `bwe`) is believed to be
 /// what the cameras may reach. It reads low on a fast link (bursts of a few packets do not spread
 /// over it) and is stale once the path has changed, so it stops holding a camera back after this,
-/// and the next step is tried instead.
+/// and the next step is tried instead. A step beyond what the narrowest link carries fails, and
+/// costs the receiver a burst of what the link drops: on a link that is narrow for good, this is
+/// how often that happens.
 const CEILING_TRUST: Duration = Duration::from_secs(60);
+/// A step taken up that the path has carried this long without congestion has held: the wait that
+/// grew with the steps that failed before it starts over.
+const STEP_HELD: Duration = FORGET_AFTER;
 /// A camera paused this long is tried at its lowest step wherever the narrowest link carries it
 /// (see [`REACH_SHARE`]), whatever the budget says.
 pub const MAX_PAUSE: Duration = Duration::from_secs(10);
 /// A cut takes the cameras down to what the path delivered, but never below this share of what
 /// was sent.
 const MOST_CUT: f64 = 0.5;
-/// ...with no margin, against this share of what the narrowest link carries.
-const REACH_SHARE: f64 = 0.95;
-/// A screen share of more than this share of what the narrowest link carries is a picture a camera
-/// is not given the last of the link at the cost of (see [`CameraBudget::pause_trial`]).
-const SCREEN_HEAVY: f64 = 10.0;
-/// With no congestion for this long, a wait that grew with each step that failed starts over.
-const BACKOFF_RESETS_AFTER: Duration = Duration::from_secs(10);
+/// ...with no margin, against this share of what the narrowest link carries: a tenth is left, so
+/// that a link whose rate swings a tenth either way carries the camera in its narrow half, and a
+/// camera that does not is not tried again and again.
+const REACH_SHARE: f64 = 0.9;
+/// A camera paused for [`MAX_PAUSE`] is tried with room left for the screen share's keyframes:
+/// the screen is counted this many times over against what the narrowest link carries.
+const SCREEN_KEYFRAME_ROOM: f64 = 1.2;
 
 /// For this long after the feedback comes back from an outage, what the path says is not read: the
 /// receiver asks for everything lost again (the node's whole retransmission history, for every
@@ -77,12 +83,17 @@ const BACKOFF_RESETS_AFTER: Duration = Duration::from_secs(10);
 /// with what the cameras cost.
 const OUTAGE_SETTLES: Duration = Duration::from_secs(4);
 
-/// Whether what the receiver's feedback says of its path is not read now: it has stopped (an
-/// outage: what the path said last is not what it says now), or has just come back (see
-/// [`OUTAGE_SETTLES`]).
-pub fn path_unreadable(now: Instant, fed_at: Option<Instant>, resumed_at: Option<Instant>) -> bool {
+/// Whether the receiver's feedback has stopped (an outage: what the path said last is not what it
+/// says now). A receiver that is sent nothing has no feedback to give either, which says nothing
+/// of its path: only where something is sent does it mean an outage.
+pub fn feedback_stopped(now: Instant, fed_at: Option<Instant>) -> bool {
     fed_at.is_some_and(|t| now.saturating_duration_since(t) > OUTAGE_GAP)
-        || resumed_at.is_some_and(|t| now.saturating_duration_since(t) < OUTAGE_SETTLES)
+}
+
+/// Whether the feedback has just come back from an outage (see [`OUTAGE_SETTLES`]): what the path
+/// says then is not read.
+pub fn path_settling(now: Instant, resumed_at: Option<Instant>) -> bool {
+    resumed_at.is_some_and(|t| now.saturating_duration_since(t) < OUTAGE_SETTLES)
 }
 
 /// Who is given room first: the host's camera, then those of the voices heard now, then the
@@ -205,6 +216,8 @@ pub struct Camera {
     pub steps: CameraSteps,
     /// What the receiver is sent now: 0 is nothing (paused), `n` is the `n`th of `steps`.
     pub level: usize,
+    /// The layer and temporal layer the receiver is sent now.
+    at: Rung,
     /// For how long the camera has been paused (nothing when it is not).
     pub paused_for: Duration,
 }
@@ -227,8 +240,17 @@ impl Camera {
             rank,
             steps,
             level,
+            at: current,
             paused_for: paused.unwrap_or_default(),
         }
+    }
+
+    /// Whether the camera is sent at a rung that is not the one of its level: it was at none of
+    /// the steps (the large layer thinned while only that flowed, and the small one flows now) and
+    /// was counted at the top, so it has to be moved to it for the receiver to be sent what the
+    /// budget counts.
+    pub fn off_step(&self) -> bool {
+        self.level > 0 && self.rung(self.level) != self.at
     }
 
     /// Whether the camera has been paused for [`MAX_PAUSE`].
@@ -306,7 +328,10 @@ impl Load {
 }
 
 /// Gives each camera the most that fits in `limit` bits per second (`None`: all of it), the host's
-/// first and then the others by rank and in the order they come in. Of the cameras that are not at the top,
+/// first and then the others by rank and in the order they come in, but no camera a step beyond
+/// its lowest at the price of pausing one that flows: the cameras that fit at their lowest steps
+/// are given those first, and what is left goes to the steps above them in the same order. Of the
+/// cameras that are not at the top,
 /// one at most (the first in that order) is taken up, and only when `raise` allows it (`Some`:
 /// the most the cameras may cost then) and everything sent now and the step fit [`RAISE_MARGIN`]
 /// times over in `limit`: rank says who goes up first and who is cut first, never who takes the
@@ -316,10 +341,12 @@ impl Load {
 ///
 /// The cameras that have been paused for [`MAX_PAUSE`] take that one step before the others, up to
 /// their lowest, whatever `limit` says and the path having stayed clear or not, when `trial` allows
-/// it (`Some`: the most the cameras may cost, what the narrowest link carries), as many as fit in
-/// it with everything sent: they flow at the lowest rate they have instead of waiting for a path
+/// it (`Some`: the most the cameras may cost, what the narrowest link carries, or infinite while
+/// that is not known, when it must fit [`RAISE_MARGIN`] times over in `limit` too), as many as fit
+/// in it with everything sent: they flow at the lowest rate they have instead of waiting for a path
 /// that a link which flaps never leaves clear, and a step up after it is taken by none of the
-/// others.
+/// others. Where that is not known, one at a time (the first, by rank, of those that fit): what
+/// they send on starting would be the flood of all of them at once.
 pub fn allocate(
     limit: Option<f64>,
     mut raise: Option<f64>,
@@ -333,17 +360,39 @@ pub fn allocate(
     let sent: f64 = cameras.iter().map(|c| c.cost(c.level)).sum();
     let mut tried = vec![false; cameras.len()];
     if let Some(reach) = trial {
+        // Where the link is not read (`reach` is not a number), one camera at a time, and only where
+        // the limit has room for it too: nothing says how many the link carries.
+        let known = reach.is_finite();
         let mut total = sent;
         for &i in &order {
-            if cameras[i].long_paused() && total + cameras[i].cost(1) <= reach {
-                total += cameras[i].cost(1);
+            let after = total + cameras[i].cost(1);
+            if cameras[i].long_paused()
+                && after <= reach
+                && (known || after * RAISE_MARGIN <= limit)
+            {
+                total = after;
                 tried[i] = true;
                 raise = None;
+                if !known {
+                    break;
+                }
             }
         }
     }
+    // What the cameras after each in `order` that flow now need at the least: a step beyond its
+    // lowest is not given to a camera at the price of pausing one of them.
+    let mut keep = vec![0.0; cameras.len() + 1];
+    for (n, &i) in order.iter().enumerate().rev() {
+        let c = &cameras[i];
+        keep[n] = keep[n + 1]
+            + if c.level > 0 && !tried[i] {
+                c.cost(1)
+            } else {
+                0.0
+            };
+    }
     let mut given = 0.0;
-    for i in order {
+    for (n, i) in order.into_iter().enumerate() {
         let c = &mut cameras[i];
         let before = c.level;
         if tried[i] {
@@ -351,8 +400,11 @@ pub fn allocate(
             c.level = 1;
             continue;
         }
+        let reserve = keep[n + 1];
         let mut level = c.top();
         while level > 0 {
+            // The lowest step is given whatever the cameras after it need.
+            let needed = given + c.cost(level) + if level > 1 { reserve } else { 0.0 };
             let fits = if level > before {
                 // Taking a camera up adds to everything sent now, whatever its rank: it never
                 // displaces a camera that flows.
@@ -362,9 +414,9 @@ pub fn allocate(
                         total <= most
                             && c.switch_cost(before, level) <= (most - total) * KEYFRAME_DRAIN
                     }) && total * RAISE_MARGIN <= limit
-                        && given + c.cost(level) <= limit
+                        && needed <= limit
             } else {
-                given + c.cost(level) <= limit
+                needed <= limit
             };
             if fits {
                 break;
@@ -399,18 +451,19 @@ pub struct CameraBudget {
     /// carries (less the screen), when that is known.
     ceiling: Option<f64>,
     /// The most the cameras may cost for a camera paused too long to be tried (see
-    /// [`MAX_PAUSE`]): what the narrowest link carries, less the screen; unbounded while unknown.
+    /// [`MAX_PAUSE`]): what the narrowest link carries, less the screen and room for its
+    /// keyframes; unbounded while unknown.
     reach: f64,
     /// Whether the last review found the path congested, or something standing queued on it.
     unsteady: bool,
-    /// Whether the screen share the receiver is sent takes over a tenth of what its narrowest link
-    /// carries.
-    screen_heavy: bool,
     /// When a step may be tried again, and the wait after the next failure.
     raise_after: Option<Instant>,
     backoff: Duration,
     /// Since when the cameras have been held without trouble.
     calm_since: Option<Instant>,
+    /// Since when the last step has held without trouble (nothing while none has been taken since
+    /// the path was last congested).
+    held_since: Option<Instant>,
 }
 
 impl Default for CameraBudget {
@@ -427,10 +480,10 @@ impl Default for CameraBudget {
             ceiling: None,
             reach: f64::INFINITY,
             unsteady: false,
-            screen_heavy: false,
             raise_after: None,
             backoff: INITIAL_BACKOFF,
             calm_since: None,
+            held_since: None,
         }
     }
 }
@@ -441,13 +494,12 @@ impl CameraBudget {
     }
 
     /// What a camera paused for [`MAX_PAUSE`] may be tried against (see [`allocate`]), unless the
-    /// path is congested or holds a queue, a cut is being waited out, the last step that failed has
-    /// not been waited out, or a screen share takes over a tenth of the link: a camera is not given the
-    /// last of what is left then, the screen's picture would break instead (see `ScreenLevel`).
+    /// path is congested or holds a queue, a cut is being waited out, or the last step that failed
+    /// has not been waited out. The screen share is counted in what is left, with room for its
+    /// keyframes (see [`SCREEN_KEYFRAME_ROOM`]).
     pub fn pause_trial(&self, now: Instant) -> Option<f64> {
         (self.limit.is_some()
             && !self.unsteady
-            && !self.screen_heavy
             && self.hold_until.is_none_or(|t| now >= t)
             && self.raise_after.is_none_or(|t| now >= t))
         .then_some(self.reach)
@@ -480,18 +532,18 @@ impl CameraBudget {
             .min(Duration::from_secs(2));
         self.last = Some(now);
         self.ceiling = path.capacity.map(|c| c * CAPACITY_SHARE - path.other);
-        self.reach = path
-            .capacity
-            .map_or(f64::INFINITY, |c| c * REACH_SHARE - path.other);
+        self.reach = path.capacity.map_or(f64::INFINITY, |c| {
+            c * REACH_SHARE - path.other * SCREEN_KEYFRAME_ROOM
+        });
         let room = path
             .capacity
             .is_some_and(|c| c * CAPACITY_SHARE >= (load.sent + path.other) * LOSS_ROOM);
         let congested = self.congested(now, path, room);
         self.unsteady = congested || !path.empty();
-        self.screen_heavy = path.capacity.is_some_and(|c| path.other * SCREEN_HEAVY > c);
         if congested {
             self.clear_since = None;
             self.calm_since = None;
+            self.held_since = None;
             if self.trial_until.take().is_some_and(|t| now < t) {
                 self.raise_after = Some(now + self.backoff);
                 self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
@@ -516,6 +568,16 @@ impl CameraBudget {
                 self.cut_at = Some(now);
             }
         } else {
+            // A step that held (the path stayed calm for [`STEP_HELD`] after it): the wait that
+            // grew with the steps before it starts over. Not on the time the path has been calm:
+            // the wait that has grown is itself spent calm, and would be started over by it.
+            if self
+                .held_since
+                .is_some_and(|t| now.saturating_duration_since(t) >= STEP_HELD)
+            {
+                self.held_since = None;
+                self.backoff = INITIAL_BACKOFF;
+            }
             // Cameras that move more than they did (a still student starts to gesture) cost more
             // without the path having said anything: the limit follows what is sent while it is
             // not congested, so nothing is lowered then.
@@ -557,7 +619,9 @@ impl CameraBudget {
         }
         if self.hold_until.is_none_or(|t| now >= t) {
             let seen = path.acked.map_or(0.0, |a| a - path.other).max(load.sent);
-            let grown = limit * (1.0 + GROWTH_PER_SECOND * elapsed.as_secs_f64());
+            // From at least what the cheapest step costs: a limit of nothing (every camera paused
+            // and no host's camera to hold it up) grows at nothing.
+            let grown = limit.max(load.next) * (1.0 + GROWTH_PER_SECOND * elapsed.as_secs_f64());
             // Enough to take the cheapest camera step up, with the margin that takes.
             let above = (load.sent + load.next) * RAISE_MARGIN;
             // A narrowest link known to carry more is trusted at once.
@@ -567,9 +631,6 @@ impl CameraBudget {
             self.limit = Some(grown.min((GROWTH_CEILING * seen).max(above)).max(link));
         }
         let calm = now.saturating_duration_since(*self.calm_since.get_or_insert(now));
-        if calm >= BACKOFF_RESETS_AFTER {
-            self.backoff = INITIAL_BACKOFF;
-        }
         let clear_for = self
             .clear_since
             .map_or(Duration::ZERO, |t| now.saturating_duration_since(t));
@@ -603,6 +664,7 @@ impl CameraBudget {
     /// A camera was taken up a step: each step earns the next on its own.
     pub fn raised(&mut self, now: Instant) {
         self.trial_until = Some(now + TRIAL);
+        self.held_since = Some(now);
         self.expect_keyframes(now);
         self.clear_since = None;
         self.calm_since = None;
@@ -684,15 +746,40 @@ mod tests {
     #[test]
     fn a_camera_with_temporal_layers_gives_up_frames_before_it_is_paused() {
         let mut cameras = class(3, layered());
-        // Two cameras and a bit more: the host whole, the first student whole, the second down to
-        // its base and second layers (three fifths of its bits), the third has nothing left.
+        // Two cameras and a bit more: the lowest step of every camera (a base layer, 160 kb/s)
+        // fits, so none is paused; the host has what is above its lowest step first (all of it),
+        // then the first student (its base and second layers, three fifths of its bits), and
+        // what is left goes to the next.
         allocate(Some(1_040_000.0), None, None, &mut cameras);
-        assert_eq!(levels(&cameras), vec![3, 2, 0, 3]);
-        assert_eq!(cameras[1].rung(2).tid, Some(1));
-        // A little less, and the second one is down to its base layer.
+        assert_eq!(levels(&cameras), vec![2, 2, 1, 3]);
+        assert_eq!(cameras[0].rung(2).tid, Some(1));
+        // A little less, and the first student gives up its second layer for the others.
         allocate(Some(960_000.0), None, None, &mut cameras);
-        assert_eq!(levels(&cameras), vec![3, 1, 0, 3]);
+        assert_eq!(levels(&cameras), vec![2, 1, 1, 3]);
         assert_eq!(cameras[1].rung(1).tid, Some(0));
+        // A camera is paused only where not even its lowest step fits.
+        allocate(Some(560_000.0), None, None, &mut cameras);
+        assert_eq!(levels(&cameras), vec![1, 1, 0, 1]);
+    }
+
+    #[test]
+    fn a_camera_is_not_given_a_step_above_its_lowest_at_the_price_of_pausing_another() {
+        // The host's camera could be sent whole, which leaves the students too little for their
+        // lowest steps: it is held to its lowest too, and none is paused.
+        let mut cameras = class(7, simulcast());
+        allocate(Some(1_700_000.0), None, None, &mut cameras);
+        assert!(
+            cameras.iter().all(|c| c.level == 1),
+            "{:?}",
+            levels(&cameras)
+        );
+        // With room for all the lowest steps and more, the host has the more first.
+        allocate(Some(3_200_000.0), Some(f64::INFINITY), None, &mut cameras);
+        assert_eq!(levels(&cameras).iter().filter(|&&l| l == 0).count(), 0);
+        assert_eq!(
+            cameras.iter().find(|c| c.rank == RANK_HOST).unwrap().level,
+            2
+        );
     }
 
     #[test]
@@ -887,8 +974,11 @@ mod tests {
                 steps += 1;
             }
         }
-        // The wait after a step that failed doubles up to MAX_BACKOFF: one step in twenty seconds.
-        assert!(steps <= 10, "{steps} steps in three minutes");
+        // The wait after a step that failed doubles up to MAX_BACKOFF: one step in twenty seconds
+        // (the first waits are shorter, and a step takes a cut's hold and a clear path to come to).
+        // Before the wait was capped at two minutes the bound was five.
+        let most = 180 / MAX_BACKOFF.as_secs();
+        assert!(steps <= most, "{steps} steps in three minutes, over {most}");
     }
 
     #[test]
@@ -906,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn the_narrowest_links_rate_holds_a_camera_back_for_a_minute_after_a_cut() {
+    fn the_narrowest_links_rate_holds_a_camera_back_for_a_while_after_a_cut() {
         let mut b = CameraBudget::default();
         let mut t = Instant::now();
         b.review(t, &congested(), load(3_300_000.0, 3_300_000.0));
@@ -920,9 +1010,9 @@ mod tests {
         b.review(t, &path, load(2_000_000.0, 3_300_000.0));
         let held = b.raise_ceiling(t).expect("may raise");
         assert!((held - 2_400_000.0 * CAPACITY_SHARE).abs() < 1.0, "{held}");
-        // A minute of steps taken one after the other, none refused: the narrowest link's rate no
-        // longer holds the next back.
-        for second in 0..63 {
+        // Steps taken one after the other, none refused, until the rate has been trusted as long as
+        // it is: it no longer holds the next back.
+        for second in 0..CEILING_TRUST.as_secs() + 3 {
             t += Duration::from_secs(1);
             b.review(t, &path, load(2_000_000.0, 3_300_000.0));
             if second % 5 == 4 {
@@ -1340,24 +1430,16 @@ mod tests {
     #[test]
     fn nothing_is_read_while_the_feedback_has_stopped_or_has_just_come_back() {
         let t = Instant::now();
-        assert!(!path_unreadable(t, None, None), "nothing is known yet");
-        assert!(!path_unreadable(t + OUTAGE_GAP, Some(t), None));
-        assert!(path_unreadable(
+        assert!(!feedback_stopped(t, None), "nothing is known yet");
+        assert!(!feedback_stopped(t + OUTAGE_GAP, Some(t)));
+        assert!(feedback_stopped(
             t + OUTAGE_GAP + Duration::from_millis(1),
-            Some(t),
-            None
+            Some(t)
         ));
         let back = t + Duration::from_secs(10);
-        assert!(path_unreadable(
-            back + OUTAGE_SETTLES / 2,
-            Some(back),
-            Some(back)
-        ));
-        assert!(!path_unreadable(
-            back + OUTAGE_SETTLES,
-            Some(back + OUTAGE_SETTLES),
-            Some(back)
-        ));
+        assert!(!path_settling(back, None));
+        assert!(path_settling(back + OUTAGE_SETTLES / 2, Some(back)));
+        assert!(!path_settling(back + OUTAGE_SETTLES, Some(back)));
     }
 
     #[test]
@@ -1381,11 +1463,15 @@ mod tests {
             b.review(t, &congested(), load(2_400_000.0, 3_300_000.0));
         }
         let last = waits.last().unwrap();
+        // 5, 10 and then 20 seconds (and what a cut and a clear path take), no more and no less:
+        // the wait is not started over by the calm it is waited out in.
+        assert!(*last >= MAX_BACKOFF, "{waits:?}");
         assert!(*last <= MAX_BACKOFF + HOLD + CLEAR_FOR, "{waits:?}");
+        assert!(waits.windows(2).all(|w| w[0] <= w[1]), "{waits:?}");
     }
 
     #[test]
-    fn the_wait_starts_over_after_ten_seconds_without_congestion() {
+    fn the_wait_starts_over_only_once_a_step_has_held() {
         let mut b = CameraBudget::default();
         let mut t = Instant::now();
         b.review(t, &congested(), load(3_300_000.0, 3_300_000.0));
@@ -1393,10 +1479,22 @@ mod tests {
         t += Duration::from_secs(1);
         b.review(t, &congested(), load(3_300_000.0, 3_300_000.0));
         assert!(b.backoff > INITIAL_BACKOFF);
-        for _ in 0..=BACKOFF_RESETS_AFTER.as_secs() {
+        // Calm for as long as the longest wait: the wait does not start over for that, or a link
+        // that flickers would never wait the longest.
+        for _ in 0..=MAX_BACKOFF.as_secs() {
             t += Duration::from_secs(1);
             b.review(t, &clear(2_000_000.0), load(2_000_000.0, 3_300_000.0));
         }
+        assert!(b.backoff > INITIAL_BACKOFF);
+        // A step taken then that holds does.
+        b.raised(t);
+        for _ in 1..STEP_HELD.as_secs() {
+            t += Duration::from_secs(1);
+            b.review(t, &clear(2_000_000.0), load(2_000_000.0, 3_300_000.0));
+            assert!(b.backoff > INITIAL_BACKOFF, "too soon");
+        }
+        t += Duration::from_secs(1);
+        b.review(t, &clear(2_000_000.0), load(2_000_000.0, 3_300_000.0));
         assert_eq!(b.backoff, INITIAL_BACKOFF);
     }
 
@@ -1485,6 +1583,154 @@ mod tests {
         // ...nor where the trial is not allowed.
         allocate(Some(CAMERA as f64), None, None, &mut cameras);
         assert_eq!(levels(&cameras), vec![1, 0]);
+    }
+
+    #[test]
+    fn with_no_reading_of_the_link_one_paused_camera_comes_back_per_review() {
+        let paused = || {
+            let mut cameras = vec![Camera::new(RANK_HOST, plain(), None, WHOLE)];
+            cameras.extend((0..4).map(|_| paused_for(RANK_WATCHED, 10)));
+            cameras
+        };
+        let room = 10.0 * CAMERA as f64;
+        let mut cameras = paused();
+        for returned in 1..=4 {
+            allocate(Some(room), None, Some(f64::INFINITY), &mut cameras);
+            assert_eq!(
+                cameras.iter().filter(|c| c.level > 0).count(),
+                1 + returned,
+                "{:?}",
+                levels(&cameras)
+            );
+            // The ones that came back are not paused any more, the others still are.
+            for c in cameras.iter_mut().filter(|c| c.level > 0) {
+                c.paused_for = Duration::ZERO;
+            }
+        }
+        // Where the link is read, as many as it carries come back together.
+        let mut cameras = paused();
+        allocate(Some(room), None, Some(3.0 * CAMERA as f64), &mut cameras);
+        assert_eq!(levels(&cameras), vec![1, 1, 1, 0, 0]);
+        // Where the link is not read, the camera must fit in what the limit allows too.
+        let mut cameras = paused();
+        allocate(
+            Some(1.5 * CAMERA as f64),
+            None,
+            Some(f64::INFINITY),
+            &mut cameras,
+        );
+        assert_eq!(levels(&cameras), vec![1, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_paused_camera_is_tried_again_whatever_share_of_the_link_a_screen_share_takes() {
+        let capacity = Some(5_000_000.0);
+        let mut b = CameraBudget::default();
+        let mut t = Instant::now();
+        let screen = ScreenInputs {
+            capacity,
+            other: 2_000_000.0,
+            ..congested()
+        };
+        b.review(t, &screen, load(1_000_000.0, 2_000_000.0));
+        t += HOLD + Duration::from_secs(1);
+        let calm = ScreenInputs {
+            capacity,
+            other: 2_000_000.0,
+            ..clear(1_400_000.0)
+        };
+        b.review(t, &calm, load(400_000.0, 800_000.0));
+        // The screen takes two fifths of the link: the cameras are left what is not the screen's,
+        // with room for its keyframes (a fifth more).
+        let reach = b.pause_trial(t).expect("a screen share is no reason");
+        assert!(
+            (reach - (5_000_000.0 * REACH_SHARE - 2_000_000.0 * SCREEN_KEYFRAME_ROOM)).abs() < 1.0,
+            "{reach}"
+        );
+        let mut cameras = vec![
+            Camera::new(RANK_HOST, plain(), None, WHOLE),
+            paused_for(RANK_WATCHED, 10),
+        ];
+        allocate(b.limit(), b.raise_ceiling(t), Some(reach), &mut cameras);
+        assert_eq!(levels(&cameras), vec![1, 1]);
+        // A screen that takes the whole link leaves nothing to try with.
+        let mut b = CameraBudget::default();
+        let hog = ScreenInputs {
+            other: 4_900_000.0,
+            ..screen
+        };
+        b.review(t, &hog, load(1_000_000.0, 2_000_000.0));
+        t += HOLD + Duration::from_secs(1);
+        b.review(
+            t,
+            &ScreenInputs {
+                other: 4_900_000.0,
+                ..calm
+            },
+            load(400_000.0, 800_000.0),
+        );
+        let reach = b
+            .pause_trial(t)
+            .expect("allowed, but with nothing to spend");
+        let mut cameras = vec![
+            Camera::new(RANK_HOST, plain(), None, WHOLE),
+            paused_for(RANK_WATCHED, 10),
+        ];
+        allocate(b.limit(), None, Some(reach), &mut cameras);
+        assert_eq!(levels(&cameras), vec![1, 0]);
+    }
+
+    #[test]
+    fn a_limit_of_nothing_with_every_camera_paused_grows_and_lets_one_back() {
+        // Every camera is paused and none is the host's, so nothing holds the limit up: a cut
+        // that found nothing sent leaves it at nothing.
+        let mut b = CameraBudget::default();
+        let mut t = Instant::now();
+        let dropping = ScreenInputs {
+            queue: Some(0.0),
+            delivery: Some(0.5),
+            ..Default::default()
+        };
+        b.review(t, &dropping, load(0.0, 3.0 * CAMERA as f64));
+        assert_eq!(b.limit(), Some(0.0));
+        let idle = ScreenInputs {
+            queue: Some(0.0),
+            ..Default::default()
+        };
+        let mut cameras: Vec<Camera> = (0..3).map(|_| paused_for(RANK_WATCHED, 0)).collect();
+        let mut back = None;
+        for second in 1..=30 {
+            t += Duration::from_secs(1);
+            b.review(t, &idle, load(0.0, 3.0 * CAMERA as f64));
+            allocate(
+                b.limit(),
+                b.raise_ceiling(t),
+                b.pause_trial(t),
+                &mut cameras,
+            );
+            if back.is_none() && cameras.iter().any(|c| c.level > 0) {
+                back = Some(second);
+            }
+        }
+        assert!(back.is_some_and(|s| s <= 20), "{back:?}");
+    }
+
+    #[test]
+    fn a_camera_sent_at_none_of_its_steps_is_counted_at_the_top_and_moved_to_it() {
+        // The host's large layer thinned to its base layer while only that flowed, and the small
+        // layer flows now: its steps are the small layer's and then the large one whole, and the
+        // rung the host is sent at is none of them.
+        let thinned = Rung {
+            layer: Layer::High,
+            tid: Some(0),
+        };
+        let off = host(simulcast(), thinned);
+        assert_eq!(off.level, off.top());
+        assert!(off.off_step());
+        assert!(!host(simulcast(), HIGH_WHOLE).off_step());
+        assert!(!host(simulcast(), WHOLE).off_step());
+        let paused = Camera::new(RANK_HOST, simulcast(), Some(Duration::ZERO), thinned);
+        assert!(!paused.off_step(), "nothing is sent");
     }
 
     #[test]
