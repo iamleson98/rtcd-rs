@@ -18,10 +18,10 @@ use tracing::{debug, warn};
 use super::session::{DownPhase, SessionKey, Source, SourceKey, SubRef};
 use super::{Engine, Load};
 use crate::camera_budget::{
-    self, Camera, NOMINAL_CAMERA_RATE, RANK_HOST, RANK_LOUD, RANK_SMALL, RANK_WATCHED,
+    self, Camera, CameraSteps, RANK_HOST, RANK_LOUD, RANK_SMALL, RANK_WATCHED,
 };
 use crate::ids::TrackType;
-use crate::layers::{Ladder, Layer, LayerRates, ScreenInputs, Steps, WATCH_EVERY};
+use crate::layers::{Ladder, Layer, LayerRates, Rung, STALL_AFTER, ScreenInputs, WATCH_EVERY};
 
 /// The most cameras one receiver may name.
 pub const MAX_VIDEO_SUBSCRIPTIONS: usize = 100;
@@ -72,10 +72,17 @@ impl Engine {
                 {
                     return None;
                 }
-                // The small layer while the receiver asked for it or the sender has paused the large.
+                // The small layer while the receiver asked for it, the sender has paused the large,
+                // or the receiver's camera budget holds the camera there.
                 let small = r.down.squeezed
                     || r.down.low_video.contains(&p.cfg.session_id)
-                    || p.up.camera_stall.stalled();
+                    || p.up.camera_stall.stalled()
+                    || r.down.iter().any(|(_, d)| {
+                        d.publisher == publisher
+                            && d.ty == ty
+                            && !matches!(d.phase, DownPhase::PendingRemove | DownPhase::Removing)
+                            && d.budget_small
+                    });
                 let preferred = if small { Layer::Low } else { Layer::High };
                 self.pick_layer(&mut candidates, preferred)
             }
@@ -518,8 +525,8 @@ impl Engine {
             .unwrap_or(0.0)
     }
 
-    /// Measures what each camera a session sends costs a receiver at each of its steps, once for
-    /// all its receivers (`review_cameras` reads it).
+    /// Measures what a session's camera costs a receiver at each of its steps, once for all its
+    /// receivers (`review_cameras` reads it).
     fn measure_cameras(&mut self, key: SessionKey, now: Instant) {
         if !self.cfg.camera_budget {
             return;
@@ -527,9 +534,7 @@ impl Engine {
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
-        for src in s.up.sources.iter_mut().filter(|x| x.ty == TrackType::Video) {
-            src.steps = camera_steps(src, now);
-        }
+        s.up.camera_steps = camera_steps(&s.up.sources, now);
     }
 
     /// Holds the cameras a receiver is sent to what its path carries (see `camera_budget`): each
@@ -568,10 +573,11 @@ impl Engine {
             let Some(p) = self.sessions.get(d.publisher) else {
                 continue;
             };
-            let Some(src) = d
+            let Some(layer) = d
                 .target
                 .or(d.source)
                 .and_then(|id| p.up.sources.iter().find(|x| x.id == id))
+                .map(|x| x.layer)
             else {
                 continue;
             };
@@ -584,12 +590,24 @@ impl Engine {
             } else {
                 RANK_WATCHED
             };
+            // A receiver held to the small layer anyway has no step onto the large one.
+            let steps = if s.down.squeezed
+                || s.down.low_video.contains(&p.cfg.session_id)
+                || p.up.camera_stall.stalled()
+            {
+                p.up.camera_steps.small_only()
+            } else {
+                p.up.camera_steps
+            };
             streams.push(id);
             cameras.push(Camera::new(
                 rank,
-                src.steps,
+                steps,
                 d.paused || d.pausing,
-                d.temporal.limit(),
+                Rung {
+                    layer,
+                    tid: d.temporal.limit(),
+                },
             ));
         }
         if cameras.is_empty() {
@@ -632,10 +650,30 @@ impl Engine {
         if changed {
             debug!(session = %s.cfg.session_id, ?limit, paused, thinned, cameras = cameras.len(), "cameras held to the path");
         }
+        if limit.is_none() {
+            self.release_small_cameras(key, now);
+        }
     }
 
-    /// Sends a receiver the camera `id` at the level `camera` was given: paused, or up to the
-    /// temporal layer it says.
+    /// Lets the cameras the budget held on their small layer go back to the layer they would be
+    /// sent otherwise, now that the budget lets go of them.
+    fn release_small_cameras(&mut self, key: SessionKey, now: Instant) {
+        let Some(s) = self.sessions.get_mut(key) else {
+            return;
+        };
+        let held: Vec<SessionKey> = s
+            .down
+            .streams
+            .iter_mut()
+            .flatten()
+            .filter_map(|d| std::mem::take(&mut d.budget_small).then_some(d.publisher))
+            .collect();
+        for publisher in held {
+            self.sync_stream(key, publisher, TrackType::Video, now);
+        }
+    }
+    /// Sends a receiver the camera `id` at the level `camera` was given: paused, or on the layer
+    /// and up to the temporal layer its step says.
     fn apply_camera_level(&mut self, key: SessionKey, id: u32, camera: &Camera, now: Instant) {
         let Some(ds) = self.sessions.get_mut(key).and_then(|s| s.down.get_mut(id)) else {
             return;
@@ -644,10 +682,15 @@ impl Engine {
             self.pause_camera(key, id, now);
             return;
         }
-        ds.temporal.set_limit(camera.limit(camera.level));
+        ds.temporal.set_limit(camera.rung(camera.level).tid);
         ds.pausing = false;
-        if ds.paused {
+        // Before the layer is chosen: `desired_source` reads it.
+        ds.budget_small = camera.held_small(camera.level);
+        let (publisher, paused) = (ds.publisher, ds.paused);
+        if paused {
             self.resume_camera(key, id, now);
+        } else {
+            self.sync_stream(key, publisher, TrackType::Video, now);
         }
     }
 
@@ -767,8 +810,7 @@ impl Engine {
                 let p = self.sessions.get(d.publisher)?;
                 let src = p.up.sources.iter().find(|x| Some(x.id) == d.source)?;
                 if held {
-                    let lowest = src.steps.iter().next().map(|(_, rate)| rate);
-                    lowest.filter(|_| p.cfg.props.host())
+                    p.cfg.props.host().then(|| p.up.camera_steps.lowest())
                 } else {
                     src.rate.rate(now).map(|r| r as f64)
                 }
@@ -790,15 +832,40 @@ impl Engine {
     }
 }
 
-/// What a camera costs at each step of its temporal layers, as measured.
-fn camera_steps(src: &Source, now: Instant) -> Steps {
-    let temporal = src.temporal_rates.as_ref().filter(|t| t.seen);
-    Steps::of(
+/// What a camera costs at each of its steps, as measured. A layer counts only while it flows and
+/// has been measured when the camera sends both: a camera whose small layer is not known to
+/// flow is not sent there, and one whose large layer is not is not costed as if it were.
+fn camera_steps(sources: &[Source], now: Instant) -> CameraSteps {
+    let layer = |layer| {
+        sources
+            .iter()
+            .find(|x| x.ty == TrackType::Video && x.layer == layer)
+    };
+    let live = |src: &Source| {
+        src.rate.rate(now).is_some()
+            && src
+                .last_packet
+                .is_some_and(|t| now.saturating_duration_since(t) < STALL_AFTER)
+    };
+    let rates = |src: &Source| {
+        let temporal = src.temporal_rates.as_ref();
         LayerRates {
             total: src.rate.rate(now),
-            temporal: temporal.map(|t| [t.base.rate(now), t.second.rate(now)]),
-            keyframe_bits: None,
+            temporal: temporal
+                .filter(|t| t.seen)
+                .map(|t| [t.base.rate(now), t.second.rate(now)]),
+            keyframe_bits: temporal
+                .and_then(|t| t.keyframe_bytes)
+                .map(|b| b as f64 * 8.0),
+        }
+    };
+    let (low, high) = match (layer(Layer::Low), layer(Layer::High)) {
+        (Some(l), Some(h)) => match (live(l), live(h)) {
+            (true, true) => (Some(l), Some(h)),
+            (true, false) => (Some(l), None),
+            _ => (None, Some(h)),
         },
-        NOMINAL_CAMERA_RATE,
-    )
+        single => single,
+    };
+    CameraSteps::of(low.map(rates), high.map(rates))
 }

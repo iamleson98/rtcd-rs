@@ -20,9 +20,8 @@ use super::record::Tap;
 use super::session::SessionKey;
 use super::session::{DownPhase, DownStream, Lifecycle, Session, Source, SourceKey, SubRef};
 use super::types::CloseReason;
-use crate::camera_budget::NOMINAL_CAMERA_RATE;
 use crate::ids::{TrackType, track_id};
-use crate::layers::{Layer, LayerRates, Steps};
+use crate::layers::Layer;
 use crate::metrics::Direction;
 use crate::peer::AUDIO_LEVEL_URI;
 use crate::rate::RateMonitor;
@@ -357,7 +356,6 @@ impl Engine {
             out_track_id,
             rate: RateMonitor::new(window),
             temporal_rates,
-            steps: Steps::of(LayerRates::default(), NOMINAL_CAMERA_RATE),
             last_packet: Some(now),
             last_pli: None,
             gap: false,
@@ -568,6 +566,7 @@ impl Engine {
             temporal: Default::default(),
             paused: false,
             pausing: false,
+            budget_small: false,
         };
         let Some(r) = self.sessions.get_mut(receiver) else {
             return;

@@ -28,6 +28,10 @@ const FPS: u32 = 30;
 const FRAME_PACKETS: usize = 2;
 const KEYFRAME_PACKETS: usize = 6;
 const KEYFRAME_EVERY: u32 = 2 * FPS;
+/// The large layer of a camera that sends two: three times the packets of the small one, so that
+/// a frame says which layer it is of by its size as well as by what it carries.
+const LARGE_PACKETS: usize = 3 * FRAME_PACKETS;
+const LARGE_KEYFRAME_PACKETS: usize = 3 * KEYFRAME_PACKETS;
 const LINK: u64 = 2_500_000;
 
 /// A viewer, the teacher and the students, and what the viewer was sent.
@@ -38,6 +42,9 @@ struct Class {
     senders: Vec<usize>,
     /// The cameras send three temporal layers, as a browser's encoder does.
     temporal: bool,
+    /// How many of the cameras, the teacher's first, send a large layer too (simulcast), whole at
+    /// every frame, as well as the small one.
+    simulcast: usize,
     /// Packets of a keyframe, and frames between the ones the encoder sends on its own.
     keyframe_packets: usize,
     keyframe_every: u32,
@@ -52,6 +59,8 @@ struct Window {
     packets: BTreeMap<String, usize>,
     /// Whether the first packet of each camera in the window was a keyframe.
     began_with_keyframe: BTreeMap<String, bool>,
+    /// The layer the first packet of each camera in the window was of.
+    began_on: BTreeMap<String, Layer>,
     drops: usize,
     bytes: usize,
     keyframe_requests: usize,
@@ -102,6 +111,7 @@ impl Class {
             viewer,
             senders,
             temporal: false,
+            simulcast: 0,
             keyframe_packets: KEYFRAME_PACKETS,
             keyframe_every: KEYFRAME_EVERY,
             frame: 0,
@@ -110,28 +120,42 @@ impl Class {
     }
 
     /// Every camera sends a frame at 30 per second (a keyframe every two seconds, one when the SFU
-    /// asks for it), spread over the frame time as unsynchronised encoders are.
+    /// asks for it), spread over the frame time as unsynchronised encoders are. A camera that
+    /// sends two layers sends a frame of each, and a keyframe of each layer is asked for on its
+    /// own.
     fn run(&mut self, seconds: u32) {
         let slot = Duration::from_secs(1) / FPS / self.senders.len() as u32;
         for _ in 0..seconds * FPS {
             for (k, &s) in self.senders.iter().enumerate() {
-                let b = &mut self.w.browsers[s];
-                let ssrc = b.camera.as_ref().expect("a camera").ssrcs[Layer::Low as usize];
-                let asked = b.keyframe_requests.contains(&ssrc);
-                b.keyframe_requests.clear();
-                if asked {
-                    b.keyframe_log.push(ssrc);
-                }
-                let key = asked || (self.frame + k as u32 * 7).is_multiple_of(self.keyframe_every);
-                let packets = if key {
-                    self.keyframe_packets
+                let layers: &[Layer] = if k < self.simulcast {
+                    &[Layer::Low, Layer::High]
                 } else {
-                    FRAME_PACKETS
+                    &[Layer::Low]
                 };
-                if self.temporal {
-                    self.w.send_camera_frame(s, Layer::Low, key, packets);
-                } else {
-                    self.w.send_video(s, false, Layer::Low, key, packets);
+                let b = &mut self.w.browsers[s];
+                let ssrcs = b.camera.as_ref().expect("a camera").ssrcs;
+                let asked: Vec<Layer> = layers
+                    .iter()
+                    .copied()
+                    .filter(|&l| b.keyframe_requests.contains(&ssrcs[l as usize]))
+                    .collect();
+                b.keyframe_requests.clear();
+                b.keyframe_log
+                    .extend(asked.iter().map(|&l| ssrcs[l as usize]));
+                let periodic = (self.frame + k as u32 * 7).is_multiple_of(self.keyframe_every);
+                for &layer in layers {
+                    let key = periodic || asked.contains(&layer);
+                    let packets = match (layer, key) {
+                        (Layer::Low, true) => self.keyframe_packets,
+                        (Layer::Low, false) => FRAME_PACKETS,
+                        (Layer::High, true) => LARGE_KEYFRAME_PACKETS,
+                        (Layer::High, false) => LARGE_PACKETS,
+                    };
+                    if self.temporal {
+                        self.w.send_camera_frame(s, layer, key, packets);
+                    } else {
+                        self.w.send_video(s, false, layer, key, packets);
+                    }
                 }
                 self.w.run_for(slot);
             }
@@ -163,9 +187,11 @@ impl Class {
                 continue;
             };
             *out.packets.entry(session.to_owned()).or_default() += 1;
+            let (layer, key) = describe(packet);
             out.began_with_keyframe
                 .entry(session.to_owned())
-                .or_insert_with(|| describe(packet).1);
+                .or_insert(key);
+            out.began_on.entry(session.to_owned()).or_insert(layer);
             out.bytes += rtc::shared::marshal::MarshalSize::marshal_size(packet);
         }
         self.counted = b.rtp.len();
@@ -179,7 +205,12 @@ impl Class {
             .iter()
             .filter(|&((track, ts), &n)| {
                 let (first, last) = ends[track.as_str()];
-                *ts != first && *ts != last && n != FRAME_PACKETS && n != self.keyframe_packets
+                let sizes = [FRAME_PACKETS, self.keyframe_packets];
+                let large = [LARGE_PACKETS, LARGE_KEYFRAME_PACKETS];
+                *ts != first
+                    && *ts != last
+                    && !sizes.contains(&n)
+                    && !(self.simulcast > 0 && large.contains(&n))
             })
             .count();
         out
@@ -193,6 +224,23 @@ impl Class {
         self.run(seconds);
         self.window(drops, requests)
     }
+
+    /// The layer and whether it begins a keyframe, of each packet of the teacher's camera the
+    /// viewer was sent from its `rtp` number `from`.
+    fn teacher_packets(&self, from: usize) -> Vec<(Layer, bool)> {
+        self.w.browsers[self.viewer].rtp[from..]
+            .iter()
+            .filter(|(track, _)| {
+                parse_track_id(track) == Some((TrackType::Video, "session-teacher"))
+            })
+            .map(|(_, packet)| describe(packet))
+            .collect()
+    }
+}
+
+/// How many times the teacher's camera changed layer in `packets`.
+fn layer_changes(packets: &[(Layer, bool)]) -> usize {
+    packets.windows(2).filter(|w| w[0].0 != w[1].0).count()
 }
 
 impl Window {
@@ -581,4 +629,129 @@ fn with_the_camera_budget_off_every_camera_is_sent_whole_whatever_the_link_drops
     seen.print("budget off", 30);
     assert_eq!(seen.packets.len(), STUDENTS + 1);
     assert!(seen.drops > 5_000, "{} dropped", seen.drops);
+}
+
+/// A link that carries the host's small layer and a student or two, but not its large layer
+/// (about 1.3 Mb/s with its keyframes).
+const NARROW: u64 = 1_200_000;
+
+fn simulcast_class(path: Path, simulcast: usize) -> Class {
+    let mut c = Class::new(path);
+    c.simulcast = simulcast;
+    c
+}
+
+#[test]
+fn a_host_whose_link_carries_only_its_small_layer_is_sent_that_whole() {
+    let mut c = simulcast_class(limited(NARROW), 1);
+    c.run(30);
+    let from = c.w.browsers[c.viewer].rtp.len();
+    let seen = c.measure(30);
+    seen.print("simulcast host, narrow link", 30);
+    let teacher = c.teacher_packets(from);
+    let large = teacher.iter().filter(|&&(l, _)| l == Layer::High).count();
+    eprintln!("teacher packets {}, large {large}", teacher.len());
+    let whole = (30 * FPS) as usize * FRAME_PACKETS;
+    // Every frame of the small layer arrived, none of the large one, and none in part.
+    assert_eq!(large, 0, "the large layer was sent");
+    assert!(
+        teacher.len() * 10 >= whole * 9,
+        "{} of {whole} packets",
+        teacher.len()
+    );
+    assert_eq!(seen.incomplete_frames, 0, "{seen:?}");
+    let sent: usize = seen.packets.values().sum();
+    assert!(seen.drops * 100 <= sent, "{} of {sent} dropped", seen.drops);
+}
+
+#[test]
+fn a_host_goes_back_to_its_large_layer_at_a_keyframe_when_the_link_clears() {
+    let mut c = simulcast_class(limited(NARROW), 1);
+    c.run(30);
+    c.w.set_path(c.viewer, limited(20_000_000));
+    let from = c.w.browsers[c.viewer].rtp.len();
+    let mut seconds = 0;
+    // Held for a while after the cut, clear for a while, and a trial: about eight seconds, and
+    // some more for the allowance to grow.
+    while seconds < 20
+        && !c
+            .teacher_packets(from)
+            .iter()
+            .any(|&(layer, _)| layer == Layer::High)
+    {
+        c.run(1);
+        seconds += 1;
+    }
+    eprintln!("the large layer came back after {seconds} s");
+    assert!(seconds < 20, "the host stayed on its small layer");
+    let teacher = c.teacher_packets(from);
+    let first = teacher
+        .iter()
+        .position(|&(layer, _)| layer == Layer::High)
+        .unwrap();
+    assert!(teacher[first].1, "the large layer began with a delta frame");
+    // One move, and the host stays there.
+    c.run(20);
+    let teacher = c.teacher_packets(from);
+    assert_eq!(layer_changes(&teacher), 1);
+    assert_eq!(teacher.last().map(|p| p.0), Some(Layer::High));
+    let seen = c.measure(10);
+    assert_eq!(seen.incomplete_frames, 0, "{seen:?}");
+}
+
+#[test]
+fn a_link_that_swings_a_tenth_either_way_moves_the_host_between_layers_at_most_once() {
+    let mut c = simulcast_class(limited(NARROW), 1);
+    c.run(30);
+    let from = c.w.browsers[c.viewer].rtp.len();
+    for second in 0..90 {
+        let rate = if second % 2 == 0 {
+            NARROW * 9 / 10
+        } else {
+            NARROW * 11 / 10
+        };
+        c.w.set_path(c.viewer, limited(rate));
+        c.run(1);
+    }
+    let teacher = c.teacher_packets(from);
+    let changes = layer_changes(&teacher);
+    eprintln!(
+        "swinging: {changes} layer changes, {} packets",
+        teacher.len()
+    );
+    assert!(changes <= 1, "{changes} layer changes");
+    assert!(teacher.len() * 10 >= (90 * FPS) as usize * FRAME_PACKETS * 9);
+}
+
+#[test]
+fn a_camera_paused_and_started_again_begins_on_its_small_layer_when_only_that_fits() {
+    // Every camera sends two layers; the link carries the small layers of a few of them.
+    let mut c = simulcast_class(limited(NARROW), STUDENTS + 1);
+    c.run(40);
+    let held = c.measure(10);
+    let paused: Vec<String> = c
+        .senders
+        .iter()
+        .map(|&s| format!("session-{}", c.w.browsers[s].name))
+        .filter(|s| !held.flowing(10).contains(&s.as_str()))
+        .collect();
+    assert!(!paused.is_empty(), "nothing was paused: {held:?}");
+
+    // Room for more of the small layers, not for a large one: the paused cameras start again.
+    c.w.set_path(c.viewer, limited(2 * NARROW));
+    let back = c.measure(40);
+    back.print("room for more small layers", 40);
+    let started: Vec<_> = paused
+        .iter()
+        .filter(|s| back.packets.contains_key(*s))
+        .collect();
+    assert!(!started.is_empty(), "no camera started again: {back:?}");
+    for camera in started {
+        assert_eq!(
+            back.began_with_keyframe.get(camera),
+            Some(&true),
+            "{camera}"
+        );
+        assert_eq!(back.began_on.get(camera), Some(&Layer::Low), "{camera}");
+    }
 }

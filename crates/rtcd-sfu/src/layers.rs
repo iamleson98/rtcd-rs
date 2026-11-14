@@ -42,10 +42,10 @@ pub const NOMINAL_LOW_RATE: u64 = 500_000;
 /// browser's encoder gives the base layer two fifths of the bits and the second layer one fifth.
 const NOMINAL_TEMPORAL_SHARE: [f64; 2] = [0.4, 0.6];
 /// A keyframe not measured yet is taken to be this many seconds of its layer (six frames).
-const NOMINAL_KEYFRAME_SECONDS: f64 = 0.4;
+pub(crate) const NOMINAL_KEYFRAME_SECONDS: f64 = 0.4;
 /// Moving onto the other layer is tried only where its keyframe would drain within this long,
 /// with what the path carries beyond the new rung.
-const KEYFRAME_DRAIN: f64 = 2.5;
+pub(crate) const KEYFRAME_DRAIN: f64 = 2.5;
 
 /// A path holding this many seconds of what is sent to it for [`QUEUE_PERSISTS`], while the queue
 /// is not shrinking, carries less than it is given (the queue a keyframe leaves shrinks once the
@@ -165,6 +165,11 @@ impl Steps {
     /// How many steps there are (at least one).
     pub fn count(&self) -> usize {
         self.len
+    }
+
+    /// Bits per second of the whole layer, the last step.
+    pub fn whole(&self) -> f64 {
+        self.steps[self.len - 1].1
     }
 }
 

@@ -6,9 +6,10 @@
 //! fewer pictures would have played. So when the path says it carries less (it queues what it is
 //! sent, or drops it: see `ScreenInputs`), the cameras are given what it delivered less the screen
 //! share's part, in the order of what matters: the host's camera first, then the others. A camera
-//! that does not fit gives up the temporal layers it can (the frames between, from the next one:
-//! a camera that has none has no such step) and then is paused for this receiver, until its
-//! keyframe at the next time it fits.
+//! that does not fit gives up what it can: it goes onto its small simulcast layer (from the
+//! layer's next keyframe) when it sends one, or gives up temporal layers (the frames between, from
+//! the next one: a camera that has none has no such step), and then is paused for this receiver,
+//! until its keyframe at the next time it fits.
 //!
 //! What the path carries is read from what it delivered, not from the estimator's target: under a
 //! hard limit that drops packets, the target falls to its floor (the estimator reads every loss
@@ -24,9 +25,9 @@ use std::time::{Duration, Instant};
 
 use crate::layers::{
     CAPACITY_SHARE, CLEAR_FOR, DRAIN_SECONDS, FORGET_AFTER, GROWTH_CEILING, GROWTH_PER_SECOND,
-    HEADROOM, HOLD, INITIAL_BACKOFF, KEYFRAME_GRACE, LEAST_SHARE, LOSS_ROOM, MAX_BACKOFF,
-    QUEUE_CRITICAL, QUEUE_HIGH, QUEUE_PERSISTS, QUEUE_SHRINKING, QUEUE_SURGING, ScreenInputs,
-    Steps, TRIAL,
+    HEADROOM, HOLD, INITIAL_BACKOFF, KEYFRAME_DRAIN, KEYFRAME_GRACE, LEAST_SHARE, LOSS_ROOM, Layer,
+    LayerRates, MAX_BACKOFF, NOMINAL_KEYFRAME_SECONDS, QUEUE_CRITICAL, QUEUE_HIGH, QUEUE_PERSISTS,
+    QUEUE_SHRINKING, QUEUE_SURGING, Rung, ScreenInputs, Steps, TRIAL,
 };
 
 /// What a camera costs until it has been measured.
@@ -52,44 +53,163 @@ pub const RANK_LOUD: u8 = 1;
 pub const RANK_WATCHED: u8 = 2;
 pub const RANK_SMALL: u8 = 3;
 
+/// The most steps a camera has: the three of its small layer and the whole of its large one.
+const MAX_STEPS: usize = 4;
+
+/// What a camera costs a receiver at each of its steps, cheapest first, and which layer and which
+/// of its temporal layers each is.
+///
+/// A camera that sends both simulcast layers goes down to the small one before it gives up frames
+/// of the large one: the steps are those of the small layer (its temporal layers, and the whole
+/// of it) and then the whole of the large layer, which has no steps of its own, so that nothing
+/// can thin the large layer before the small one is reached. When the small layer is not cheaper
+/// than the large (it is no step down) the camera has the steps of the large layer alone.
+#[derive(Debug, Clone, Copy)]
+pub struct CameraSteps {
+    steps: [(Rung, f64); MAX_STEPS],
+    len: usize,
+    /// Bits of the keyframe the receiver is sent when it moves from the small layer onto the large
+    /// one: it arrives at once, on top of what flows.
+    switch_bits: f64,
+}
+
+impl CameraSteps {
+    /// The steps of a camera from what was measured of each layer it sends (`None` for a layer it
+    /// does not send, or one that is not flowing now: a rate that is not measured is a guess that
+    /// must not take a camera off its large layer). A camera with no layer at all costs what a
+    /// camera not measured yet does.
+    pub fn of(low: Option<LayerRates>, high: Option<LayerRates>) -> Self {
+        let steps = |rates| Steps::of(rates, NOMINAL_CAMERA_RATE);
+        let mut out = Self {
+            steps: [(
+                Rung {
+                    layer: Layer::Low,
+                    tid: None,
+                },
+                0.0,
+            ); MAX_STEPS],
+            len: 0,
+            switch_bits: 0.0,
+        };
+        match (low.map(steps), high.map(steps)) {
+            (Some(small), Some(large)) if small.whole() < large.whole() => {
+                out.extend(Layer::Low, &small);
+                out.push(Layer::High, None, large.whole());
+                out.switch_bits = high
+                    .and_then(|r| r.keyframe_bits)
+                    .unwrap_or(large.whole() * NOMINAL_KEYFRAME_SECONDS);
+            }
+            (_, Some(large)) => out.extend(Layer::High, &large),
+            (Some(small), None) => out.extend(Layer::Low, &small),
+            (None, None) => out.extend(Layer::Low, &steps(LayerRates::default())),
+        }
+        out
+    }
+
+    fn push(&mut self, layer: Layer, tid: Option<u8>, rate: f64) {
+        self.steps[self.len] = (Rung { layer, tid }, rate);
+        self.len += 1;
+    }
+
+    fn extend(&mut self, layer: Layer, steps: &Steps) {
+        for (tid, rate) in steps.iter() {
+            self.push(layer, tid, rate);
+        }
+    }
+
+    fn rungs(&self) -> &[(Rung, f64)] {
+        &self.steps[..self.len]
+    }
+
+    /// How many steps there are (at least one).
+    pub fn count(&self) -> usize {
+        self.len
+    }
+
+    /// Bits per second the cheapest step costs: what the camera is never held below, if it is
+    /// the host's.
+    pub fn lowest(&self) -> f64 {
+        self.steps[0].1
+    }
+
+    /// Whether the large layer is among the steps.
+    fn reaches_high(&self) -> bool {
+        self.rungs().iter().any(|(r, _)| r.layer == Layer::High)
+    }
+
+    /// The steps of the small layer alone, for a receiver that is held to it anyway (a camera
+    /// that has no small layer keeps what it has).
+    pub fn small_only(mut self) -> Self {
+        let small = self
+            .rungs()
+            .iter()
+            .take_while(|(r, _)| r.layer == Layer::Low)
+            .count();
+        if small > 0 {
+            self.len = small;
+        }
+        self
+    }
+}
+
+impl Default for CameraSteps {
+    fn default() -> Self {
+        Self::of(None, None)
+    }
+}
+
 /// One camera a receiver is sent, and what it can be sent at.
 #[derive(Debug, Clone, Copy)]
 pub struct Camera {
     /// What comes first when there is not room for all (`RANK_*`, the lowest first).
     pub rank: u8,
-    pub steps: Steps,
+    pub steps: CameraSteps,
     /// What the receiver is sent now: 0 is nothing (paused), `n` is the `n`th of `steps`.
     pub level: usize,
 }
 
 impl Camera {
-    /// A camera as the receiver is sent it: `paused`, or up to temporal layer `limit` (`None`: all).
-    pub fn new(rank: u8, steps: Steps, paused: bool, limit: Option<u8>) -> Self {
+    /// A camera as the receiver is sent it: `paused`, or at the step that is `current` (the
+    /// top one when `steps` has none like it: the cameras are only ever taken down from it).
+    pub fn new(rank: u8, steps: CameraSteps, paused: bool, current: Rung) -> Self {
         let level = if paused {
             0
         } else {
             steps
+                .rungs()
                 .iter()
-                .position(|(tid, _)| tid == limit)
+                .position(|(rung, _)| *rung == current)
                 .map_or(steps.count(), |i| i + 1)
         };
         Self { rank, steps, level }
     }
 
-    /// The highest temporal layer sent at `level` (`None`: every frame).
-    pub fn limit(&self, level: usize) -> Option<u8> {
-        self.steps
-            .iter()
-            .nth(level.saturating_sub(1))
-            .and_then(|(tid, _)| tid)
+    /// The layer and the highest temporal layer sent at `level` (not 0).
+    pub fn rung(&self, level: usize) -> Rung {
+        self.steps.rungs()[level.saturating_sub(1)].0
+    }
+
+    /// Whether the camera is held on its small layer at `level` while it sends a large one, for
+    /// want of room: the receiver is kept on the small layer until the budget takes it up.
+    pub fn held_small(&self, level: usize) -> bool {
+        level > 0 && self.rung(level).layer == Layer::Low && self.steps.reaches_high()
     }
 
     /// Bits per second `level` costs.
     fn cost(&self, level: usize) -> f64 {
         level
             .checked_sub(1)
-            .and_then(|i| self.steps.iter().nth(i))
-            .map_or(0.0, |(_, rate)| rate)
+            .map_or(0.0, |i| self.steps.rungs()[i].1)
+    }
+
+    /// Bits of the keyframe that taking the camera from `before` up to `level` sends at once: the
+    /// one of the large layer, when it is a move onto it.
+    fn switch_cost(&self, before: usize, level: usize) -> f64 {
+        if before > 0 && self.rung(before).layer != self.rung(level).layer {
+            self.steps.switch_bits
+        } else {
+            0.0
+        }
     }
 
     fn top(&self) -> usize {
@@ -138,7 +258,9 @@ impl Load {
 /// one at most (the first in that order) is taken up, and only when `raise` allows it (`Some`:
 /// the most the cameras may cost then) and everything sent now and the step fit [`RAISE_MARGIN`]
 /// times over in `limit`: rank says who goes up first and who is cut first, never who takes the
-/// place of a camera that flows. One that no longer fits goes down at once.
+/// place of a camera that flows. A step onto the large layer also needs its keyframe to drain
+/// within [`KEYFRAME_DRAIN`] in what is left of the most the cameras may cost (everything, while
+/// that is not known). One that no longer fits goes down at once.
 pub fn allocate(limit: Option<f64>, mut raise: Option<f64>, cameras: &mut [Camera]) {
     let limit = limit.unwrap_or(f64::INFINITY);
     let mut order: Vec<usize> = (0..cameras.len()).collect();
@@ -154,8 +276,9 @@ pub fn allocate(limit: Option<f64>, mut raise: Option<f64>, cameras: &mut [Camer
                 // Taking a camera up adds to everything sent now, whatever its rank: it never
                 // displaces a camera that flows.
                 let total = sent + c.cost(level) - c.cost(before);
-                raise.is_some_and(|most| total <= most)
-                    && total * RAISE_MARGIN <= limit
+                raise.is_some_and(|most| {
+                    total <= most && c.switch_cost(before, level) <= (most - total) * KEYFRAME_DRAIN
+                }) && total * RAISE_MARGIN <= limit
                     && given + c.cost(level) <= limit
             } else {
                 given + c.cost(level) <= limit
@@ -362,34 +485,41 @@ mod tests {
 
     const CAMERA: u64 = 400_000;
 
-    fn plain() -> Steps {
-        Steps::of(
-            LayerRates {
+    fn plain() -> CameraSteps {
+        CameraSteps::of(
+            Some(LayerRates {
                 total: Some(CAMERA),
                 ..Default::default()
-            },
-            CAMERA,
+            }),
+            None,
         )
     }
 
     /// A camera sent as a browser's encoder does: the base layer two fifths of the bits and the
     /// second one fifth.
-    fn layered() -> Steps {
-        Steps::of(
-            LayerRates {
-                total: Some(CAMERA),
-                temporal: Some([Some(160_000), Some(80_000)]),
-                keyframe_bits: None,
-            },
-            CAMERA,
-        )
+    fn layered() -> CameraSteps {
+        CameraSteps::of(Some(layered_rates()), None)
     }
 
-    fn class(students: usize, steps: Steps) -> Vec<Camera> {
+    fn layered_rates() -> LayerRates {
+        LayerRates {
+            total: Some(CAMERA),
+            temporal: Some([Some(160_000), Some(80_000)]),
+            keyframe_bits: None,
+        }
+    }
+
+    /// The rung of a camera sent whole.
+    const WHOLE: Rung = Rung {
+        layer: Layer::Low,
+        tid: None,
+    };
+
+    fn class(students: usize, steps: CameraSteps) -> Vec<Camera> {
         // The host is last on purpose: the order cameras come in does not matter to it.
         (0..students)
-            .map(|_| Camera::new(RANK_WATCHED, steps, false, None))
-            .chain([Camera::new(RANK_HOST, steps, false, None)])
+            .map(|_| Camera::new(RANK_WATCHED, steps, false, WHOLE))
+            .chain([Camera::new(RANK_HOST, steps, false, WHOLE)])
             .collect()
     }
 
@@ -420,11 +550,11 @@ mod tests {
         // its base and second layers (three fifths of its bits), the third has nothing left.
         allocate(Some(1_040_000.0), None, &mut cameras);
         assert_eq!(levels(&cameras), vec![3, 2, 0, 3]);
-        assert_eq!(cameras[1].limit(2), Some(1));
+        assert_eq!(cameras[1].rung(2).tid, Some(1));
         // A little less, and the second one is down to its base layer.
         allocate(Some(960_000.0), None, &mut cameras);
         assert_eq!(levels(&cameras), vec![3, 1, 0, 3]);
-        assert_eq!(cameras[1].limit(1), Some(0));
+        assert_eq!(cameras[1].rung(1).tid, Some(0));
     }
 
     #[test]
@@ -773,12 +903,12 @@ mod tests {
         }
         let held = levels(&sim.cameras);
         // The cameras that flow now cost three times what they did, and the path is clear.
-        let busy = Steps::of(
-            LayerRates {
+        let busy = CameraSteps::of(
+            Some(LayerRates {
                 total: Some(3 * CAMERA),
                 ..Default::default()
-            },
-            CAMERA,
+            }),
+            None,
         );
         for c in sim.cameras.iter_mut().filter(|c| c.level > 0) {
             c.steps = busy;
@@ -836,14 +966,178 @@ mod tests {
     #[test]
     fn who_is_given_room_first_goes_by_rank() {
         let mut cameras = vec![
-            Camera::new(RANK_SMALL, plain(), false, None),
-            Camera::new(RANK_WATCHED, plain(), false, None),
-            Camera::new(RANK_LOUD, plain(), false, None),
-            Camera::new(RANK_HOST, plain(), false, None),
+            Camera::new(RANK_SMALL, plain(), false, WHOLE),
+            Camera::new(RANK_WATCHED, plain(), false, WHOLE),
+            Camera::new(RANK_LOUD, plain(), false, WHOLE),
+            Camera::new(RANK_HOST, plain(), false, WHOLE),
         ];
         allocate(Some(2.0 * CAMERA as f64), None, &mut cameras);
         assert_eq!(levels(&cameras), vec![0, 0, 1, 1]);
         allocate(Some(4.0 * CAMERA as f64), Some(f64::INFINITY), &mut cameras);
         assert_eq!(levels(&cameras), vec![0, 1, 1, 1]);
+    }
+
+    const SMALL: u64 = 200_000;
+    const LARGE: u64 = 1_000_000;
+    const KEYFRAME: f64 = 100_000.0;
+
+    fn small_layer() -> LayerRates {
+        LayerRates {
+            total: Some(SMALL),
+            ..Default::default()
+        }
+    }
+
+    fn large_layer(total: u64) -> LayerRates {
+        LayerRates {
+            total: Some(total),
+            keyframe_bits: Some(KEYFRAME),
+            ..Default::default()
+        }
+    }
+
+    /// A camera that sends a small and a large layer, as the host's does.
+    fn simulcast() -> CameraSteps {
+        CameraSteps::of(Some(small_layer()), Some(large_layer(LARGE)))
+    }
+
+    fn rungs(steps: &CameraSteps) -> Vec<(Layer, Option<u8>)> {
+        steps
+            .rungs()
+            .iter()
+            .map(|(r, _)| (r.layer, r.tid))
+            .collect()
+    }
+
+    #[test]
+    fn a_camera_with_two_layers_goes_down_to_the_small_one_before_it_loses_frames() {
+        let whole = (Layer::Low, None);
+        let large = (Layer::High, None);
+        assert_eq!(rungs(&simulcast()), vec![whole, large]);
+        // The temporal layers of the small one are steps; the large one's are not, even when it
+        // has them.
+        let layered_large = LayerRates {
+            temporal: Some([Some(400_000), Some(200_000)]),
+            ..large_layer(LARGE)
+        };
+        let steps = CameraSteps::of(Some(layered_rates()), Some(layered_large));
+        assert_eq!(
+            rungs(&steps),
+            vec![(Layer::Low, Some(0)), (Layer::Low, Some(1)), whole, large]
+        );
+        assert_eq!(steps.lowest(), 160_000.0);
+    }
+
+    #[test]
+    fn a_small_layer_that_is_no_cheaper_than_the_large_is_no_step_down() {
+        let steps = CameraSteps::of(Some(large_layer(LARGE)), Some(large_layer(LARGE)));
+        assert_eq!(rungs(&steps), vec![(Layer::High, None)]);
+        let layered_large = LayerRates {
+            temporal: Some([Some(400_000), Some(200_000)]),
+            ..large_layer(LARGE)
+        };
+        let steps = CameraSteps::of(Some(large_layer(2 * LARGE)), Some(layered_large));
+        assert_eq!(
+            rungs(&steps),
+            vec![
+                (Layer::High, Some(0)),
+                (Layer::High, Some(1)),
+                (Layer::High, None)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_camera_with_one_layer_has_the_steps_of_it() {
+        assert_eq!(rungs(&layered()).len(), 3);
+        assert!(rungs(&layered()).iter().all(|&(l, _)| l == Layer::Low));
+        let large = CameraSteps::of(None, Some(large_layer(LARGE)));
+        assert_eq!(rungs(&large), vec![(Layer::High, None)]);
+        assert_eq!(rungs(&CameraSteps::default()), vec![(Layer::Low, None)]);
+    }
+
+    #[test]
+    fn a_receiver_held_to_the_small_layer_has_its_steps_alone() {
+        assert_eq!(rungs(&simulcast().small_only()), vec![(Layer::Low, None)]);
+        let large = CameraSteps::of(None, Some(large_layer(LARGE)));
+        assert_eq!(rungs(&large.small_only()), vec![(Layer::High, None)]);
+    }
+
+    fn host(steps: CameraSteps, rung: Rung) -> Camera {
+        Camera::new(RANK_HOST, steps, false, rung)
+    }
+
+    const HIGH_WHOLE: Rung = Rung {
+        layer: Layer::High,
+        tid: None,
+    };
+
+    #[test]
+    fn a_link_that_carries_the_small_layer_alone_holds_the_host_on_it_whole() {
+        // The large layer of the host's camera with temporal layers would have been thinned to
+        // fit; the small one is sent whole instead.
+        let large = LayerRates {
+            temporal: Some([Some(400_000), Some(200_000)]),
+            ..large_layer(LARGE)
+        };
+        let steps = CameraSteps::of(Some(small_layer()), Some(large));
+        let mut cameras = [host(steps, HIGH_WHOLE)];
+        allocate(Some(600_000.0), None, &mut cameras);
+        let level = cameras[0].level;
+        assert_eq!(cameras[0].rung(level), WHOLE);
+        assert!(cameras[0].held_small(level));
+        // Room for the large one whole: it is no longer held.
+        allocate(Some(5_000_000.0), Some(f64::INFINITY), &mut cameras);
+        let level = cameras[0].level;
+        assert_eq!(cameras[0].rung(level), HIGH_WHOLE);
+        assert!(!cameras[0].held_small(level));
+    }
+
+    #[test]
+    fn a_camera_with_no_larger_layer_is_never_held_small() {
+        let cameras = class(1, plain());
+        assert!(!cameras[0].held_small(cameras[0].level));
+        let cut = Camera::new(RANK_HOST, simulcast().small_only(), false, WHOLE);
+        assert!(
+            !cut.held_small(cut.level),
+            "held small by the receiver, not the budget"
+        );
+    }
+
+    #[test]
+    fn the_host_keeps_the_lowest_step_of_the_ladder_it_has() {
+        let layered_small = CameraSteps::of(Some(layered_rates()), Some(large_layer(LARGE)));
+        let cameras = [host(layered_small, HIGH_WHOLE)];
+        assert_eq!(Load::of(&cameras).floor, 160_000.0);
+        let cameras = [host(simulcast(), HIGH_WHOLE)];
+        assert_eq!(Load::of(&cameras).floor, SMALL as f64);
+        let cameras = [host(
+            CameraSteps::of(None, Some(large_layer(LARGE))),
+            HIGH_WHOLE,
+        )];
+        assert_eq!(Load::of(&cameras).floor, LARGE as f64);
+    }
+
+    #[test]
+    fn a_camera_goes_onto_the_large_layer_only_where_its_keyframe_drains() {
+        let mut cameras = [host(simulcast(), WHOLE)];
+        let level = cameras[0].level;
+        // Room in the limit, and in the narrowest link for the large layer whole (1 Mb/s) but not
+        // for its keyframe (100 kbit would take longer than the drain allows to leave in 20 kb/s).
+        allocate(Some(5_000_000.0), Some(1_020_000.0), &mut cameras);
+        assert_eq!(cameras[0].level, level, "the keyframe would queue");
+        allocate(Some(5_000_000.0), Some(1_100_000.0), &mut cameras);
+        assert_eq!(cameras[0].level, 2);
+        // And where the link is not known, nothing is held back.
+        let mut cameras = [host(simulcast(), WHOLE)];
+        allocate(Some(5_000_000.0), Some(f64::INFINITY), &mut cameras);
+        assert_eq!(cameras[0].level, 2);
+    }
+
+    #[test]
+    fn a_move_down_from_the_large_layer_needs_no_room_for_a_keyframe() {
+        let mut cameras = [host(simulcast(), HIGH_WHOLE)];
+        allocate(Some(400_000.0), None, &mut cameras);
+        assert_eq!(cameras[0].level, 1);
     }
 }

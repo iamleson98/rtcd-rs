@@ -18,9 +18,9 @@ use super::route::AddrBudget;
 use super::signaling::{Phase, SignalingLock};
 use super::types::Proto;
 use crate::bwe::Estimate;
-use crate::camera_budget::CameraBudget;
+use crate::camera_budget::{CameraBudget, CameraSteps};
 use crate::ids::TrackType;
-use crate::layers::{Layer, ScreenLevel, StallWatch, Steps};
+use crate::layers::{Layer, ScreenLevel, StallWatch};
 use crate::rate::RateMonitor;
 use crate::rewrite::Rewriter;
 use crate::temporal::TemporalFilter;
@@ -66,9 +66,6 @@ pub(crate) struct Source {
     /// For a VP8 video: what its base and second temporal layers bring, for the rungs a receiver
     /// is offered (see `layers::Ladder`, `camera_budget`).
     pub temporal_rates: Option<TemporalRates>,
-    /// For a camera: what it costs a receiver at each step, as measured at the last upkeep (once
-    /// a second per sender, not once per receiver).
-    pub steps: Steps,
     /// When a packet of this stream last arrived.
     pub last_packet: Option<Instant>,
     /// When a keyframe was last asked of the sender for this stream.
@@ -139,6 +136,9 @@ pub(crate) struct Uplink {
     pub audio_level_ext: Option<u8>,
     /// Whether the large layer of the camera has stopped while the small one flows.
     pub camera_stall: StallWatch,
+    /// What the camera costs a receiver at each step, as measured at the last upkeep (once a
+    /// second per sender, not once per receiver).
+    pub camera_steps: CameraSteps,
 }
 
 /// Where a stream stands in the receiver's connection.
@@ -182,6 +182,10 @@ pub(crate) struct DownStream {
     /// The camera is being paused: it leaves the stream at the end of the frame it is in, so no
     /// receiver is sent half a frame.
     pub pausing: bool,
+    /// The receiver's camera budget holds the camera on its small layer for want of room, though
+    /// the large one is flowing (see `Engine::apply_camera_level`): `Engine::desired_source` keeps
+    /// the stream there until the budget takes it up.
+    pub budget_small: bool,
 }
 
 /// What the SFU sends a participant.
