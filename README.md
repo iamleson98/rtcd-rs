@@ -173,14 +173,16 @@ up to 120.
 ## A receiver's path that carries less than its cameras
 
 A receiver whose downlink carries less than the cameras it is sent loses the excess at random, and
-every picture breaks. With `RTCD_RTC_CAMERABUDGET=true` (`rtc.camera_budget`, off by default) the SFU
+every picture breaks. With the camera budget (`RTCD_RTC_CAMERABUDGET`, `rtc.camera_budget`, on by default) the SFU
 holds that receiver's cameras to what its path was measured to deliver (less its screen share): the
 host's camera first, then the others in turn, each whole, or on its small simulcast layer (moved at
 its keyframe, and back up the same way) when the browser sends both, or without its upper temporal
 layers when it sends them, or paused (restarted at a keyframe) until there is room again. Cameras
 that fit are untouched; `false` sends every camera whole, whatever the path drops (`src/camera_budget.rs`).
-It is off by default: with single-layer cameras its only tool is a pause, and in the lesson soak a
-paused camera stalled for up to a minute where the dropped packets had cost a few frames a second.
+Browsers send their cameras in two simulcast layers, so the budget's usual step is the small layer. In
+the two-hour lesson soak with simulcast cameras, a browser on a narrowed link froze about 13 times a
+minute with the budget off and under twice with it on (the Go rtcd: 1.3), and the simulated receivers
+almost never (0.01 a minute against the Go rtcd's 0.7).
 
 ## Large calls: a send budget
 
