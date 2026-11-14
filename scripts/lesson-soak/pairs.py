@@ -3,9 +3,10 @@
 
     pairs.py RULES.json OUT.json IMPL...        (IMPL: rs, rs-budget, go)
 
-The gated subject is rtcd-rs-budget when that soak ran, else rtcd-rs, held against the Go rtcd (the
-pairs of RULES.json with their rtcd-rs replaced). When both rs and rs-budget ran, rs-budget is also
-held against rs, for the report only (`"gate": false`: a breach shows in the tables and does not fail).
+rtcd-rs as it ships (rs, the camera budget off) is the gated subject whenever it ran: it is held
+against the Go rtcd (the pairs of RULES.json). The camera budget's soak (rs-budget) is held against
+the Go rtcd too, and against rs when that ran, for the report only (`"gate": false`: a breach shows
+in the tables and does not fail) while rs is gated; without rs, rs-budget is the gated subject.
 """
 import json
 import sys
@@ -15,16 +16,16 @@ BUDGET = "rtcd-rs-budget"
 
 
 def build(rules, impls):
-    gated = BUDGET if "rs-budget" in impls else SUBJECT
-    pairs = []
-    for p in rules["compare"]:
-        q = dict(p)
-        q["subject"] = gated + p["subject"][len(SUBJECT):]
-        pairs.append(q)
-    if "rs-budget" in impls and "rs" in impls:
-        for p in rules["compare"]:
-            pairs.append({**p, "subject": BUDGET + p["subject"][len(SUBJECT):],
-                          "baseline": SUBJECT + p["subject"][len(SUBJECT):], "gate": False})
+    plain = "rs" in impls
+    pairs = [dict(p) for p in rules["compare"]] if plain else []
+    if "rs-budget" in impls:
+        budget = [{**p, "subject": BUDGET + p["subject"][len(SUBJECT):]} for p in rules["compare"]]
+        if plain:
+            pairs += [{**p, "gate": False} for p in budget]
+            pairs += [{**p, "baseline": SUBJECT + p["subject"][len(BUDGET):], "gate": False}
+                      for p in budget]
+        else:
+            pairs += budget
     return {**rules, "compare": pairs}
 
 

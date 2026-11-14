@@ -143,12 +143,13 @@ class Pairs(unittest.TestCase):
                          {"subject": "rtcd-rs/chrome", "baseline": "rtcd-go/chrome", "clean_zero": ["stalls"]}],
              "ratio": 1.25}
 
-    def test_the_budget_soak_is_the_gated_subject_and_rs_a_report_only_baseline(self):
+    def test_rs_is_gated_against_go_and_the_budget_soak_is_report_only(self):
         got = pairs.build(self.rules, ["rs", "rs-budget", "go"])["compare"]
         self.assertEqual([(p["subject"], p["baseline"], p.get("gate", True)) for p in got], [
-            ("rtcd-rs-budget", "rtcd-go", True), ("rtcd-rs-budget/chrome", "rtcd-go/chrome", True),
+            ("rtcd-rs", "rtcd-go", True), ("rtcd-rs/chrome", "rtcd-go/chrome", True),
+            ("rtcd-rs-budget", "rtcd-go", False), ("rtcd-rs-budget/chrome", "rtcd-go/chrome", False),
             ("rtcd-rs-budget", "rtcd-rs", False), ("rtcd-rs-budget/chrome", "rtcd-rs/chrome", False)])
-        self.assertEqual(got[3]["clean_zero"], ["stalls"])
+        self.assertEqual(got[5]["clean_zero"], ["stalls"])
 
     def test_without_the_budget_soak_rs_is_held_against_go(self):
         got = pairs.build(self.rules, ["rs", "go"])
@@ -156,4 +157,5 @@ class Pairs(unittest.TestCase):
 
     def test_without_the_plain_soak_there_is_nothing_report_only(self):
         got = pairs.build(self.rules, ["rs-budget", "go"])["compare"]
-        self.assertEqual([p["subject"] for p in got], ["rtcd-rs-budget", "rtcd-rs-budget/chrome"])
+        self.assertEqual([(p["subject"], p.get("gate", True)) for p in got],
+                         [("rtcd-rs-budget", True), ("rtcd-rs-budget/chrome", True)])

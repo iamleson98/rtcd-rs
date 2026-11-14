@@ -37,10 +37,10 @@ use std::time::{Duration, Instant};
 
 use crate::bwe::OUTAGE_GAP;
 use crate::layers::{
-    CAPACITY_SHARE, CLEAR_FOR, DRAIN_SECONDS, FORGET_AFTER, GROWTH_CEILING, GROWTH_PER_SECOND,
-    HEADROOM, HOLD, INITIAL_BACKOFF, KEYFRAME_DRAIN, KEYFRAME_GRACE, LEAST_SHARE, LOSS_ROOM, Layer,
-    LayerRates, MAX_BACKOFF, NOMINAL_KEYFRAME_SECONDS, QUEUE_CRITICAL, QUEUE_HIGH, QUEUE_PERSISTS,
-    QUEUE_SHRINKING, QUEUE_SURGING, Rung, ScreenInputs, Steps, TRIAL,
+    CAPACITY_SHARE, CLEAR_FOR, DRAIN_SECONDS, GROWTH_CEILING, GROWTH_PER_SECOND, HEADROOM, HOLD,
+    KEYFRAME_DRAIN, KEYFRAME_GRACE, LEAST_SHARE, LOSS_ROOM, Layer, LayerRates,
+    NOMINAL_KEYFRAME_SECONDS, QUEUE_CRITICAL, QUEUE_HIGH, QUEUE_PERSISTS, QUEUE_SHRINKING,
+    QUEUE_SURGING, Rung, ScreenInputs, Steps, TRIAL,
 };
 
 /// What a camera costs until it has been measured.
@@ -60,6 +60,13 @@ const CUT_SETTLES: Duration = Duration::from_millis(3500);
 /// costs the receiver a burst of what the link drops: on a link that is narrow for good, this is
 /// how often that happens.
 const CEILING_TRUST: Duration = Duration::from_secs(60);
+/// A step that brought congestion is not tried again for a wait that starts at this and doubles
+/// each time, up to [`MAX_BACKOFF`]; once a step has been held [`FORGET_AFTER`] without trouble,
+/// the failures are forgotten. Shorter than the screen share's (`layers`): a camera's steps are
+/// smaller, so a failed one costs less, and a camera held low is what a class sees most.
+const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
+const MAX_BACKOFF: Duration = Duration::from_secs(20);
+const FORGET_AFTER: Duration = Duration::from_secs(12);
 /// A step taken up that the path has carried this long without congestion has held: the wait that
 /// grew with the steps that failed before it starts over.
 const STEP_HELD: Duration = FORGET_AFTER;

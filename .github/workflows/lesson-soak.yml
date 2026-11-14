@@ -10,9 +10,10 @@ name: lesson-soak
 #           one seed (the run id) so both services meet the same attacks.
 # rtcd-rs runs twice, with the camera budget off (`rs`) and on (`rs-budget`, the same image; the
 # variable is set explicitly for each), beside the Go rtcd (`go`). The report compares the first and
-# the last clean stretch of each service, holds rtcd-rs-budget against the Go rtcd (the same lesson,
-# the same network, the same machine type) and fails when it drifts, crashes or is less stable;
-# rtcd-rs-budget against rtcd-rs is in the report only.
+# the last clean stretch of each service, holds rtcd-rs as it ships (`rs`) against the Go rtcd (the
+# same lesson, the same network, the same machine type) and fails when it drifts, crashes or is less
+# stable; rtcd-rs-budget against the Go rtcd and against rtcd-rs is in the report only (gated only
+# when `rs` did not run).
 
 on:
   schedule:
@@ -30,8 +31,9 @@ on:
       budget:
         description: "Camera budget legs: both (rs, rs-budget, go), on (rs-budget, go) or off (rs, go)"
         type: choice
-        options: [both, on, off]
-        default: both
+        # Quoted: bare on and off are YAML booleans, and the choice would not take them.
+        options: ['both', 'on', 'off']
+        default: 'both'
   pull_request:
     paths:
       - 'crates/lms-sim/**'

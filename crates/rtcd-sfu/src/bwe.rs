@@ -352,17 +352,21 @@ impl PathMeter {
     /// The rate of the narrowest link: the median of what the last bursts arrived at, as long as
     /// enough of them are recent.
     fn capacity(&self, now: Instant) -> Option<f64> {
-        let mut rates: Vec<f64> = self
-            .trains
-            .iter()
-            .filter(|&&(at, _)| now.saturating_duration_since(at) <= TRAIN_AGE)
-            .map(|&(_, rate)| rate)
-            .collect();
-        if rates.len() < TRAINS / 3 {
+        // Called on every wake of the peer: the rates are sorted on the stack.
+        let mut rates = [0.0; TRAINS];
+        let mut n = 0;
+        for &(at, rate) in &self.trains {
+            if n < TRAINS && now.saturating_duration_since(at) <= TRAIN_AGE {
+                rates[n] = rate;
+                n += 1;
+            }
+        }
+        if n < TRAINS / 3 {
             return None;
         }
-        rates.sort_by(f64::total_cmp);
-        Some(rates[rates.len() / 2])
+        let rates = &mut rates[..n];
+        rates.sort_unstable_by(f64::total_cmp);
+        Some(rates[n / 2])
     }
 
     /// How the queue moved over the last [`TREND_SPAN`], once that much has been seen.

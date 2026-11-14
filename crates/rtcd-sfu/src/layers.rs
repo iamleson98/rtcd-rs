@@ -98,9 +98,9 @@ pub(crate) const GROWTH_CEILING: f64 = 2.0;
 /// narrowest link of the path carries (when that is known). A rung that brought congestion is not
 /// tried again for a wait that doubles each time, and is forgotten once held without trouble.
 pub(crate) const CAPACITY_SHARE: f64 = 0.85;
-pub(crate) const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
-pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(20);
-pub(crate) const FORGET_AFTER: Duration = Duration::from_secs(12);
+const INITIAL_BACKOFF: Duration = Duration::from_secs(10);
+const MAX_BACKOFF: Duration = Duration::from_secs(120);
+const FORGET_AFTER: Duration = Duration::from_secs(30);
 
 /// One step of what a receiver can be sent of a screen share: a simulcast layer, and the highest
 /// of its temporal layers sent (`None`: every frame of the layer).
