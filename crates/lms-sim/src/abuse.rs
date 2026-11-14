@@ -86,7 +86,7 @@ use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use crate::assets::Assets;
+use crate::assets::{Assets, CameraLayers};
 use crate::class::{self, Ctl, Participant, Quirk, Spec};
 use crate::host::{CLIENT, KEY, Rtcd};
 use crate::hostile::{Hostile, Rng};
@@ -1042,6 +1042,7 @@ pub struct Args {
     pub call: String,
     pub only: Vec<Class>,
     pub intensity: u8,
+    pub camera_layers: CameraLayers,
 }
 
 pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -1055,6 +1056,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
         call: "channel-lesson".into(),
         only: Vec::new(),
         intensity: 3,
+        camera_layers: CameraLayers::default(),
     };
     let mut it = args;
     while let Some(k) = it.next() {
@@ -1084,6 +1086,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
                     .collect::<Result<_, _>>()?;
             }
             "--intensity" => a.intensity = n()?.clamp(1, 5) as u8,
+            "--camera-layers" => a.camera_layers = CameraLayers::parse(&v)?,
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -1102,7 +1105,11 @@ pub async fn run(args: impl Iterator<Item = String>, assets: PathBuf) {
             std::process::exit(2);
         }
     };
-    let assets = Arc::new(Assets::load(&assets).expect("the media is made (ffmpeg)"));
+    let assets = Arc::new(
+        Assets::load(&assets)
+            .expect("the media is made (ffmpeg)")
+            .with_camera_layers(a.camera_layers),
+    );
     let _ = rustls::crypto::ring::default_provider().install_default();
     let sink = Sink::open(&a.out).expect("the output file opens");
     let rows = Rows::new(sink, "all", a.seed, &a.imp);

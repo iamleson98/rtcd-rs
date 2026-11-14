@@ -1,4 +1,4 @@
-"""Tests of ceiling.py and hold.py: python3 -m unittest discover -s scripts/lesson-soak"""
+"""Tests of ceiling.py, hold.py and pairs.py: python3 -m unittest discover -s scripts/lesson-soak"""
 import json
 import os
 import subprocess
@@ -10,6 +10,7 @@ here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, here)
 import ceiling  # noqa: E402
 import hold  # noqa: E402
+import pairs  # noqa: E402
 
 
 def proc(cpus, start=0):
@@ -135,3 +136,24 @@ class Files(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Pairs(unittest.TestCase):
+    rules = {"compare": [{"subject": "rtcd-rs", "baseline": "rtcd-go"},
+                         {"subject": "rtcd-rs/chrome", "baseline": "rtcd-go/chrome", "clean_zero": ["stalls"]}],
+             "ratio": 1.25}
+
+    def test_the_budget_soak_is_the_gated_subject_and_rs_a_report_only_baseline(self):
+        got = pairs.build(self.rules, ["rs", "rs-budget", "go"])["compare"]
+        self.assertEqual([(p["subject"], p["baseline"], p.get("gate", True)) for p in got], [
+            ("rtcd-rs-budget", "rtcd-go", True), ("rtcd-rs-budget/chrome", "rtcd-go/chrome", True),
+            ("rtcd-rs-budget", "rtcd-rs", False), ("rtcd-rs-budget/chrome", "rtcd-rs/chrome", False)])
+        self.assertEqual(got[3]["clean_zero"], ["stalls"])
+
+    def test_without_the_budget_soak_rs_is_held_against_go(self):
+        got = pairs.build(self.rules, ["rs", "go"])
+        self.assertEqual(got, self.rules)
+
+    def test_without_the_plain_soak_there_is_nothing_report_only(self):
+        got = pairs.build(self.rules, ["rs-budget", "go"])["compare"]
+        self.assertEqual([p["subject"] for p in got], ["rtcd-rs-budget", "rtcd-rs-budget/chrome"])

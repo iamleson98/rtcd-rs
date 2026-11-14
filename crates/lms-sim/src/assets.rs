@@ -95,10 +95,40 @@ impl Voice {
     }
 }
 
+/// How a camera is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CameraLayers {
+    /// One stream of 640x360 at 30 fps with no temporal layers: what the sim sent before it knew
+    /// the browser's encodings, kept so that those runs can be reproduced.
+    Single,
+    /// Two simulcast layers (`l` and `h`), each with three temporal layers, as lms-web's
+    /// `cameraEncodings` sends them.
+    #[default]
+    Simulcast,
+}
+
+impl CameraLayers {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "single" => Ok(Self::Single),
+            "simulcast" => Ok(Self::Simulcast),
+            _ => Err("--camera-layers is single or simulcast".into()),
+        }
+    }
+}
+
 /// The files, made if they are not there.
 #[derive(Debug, Clone)]
 pub struct Assets {
+    pub camera_layers: CameraLayers,
+    /// The single-layer camera.
     pub camera: Clip,
+    /// The small simulcast layer, the same for everyone: 320x180, 15 fps, 150 kbit/s.
+    pub camera_low: Clip,
+    /// The large simulcast layer of the teacher: 640x360, 24 fps, 600 kbit/s.
+    pub camera_teacher: Clip,
+    /// The large simulcast layer of a student: 640x360, 20 fps, 400 kbit/s.
+    pub camera_student: Clip,
     pub screen: Clip,
     pub voice: Voice,
 }
@@ -118,6 +148,12 @@ fn ffmpeg(args: &[&str]) -> std::io::Result<()> {
 }
 
 impl Assets {
+    /// The same media, with cameras sent as `layers`.
+    pub fn with_camera_layers(mut self, layers: CameraLayers) -> Self {
+        self.camera_layers = layers;
+        self
+    }
+
     pub fn load(dir: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let make = |name: &str, args: &[&str]| -> std::io::Result<PathBuf> {
@@ -132,6 +168,48 @@ impl Assets {
             }
             Ok(path)
         };
+        // One simulcast layer of a camera, as a browser's encoder makes it: VP8 with three temporal
+        // layers (frame `n` is in layer 0, 2, 1, 2 for `n` mod 4 = 0, 1, 2, 3) and a keyframe only
+        // at the start, for the rest on request.
+        let layer = |name: &str, size: &str, fps: u32, kbps: u32| -> std::io::Result<PathBuf> {
+            let src = format!("testsrc2=size={size}:rate={fps}");
+            let (b, ts) = (
+                format!("{kbps}k"),
+                format!(
+                    "ts_number_layers=3:ts_target_bitrate={},{},{kbps}:ts_rate_decimator=4,2,1:ts_periodicity=4:ts_layer_id=0,2,1,2",
+                    kbps * 2 / 5,
+                    kbps * 3 / 5,
+                ),
+            );
+            make(
+                name,
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &src,
+                    "-t",
+                    "20",
+                    "-c:v",
+                    "libvpx",
+                    "-b:v",
+                    &b,
+                    "-g",
+                    "3000",
+                    "-deadline",
+                    "realtime",
+                    "-cpu-used",
+                    "8",
+                    "-ts-parameters",
+                    &ts,
+                    "-f",
+                    "ivf",
+                ],
+            )
+        };
+        let camera_low = layer("cam-l.ivf", "320x180", 15, 150)?;
+        let camera_teacher = layer("cam-h-teacher.ivf", "640x360", 24, 600)?;
+        let camera_student = layer("cam-h-student.ivf", "640x360", 20, 400)?;
         // A camera: 640x360 at 30 fps, 500 kb/s, a keyframe every two seconds.
         let camera = make(
             "camera.ivf",
@@ -200,7 +278,11 @@ impl Assets {
             ],
         )?;
         Ok(Self {
+            camera_layers: CameraLayers::default(),
             camera: Clip::read(&camera)?,
+            camera_low: Clip::read(&camera_low)?,
+            camera_teacher: Clip::read(&camera_teacher)?,
+            camera_student: Clip::read(&camera_student)?,
             screen: Clip::read(&screen)?,
             voice: Voice::read(&voice)?,
         })
@@ -227,6 +309,28 @@ mod tests {
             a.camera.frames.iter().filter(|f| f.1).count() >= 9,
             "keyframes every two seconds"
         );
+        for (clip, size, fps) in [
+            (&a.camera_low, (320, 180), 15),
+            (&a.camera_teacher, (640, 360), 24),
+            (&a.camera_student, (640, 360), 20),
+        ] {
+            assert_eq!((clip.width, clip.height, clip.fps), (size.0, size.1, fps));
+            assert!(clip.frames[0].1, "starts on a keyframe");
+            assert_eq!(clip.frames.len() % 4, 0, "the temporal pattern loops whole");
+            assert_eq!(clip.frames.iter().filter(|f| f.1).count(), 1);
+            // Frames of temporal layer 0 are the base the others lean on, so they are the larger.
+            let mean = |tid: fn(usize) -> bool| {
+                let sizes: Vec<usize> = (1..clip.frames.len())
+                    .filter(|n| tid(*n))
+                    .map(|n| clip.frames[n].0.len())
+                    .collect();
+                sizes.iter().sum::<usize>() / sizes.len()
+            };
+            assert!(
+                mean(|n| n % 4 == 0) > mean(|n| n % 2 == 1),
+                "frames 0 mod 4 are layer 0 and the odd ones layer 2"
+            );
+        }
         assert_eq!((a.screen.width, a.screen.height), (1280, 720));
         assert!(
             a.voice.packets.len() >= 990,

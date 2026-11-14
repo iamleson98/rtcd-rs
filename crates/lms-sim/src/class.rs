@@ -42,7 +42,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::assets::{Assets, Clip};
+use crate::assets::{Assets, CameraLayers, Clip};
 use crate::host::{Rtcd, RtcdConn};
 use crate::hostile::{self, Hostile, Hot, Rng};
 use crate::stats::{Probe, Receiver};
@@ -173,12 +173,60 @@ pub(crate) struct Video {
     pub(crate) ssrcs: Vec<u32>,
     pub(crate) seq: Vec<u16>,
     pub(crate) ts: Vec<u32>,
-    pub(crate) picture_id: u8,
-    pub(crate) pos: usize,
-    pub(crate) clip: Clip,
+    /// Per layer: the clip it replays (layers differ in size and rate), the next frame of it, the
+    /// VP8 picture id, TL0PICIDX, and when its next frame is due and how far apart they are.
+    pub(crate) clips: Vec<Clip>,
+    pub(crate) pos: Vec<usize>,
+    pub(crate) picture_id: Vec<u16>,
+    pub(crate) tl0: Vec<u8>,
+    pub(crate) next: Vec<Instant>,
+    pub(crate) step: Vec<Duration>,
+    /// Whether the payload descriptor carries a 15-bit picture id, TL0PICIDX and the temporal layer
+    /// (frame `n` of a clip in layer 0, 2, 1, 2 for `n` mod 4 = 0, 1, 2, 3, as its encoder made it).
+    pub(crate) temporal: bool,
     pub(crate) mid: Option<String>,
-    pub(crate) next: Instant,
-    pub(crate) step: Duration,
+}
+
+impl Video {
+    /// A sender of one layer per clip (an SSRC each), starting now.
+    fn new(
+        sender: RTCRtpSenderId,
+        label: &'static str,
+        ssrcs: Vec<u32>,
+        clips: Vec<Clip>,
+        (temporal, wrap): (bool, bool),
+        now: Instant,
+    ) -> Self {
+        let n = ssrcs.len();
+        let (seq, ts) = if wrap {
+            (vec![WRAP_SEQ; n], vec![WRAP_VIDEO_TS; n])
+        } else {
+            (vec![100, 5000], vec![1000, 900_000])
+        };
+        Self {
+            sender,
+            label,
+            seq: seq[..n].to_vec(),
+            ts: ts[..n].to_vec(),
+            ssrcs,
+            picture_id: vec![10; n],
+            tl0: vec![0; n],
+            pos: vec![0; n],
+            next: vec![now; n],
+            step: clips
+                .iter()
+                .map(|c| Duration::from_micros(1_000_000 / u64::from(c.fps)))
+                .collect(),
+            clips,
+            temporal,
+            mid: None,
+        }
+    }
+
+    /// The encoder starts over with a keyframe on every layer.
+    fn restart(&mut self) {
+        self.pos.fill(0);
+    }
 }
 
 fn host_candidate(addr: SocketAddr) -> RTCIceCandidateInit {
@@ -540,7 +588,22 @@ async fn build(
     let now = Instant::now();
     let camera = spec.camera.then(|| {
         let stream = format!("camera-stream-{}", spec.name);
-        let ssrcs = vec![base + 1];
+        // Cameras are sent as lms-web sends them: a small layer and a large one, the teacher's
+        // larger and faster than a student's.
+        let simulcast = assets.camera_layers == CameraLayers::Simulcast;
+        let (ssrcs, clips) = if simulcast {
+            let high = if spec.name == "teacher" {
+                &assets.camera_teacher
+            } else {
+                &assets.camera_student
+            };
+            (
+                vec![base + 1, base + 4],
+                vec![assets.camera_low.clone(), high.clone()],
+            )
+        } else {
+            (vec![base + 1], vec![assets.camera.clone()])
+        };
         let sender = video_track(&mut pc, &stream, &format!("camera-{}", spec.name), &ssrcs);
         announce.push(message(
             &session_id,
@@ -548,19 +611,7 @@ async fn build(
             MessageType::VideoOn,
             serde_json::to_vec(&serde_json::json!({ "videoStreamID": stream })).unwrap(),
         ));
-        Video {
-            sender,
-            label: "camera",
-            seq: vec![if spec.wrap { WRAP_SEQ } else { 100 }],
-            ts: vec![if spec.wrap { WRAP_VIDEO_TS } else { 1000 }],
-            ssrcs,
-            picture_id: 10,
-            pos: 0,
-            clip: assets.camera.clone(),
-            mid: None,
-            next: now,
-            step: Duration::from_micros(1_000_000 / u64::from(assets.camera.fps)),
-        }
+        Video::new(sender, "camera", ssrcs, clips, (simulcast, spec.wrap), now)
     });
     let screen = spec.screen.then(|| {
         let stream = format!("screen-stream-{}", spec.name);
@@ -572,27 +623,8 @@ async fn build(
             MessageType::ScreenOn,
             serde_json::to_vec(&serde_json::json!({ "screenStreamID": stream })).unwrap(),
         ));
-        Video {
-            sender,
-            label: "screen",
-            seq: if spec.wrap {
-                vec![WRAP_SEQ; 2]
-            } else {
-                vec![100, 5000]
-            },
-            ts: if spec.wrap {
-                vec![WRAP_VIDEO_TS; 2]
-            } else {
-                vec![1000, 900_000]
-            },
-            ssrcs,
-            picture_id: 90,
-            pos: 0,
-            clip: assets.screen.clone(),
-            mid: None,
-            next: now,
-            step: Duration::from_micros(1_000_000 / u64::from(assets.screen.fps)),
-        }
+        let clips = vec![assets.screen.clone(); 2];
+        Video::new(sender, "screen", ssrcs, clips, (false, spec.wrap), now)
     });
     pc.add_local_candidate(host_candidate(addr))
         .expect("local candidate");
@@ -780,7 +812,7 @@ async fn drive(
                             // An encoder answers a keyframe request with a keyframe: the clip starts over.
                             for v in [camera.as_mut(), screen.as_mut()].into_iter().flatten() {
                                 if v.ssrcs.iter().any(|s| asked.contains(s)) {
-                                    v.pos = 0;
+                                    v.restart();
                                 }
                             }
                         }
@@ -865,27 +897,26 @@ async fn drive(
                 } else {
                     [true; 2]
                 };
-                while v.next <= now {
-                    if on {
-                        let (seq, ts) = (v.seq[0], v.ts[0]);
-                        send_frame(&mut pc, v, mask);
-                        if let Some(p) = probe {
-                            for (wrapped, name) in
-                                [(v.seq[0] < seq, "seq"), (v.ts[0] < ts, "timestamp")]
-                            {
-                                if wrapped {
-                                    p.event(me, "wrap", &format!("tx {name} {}", v.label));
+                for l in 0..v.ssrcs.len() {
+                    while v.next[l] <= now {
+                        if on {
+                            let (seq, ts) = (v.seq[l], v.ts[l]);
+                            send_frame(&mut pc, v, l, mask[l % 2]);
+                            if let (0, Some(p)) = (l, probe) {
+                                for (wrapped, name) in
+                                    [(v.seq[0] < seq, "seq"), (v.ts[0] < ts, "timestamp")]
+                                {
+                                    if wrapped {
+                                        p.event(me, "wrap", &format!("tx {name} {}", v.label));
+                                    }
                                 }
                             }
+                        } else {
+                            // The camera is off, and time goes on.
+                            v.ts[l] = v.ts[l].wrapping_add(90_000 / v.clips[l].fps);
                         }
-                    } else {
-                        // The camera is off, and time goes on.
-                        let tick = 90_000 / v.clip.fps;
-                        for t in &mut v.ts {
-                            *t = t.wrapping_add(tick);
-                        }
+                        v.next[l] += v.step[l];
                     }
-                    v.next += v.step;
                 }
             }
             // Answers a slow client held back are due.
@@ -926,7 +957,7 @@ async fn drive(
         } else {
             next_audio = now;
             for v in [camera.as_mut(), screen.as_mut()].into_iter().flatten() {
-                v.next = now;
+                v.next.fill(now);
             }
         }
 
@@ -960,7 +991,9 @@ async fn drive(
                 wake = wake.min(next_audio);
             }
             for v in [camera.as_ref(), screen.as_ref()].into_iter().flatten() {
-                wake = wake.min(v.next);
+                for n in &v.next {
+                    wake = wake.min(*n);
+                }
             }
         }
         let sleep = tokio::time::sleep(wake.saturating_duration_since(Instant::now()));
@@ -1239,8 +1272,11 @@ fn send_voice(
     }
 }
 
-/// Sends the clip's next frame on every layer, as a browser's encoder does.
-fn send_frame(pc: &mut RTCPeerConnection, v: &mut Video, mask: [bool; 2]) {
+/// The temporal layer of frames 0, 1, 2, 3 of a clip, over and over (L1T3, as libwebrtc's VP8).
+const TEMPORAL_PATTERN: [u8; 4] = [0, 2, 1, 2];
+
+/// Sends the next frame of layer `l` (skipped on the wire when `on` is false, the clip goes on).
+fn send_frame(pc: &mut RTCPeerConnection, v: &mut Video, l: usize, on: bool) {
     let now = Instant::now();
     let (pt, mid_ext, rid_ext) = {
         let Some(mut s) = pc.rtp_sender(v.sender) else {
@@ -1270,45 +1306,58 @@ fn send_frame(pc: &mut RTCPeerConnection, v: &mut Video, mask: [bool; 2]) {
             .and_then(|t| t.mid().clone());
     }
     let Some(mid) = v.mid.clone() else { return };
-    let (frame, _) = v.clip.frames[v.pos % v.clip.frames.len()].clone();
-    v.pos = (v.pos + 1) % v.clip.frames.len();
-    v.picture_id = v.picture_id.wrapping_add(1) & 0x7f;
+    let clip = &v.clips[l];
+    let step = v.pos[l] % 4;
+    let (frame, key) = clip.frames[v.pos[l] % clip.frames.len()].clone();
+    v.pos[l] = (v.pos[l] + 1) % clip.frames.len();
+    v.ts[l] = v.ts[l].wrapping_add(90_000 / clip.fps);
+    // A browser's picture id is 15 bits with temporal layers; the plain stream's is 7.
+    v.picture_id[l] = v.picture_id[l].wrapping_add(1) & if v.temporal { 0x7fff } else { 0x7f };
+    let tid = TEMPORAL_PATTERN[step];
+    if v.temporal && tid == 0 {
+        v.tl0[l] = v.tl0[l].wrapping_add(1);
+    }
+    if !on {
+        return;
+    }
+    let sync = !key && (tid == 1 || step == 1);
+    let pid = v.picture_id[l];
     let chunks: Vec<&[u8]> = frame.chunks(MTU_PAYLOAD).collect();
-    let tick = 90_000 / v.clip.fps;
-    for l in 0..v.ssrcs.len() {
-        v.ts[l] = v.ts[l].wrapping_add(tick);
-        if !mask[l % 2] {
-            continue;
+    for (n, chunk) in chunks.iter().enumerate() {
+        let first = n == 0;
+        let mut payload = vec![0x80 | if first { 0x10 } else { 0 }];
+        if v.temporal {
+            // I, L and T set, as libwebrtc does (no key index).
+            payload.extend_from_slice(&[0xe0, 0x80 | (pid >> 8) as u8, pid as u8, v.tl0[l]]);
+            payload.push(tid << 6 | u8::from(sync) << 5);
+        } else {
+            payload.extend_from_slice(&[0x80, pid as u8]);
         }
-        for (n, chunk) in chunks.iter().enumerate() {
-            let first = n == 0;
-            let mut payload = vec![0x80 | if first { 0x10 } else { 0 }, 0x80, v.picture_id];
-            payload.extend_from_slice(chunk);
-            let mut header = rtc::rtp::header::Header {
-                version: 2,
-                marker: n == chunks.len() - 1,
-                payload_type: pt,
-                sequence_number: v.seq[l],
-                timestamp: v.ts[l],
-                ssrc: v.ssrcs[l],
-                ..Default::default()
-            };
-            if let Some(id) = mid_ext {
-                let _ = header.set_extension(id, Bytes::from(mid.clone().into_bytes()));
-            }
-            if let (Some(id), true) = (rid_ext, v.ssrcs.len() > 1) {
-                let _ = header.set_extension(id, Bytes::from(if l == 0 { "l" } else { "h" }));
-            }
-            v.seq[l] = v.seq[l].wrapping_add(1);
-            if let Some(mut s) = pc.rtp_sender(v.sender) {
-                let _ = s.write_rtp(
-                    now,
-                    rtc::rtp::packet::Packet {
-                        header,
-                        payload: Bytes::from(payload),
-                    },
-                );
-            }
+        payload.extend_from_slice(chunk);
+        let mut header = rtc::rtp::header::Header {
+            version: 2,
+            marker: n == chunks.len() - 1,
+            payload_type: pt,
+            sequence_number: v.seq[l],
+            timestamp: v.ts[l],
+            ssrc: v.ssrcs[l],
+            ..Default::default()
+        };
+        if let Some(id) = mid_ext {
+            let _ = header.set_extension(id, Bytes::from(mid.clone().into_bytes()));
+        }
+        if let (Some(id), true) = (rid_ext, v.ssrcs.len() > 1) {
+            let _ = header.set_extension(id, Bytes::from(if l == 0 { "l" } else { "h" }));
+        }
+        v.seq[l] = v.seq[l].wrapping_add(1);
+        if let Some(mut s) = pc.rtp_sender(v.sender) {
+            let _ = s.write_rtp(
+                now,
+                rtc::rtp::packet::Packet {
+                    header,
+                    payload: Bytes::from(payload),
+                },
+            );
         }
     }
 }
@@ -1316,6 +1365,29 @@ fn send_frame(pc: &mut RTCPeerConnection, v: &mut Video, mask: [bool; 2]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_simulcast_camera_has_two_layers_and_a_temporal_pattern() {
+        let Some(assets) = Assets::load(&std::env::temp_dir().join("lms-sim-assets")).ok() else {
+            return;
+        };
+        let clips = [
+            &assets.camera_low,
+            &assets.camera_teacher,
+            &assets.camera_student,
+        ];
+        let v = Video::new(
+            RTCRtpSenderId::from(0usize),
+            "camera",
+            vec![1, 2],
+            vec![clips[0].clone(), clips[1].clone()],
+            (true, false),
+            Instant::now(),
+        );
+        assert_eq!((v.ssrcs.len(), v.step.len(), v.clips.len()), (2, 2, 2));
+        assert!(v.step[0] > v.step[1], "the small layer is the slower");
+        assert_eq!(TEMPORAL_PATTERN, [0, 2, 1, 2]);
+    }
 
     #[test]
     fn rejoins_and_rebinds_never_share_a_port_and_stay_in_the_block() {

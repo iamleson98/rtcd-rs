@@ -24,6 +24,9 @@
 //! student of an impaired group changes its UDP source port now and then) and `--mtu` (an impaired
 //! group sends datagrams of MTU size and over).
 //!
+//! `--camera-layers single|simulcast` (default `simulcast`) sets how cameras are sent: the browser's
+//! two layers with three temporal layers each, or one plain stream.
+//!
 //! The first `--measure` students of a process measure what they receive (the teacher's voice,
 //! camera and screen, and the student cameras) and write it every 5 s, see `lms_sim::stats`. With
 //! `--chrome PORT` the process also serves the page for a headless Chrome (on loopback, for one in the
@@ -35,7 +38,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lms_sim::abuse::{LessonAttacks, Rows};
-use lms_sim::assets::Assets;
+use lms_sim::assets::{Assets, CameraLayers};
 use lms_sim::chrome;
 use lms_sim::class::{self, Ctl, Spec};
 use lms_sim::host::Rtcd;
@@ -61,6 +64,7 @@ struct Args {
     teacher_reconnect_mins: Option<u64>,
     nat_rebind_secs: Option<u64>,
     mtu: bool,
+    camera_layers: CameraLayers,
     call: String,
     out: PathBuf,
 }
@@ -86,6 +90,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
         teacher_reconnect_mins: None,
         nat_rebind_secs: None,
         mtu: false,
+        camera_layers: CameraLayers::default(),
         call: "channel-lesson".into(),
         out: PathBuf::new(),
     };
@@ -132,6 +137,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--seed" => a.seed = Some(n()?),
             "--teacher-reconnect-every" => a.teacher_reconnect_mins = Some(n()?.max(1)),
             "--nat-rebind-every" => a.nat_rebind_secs = Some(n()?.max(1)),
+            "--camera-layers" => a.camera_layers = CameraLayers::parse(&v)?,
             "--call" => a.call = v.clone(),
             "--out" => a.out = v.into(),
             other => return Err(format!("unknown option {other}")),
@@ -156,7 +162,11 @@ pub async fn run(args: impl Iterator<Item = String>, assets: PathBuf) {
             std::process::exit(2);
         }
     };
-    let assets = Arc::new(Assets::load(&assets).expect("the media is made (ffmpeg)"));
+    let assets = Arc::new(
+        Assets::load(&assets)
+            .expect("the media is made (ffmpeg)")
+            .with_camera_layers(a.camera_layers),
+    );
     let _ = rustls::crypto::ring::default_provider().install_default();
     let sink = Sink::open(&a.out).expect("the output file opens");
     let rtcd = Arc::new(Rtcd::remote(&a.http, a.media).await);

@@ -8,9 +8,11 @@ name: lesson-soak
 #           the two services' ceilings (found by `calibrate` on the same runner type), churn, hostile
 #           clients, junk and signaling abuse, and a network abuse profile for each participant, from
 #           one seed (the run id) so both services meet the same attacks.
-# The report compares the first and the last clean stretch of each service, holds rtcd-rs against the
-# Go rtcd (the same lesson, the same network, the same machine type) and fails when rtcd-rs drifts,
-# crashes or is less stable.
+# rtcd-rs runs twice, with the camera budget off (`rs`) and on (`rs-budget`, the same image; the
+# variable is set explicitly for each), beside the Go rtcd (`go`). The report compares the first and
+# the last clean stretch of each service, holds rtcd-rs-budget against the Go rtcd (the same lesson,
+# the same network, the same machine type) and fails when it drifts, crashes or is less stable;
+# rtcd-rs-budget against rtcd-rs is in the report only.
 
 on:
   schedule:
@@ -25,6 +27,11 @@ on:
         description: "Minutes in one cycle of network phases"
         required: false
         default: "20"
+      budget:
+        description: "Camera budget legs: both (rs, rs-budget, go), on (rs-budget, go) or off (rs, go)"
+        type: choice
+        options: [both, on, off]
+        default: both
   pull_request:
     paths:
       - 'crates/lms-sim/**'
@@ -43,6 +50,7 @@ jobs:
     name: Plan
     runs-on: ubuntu-latest
     outputs:
+      impls: ${{ steps.plan.outputs.impls }}
       minutes: ${{ steps.plan.outputs.minutes }}
       cycle: ${{ steps.plan.outputs.cycle }}
       ramp_step: ${{ steps.plan.outputs.ramp_step }}
@@ -54,6 +62,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           MINUTES: ${{ inputs.minutes }}
           CYCLE: ${{ inputs.cycle }}
+          BUDGET: ${{ inputs.budget }}
         run: |
           case "$EVENT" in
             pull_request) minutes=10 cycle=5 ramp_step=20 ramp_per_step=1 ramp_max=6 ;;
@@ -62,9 +71,18 @@ jobs:
           esac
           case "$minutes$cycle" in *[!0-9]*|'') echo "minutes and cycle must be whole numbers"; exit 1 ;; esac
           [ "$minutes" -le 150 ] || { echo "a lesson is at most 150 minutes (the job's timeout is 180)"; exit 1; }
+          # The services to run: the budget legs, and always the Go baseline. A run that is not started
+          # by hand (and so has no input) and a pull request run all three.
+          case "${BUDGET:-both}" in
+            both) impls='["rs","rs-budget","go"]' ;;
+            on) impls='["rs-budget","go"]' ;;
+            off) impls='["rs","go"]' ;;
+            *) echo "budget is both, on or off"; exit 1 ;;
+          esac
           # The calibration ramp: at most ramp_max / ramp_per_step steps of ramp_step seconds for each
           # service, so the two of them fit the calibrate job's 60 minutes with the image builds.
           {
+            echo "impls=$impls"
             echo "minutes=$minutes"
             echo "cycle=$cycle"
             echo "ramp_step=$ramp_step"
@@ -84,11 +102,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        impl: [rs, go]
+        impl: ${{ fromJSON(needs.plan.outputs.impls) }}
         arch: [x64, arm64]
         include:
           - { arch: x64, os: ubuntu-latest }
           - { arch: arm64, os: ubuntu-24.04-arm }
+    env:
+      # One seed for every service and architecture of this run (not the date: a run can span midnight).
+      SEED: ${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -165,7 +186,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        impl: [rs, go]
+        impl: ${{ fromJSON(needs.plan.outputs.impls) }}
         arch: [x64, arm64]
         include:
           - { arch: x64, os: ubuntu-latest }
@@ -207,7 +228,7 @@ jobs:
 
   report:
     name: Report (${{ matrix.profile }}, ${{ matrix.arch }})
-    needs: [lesson, abuse]
+    needs: [plan, lesson, abuse]
     if: always() && (needs.lesson.result != 'skipped' || needs.abuse.result != 'skipped')
     runs-on: ubuntu-latest
     strategy:
@@ -225,10 +246,13 @@ jobs:
           path: soak
       - name: Every soak produced its measurements
         id: inputs
+        env:
+          IMPLS: ${{ join(fromJSON(needs.plan.outputs.impls), ' ') }}
         run: |
           set +e
           missing=0
-          for impl in rs go; do
+          read -ra impls <<<"$IMPLS"
+          for impl in "${impls[@]}"; do
             dir=soak/lesson-soak-${{ matrix.profile }}-$impl-${{ matrix.arch }}
             if [ -z "$(find "$dir" -name 'rtcd-*.jsonl' -size +0 2>/dev/null)" ]; then
               echo "::error::no measurements from the $impl ${{ matrix.profile }} soak on ${{ matrix.arch }}"
@@ -239,11 +263,16 @@ jobs:
           exit 0
       - name: Compare
         id: report
+        env:
+          IMPLS: ${{ join(fromJSON(needs.plan.outputs.impls), ' ') }}
         run: |
           set +e
           rules=scripts/lesson-soak/rules.json
           [ "${{ matrix.profile }}" = abuse ] && rules=scripts/lesson-soak/rules-abuse.json
-          python3 vendor/rtc/benchmarks/soak/report.py --rules "$rules" --out report soak/*/rtcd-*.jsonl
+          # The pairs for the services that ran (see pairs.py).
+          read -ra impls <<<"$IMPLS"
+          python3 scripts/lesson-soak/pairs.py "$rules" pairs.json "${impls[@]}"
+          python3 vendor/rtc/benchmarks/soak/report.py --rules pairs.json --out report soak/*/rtcd-*.jsonl
           echo "status=$?" >> "$GITHUB_OUTPUT"
           if [ -f report/summary.md ]; then
             {

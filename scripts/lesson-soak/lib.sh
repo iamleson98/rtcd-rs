@@ -2,7 +2,7 @@
 # What run.sh (a lesson or an abuse soak) and calibrate.sh (the load ramp) share: the images, the
 # network and its addresses, the SFU in a container of two CPUs, its sampler, the lesson client
 # containers, the background load and the evidence of a crash. Sourced, never run. The caller sets
-# IMPL (rs|go), OUT (an existing absolute directory), here and root (this directory and the
+# IMPL (rs|rs-budget|go), OUT (an existing absolute directory), here and root (this directory and the
 # repository) before it calls anything.
 
 SOAK_DIR=${SOAK_DIR:-$root/vendor/rtc/benchmarks/soak}
@@ -11,7 +11,13 @@ CHROME_IMAGE=${CHROME_IMAGE:-rtcd-lesson-chrome:soak}
 # The upstream Go service, the latest stable release when this was written (2026-06-29), by tag and
 # by the digest of its multi-arch index (linux/amd64 and linux/arm64).
 GO_IMAGE='mattermost/rtcd:v1.2.6@sha256:a8c3c1c3fa2937527d3a96351534fa116106b88aca777bed49d6a360fb2eacd3'
-if [ "$IMPL" = rs ]; then SFU_IMAGE=${SFU_IMAGE:-rtcd-rs:soak}; else SFU_IMAGE=${SFU_IMAGE:-$GO_IMAGE}; fi
+# rs and rs-budget are the same image: they differ in the camera budget alone (RTCD_RTC_CAMERABUDGET),
+# set explicitly for each so that a change of the service's default moves neither.
+case "$IMPL" in
+  rs) SFU_IMAGE=${SFU_IMAGE:-rtcd-rs:soak} SFU_EXTRA_ENV=(-e RTCD_RTC_CAMERABUDGET=false) ;;
+  rs-budget) SFU_IMAGE=${SFU_IMAGE:-rtcd-rs:soak} SFU_EXTRA_ENV=(-e RTCD_RTC_CAMERABUDGET=true) ;;
+  *) SFU_IMAGE=${SFU_IMAGE:-$GO_IMAGE} SFU_EXTRA_ENV=() ;;
+esac
 # What the lines say (and `uname -m` on a Mac says arm64).
 ARCH=$(uname -m)
 [ "$ARCH" = arm64 ] && ARCH=aarch64
@@ -38,7 +44,7 @@ machine() {
 # The images (built here when they are not prebuilt), the artifacts' machine.txt and the network.
 # $1 = chrome when the browser image is needed.
 prepare() {
-  if [ "$IMPL" = rs ] && ! docker image inspect "$SFU_IMAGE" >/dev/null 2>&1; then
+  if [ "$IMPL" != go ] && ! docker image inspect "$SFU_IMAGE" >/dev/null 2>&1; then
     docker build -t "$SFU_IMAGE" "$root"
   fi
   docker image inspect "$LESSON_IMAGE" >/dev/null 2>&1 || docker build -f "$here/Dockerfile" -t "$LESSON_IMAGE" "$root"
@@ -72,7 +78,8 @@ segment_in_software() {
 }
 
 # The SFU in a container named soak-sfu, with the same settings for both services by the RTCD_*
-# variables they share, and waits until it answers.
+# variables they share, and waits until it answers. The arguments are more `-e NAME=value` options
+# for the container (run.sh and calibrate.sh pass SFU_EXTRA_ENV, the service's own settings).
 start_sfu() {
   local envs=(
     -e RTCD_API_HTTP_LISTENADDRESS=:8045
@@ -85,7 +92,7 @@ start_sfu() {
     -e RTCD_LOGGER_CONSOLELEVEL=INFO
   )
   docker run -d --name soak-sfu --network "$NET" --ip "$SFU_IP" "${sfu_cpu[@]}" \
-    --memory=4g --memory-swap=4g --ulimit nofile=65536:65536 "${envs[@]}" "$SFU_IMAGE" >/dev/null
+    --memory=4g --memory-swap=4g --ulimit nofile=65536:65536 "${envs[@]}" ${1+"$@"} "$SFU_IMAGE" >/dev/null
   segment_in_software
   for _ in $(seq 60); do
     docker run --rm --network "$NET" "$LESSON_IMAGE" curl -sf "http://$SFU_IP:8045/version" >/dev/null 2>&1 && break
