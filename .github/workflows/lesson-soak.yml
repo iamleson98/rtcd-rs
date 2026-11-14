@@ -31,8 +31,9 @@ on:
       budget:
         description: "Camera budget legs: both (rs, rs-budget, go), on (rs-budget, go) or off (rs, go)"
         type: choice
-        options: [both, on, off]
-        default: both
+        # Quoted: bare on and off are YAML booleans, and the choice would not take them.
+        options: ['both', 'on', 'off']
+        default: 'both'
   pull_request:
     paths:
       - 'crates/lms-sim/**'
