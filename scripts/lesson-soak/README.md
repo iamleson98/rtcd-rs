@@ -107,7 +107,7 @@ colima start --cpu 6 --memory 10      # the SFU gets 2 CPUs, the clients and the
 scripts/lesson-soak/run.sh rs 4 2 /tmp/soak     # 4 minutes, a 2-minute cycle, rtcd-rs
 scripts/lesson-soak/run.sh rs-budget 4 2 /tmp/soak   # rtcd-rs with the camera budget on (rs: off)
 scripts/lesson-soak/run.sh go 4 2 /tmp/soak     # the same against the Go service
-# the pairs for the services that ran (rs-budget against go gates; against rs it is report only)
+# the pairs for the services that ran (rs against go gates; rs-budget is report only)
 python3 scripts/lesson-soak/pairs.py scripts/lesson-soak/rules.json /tmp/soak/pairs.json rs rs-budget go
 python3 vendor/rtc/benchmarks/soak/report.py --rules /tmp/soak/pairs.json --out /tmp/soak/report \
     /tmp/soak/rtcd-rs-*.jsonl /tmp/soak/rtcd-rs-budget-*.jsonl /tmp/soak/rtcd-go-*.jsonl
@@ -130,8 +130,8 @@ workflow (10 minutes, 5-minute cycle, a short calibration ramp). `rs` and `rs-bu
 a change of the service's default moves neither), labelled `rtcd-rs` and `rtcd-rs-budget`; every leg uses one `SEED`
 (the run id). One `report` job per architecture and
 profile runs `report.py` over the files of the services that ran (`rules.json` for `lesson`, `rules-abuse.json`
-for `abuse`, turned into pairs by `pairs.py`: rtcd-rs-budget against Go is gated, as rtcd-rs was, and rtcd-rs-budget
-against rtcd-rs is in the report only; with `budget: off` rtcd-rs is held against Go), writes `summary.md` to the run's summary and uploads `report.html` and the JSONL; it fails
+for `abuse`, turned into pairs by `pairs.py`: rtcd-rs as it ships is gated against Go, and rtcd-rs-budget against Go and
+against rtcd-rs is in the report only; with `budget: on` rtcd-rs-budget is gated against Go), writes `summary.md` to the run's summary and uploads `report.html` and the JSONL; it fails
 when rtcd-rs-budget (rtcd-rs when the budget legs are off) broke a rule, when a soak job failed (an SFU crash fails `run.sh`) or when a soak left no
 measurements. Both services run on the same runner type for each architecture. Artifacts are named
 `lesson-soak-<profile>-<impl>-<arch>`.
