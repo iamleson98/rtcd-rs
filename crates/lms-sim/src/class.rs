@@ -639,7 +639,7 @@ async fn drive(
         mut conn,
         mut pc,
         mut socket,
-        mut addr,
+        addr,
         mic,
         mic_ssrc,
         mut camera,
@@ -1022,8 +1022,10 @@ async fn drive(
                         if let Ok(s) = UdpSocket::bind(format!("{local}:{port}")).await
                             && let Ok(a) = s.local_addr()
                         {
+                            // Only the source the server sees changes: the peer connection keeps
+                            // the local address it was given, as behind a real NAT.
                             env.rtcd.exempt(a);
-                            (socket, addr) = (s, a);
+                            socket = s;
                             tally(1);
                         }
                     }

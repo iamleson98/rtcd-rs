@@ -20,8 +20,9 @@ use super::record::Tap;
 use super::session::SessionKey;
 use super::session::{DownPhase, DownStream, Lifecycle, Session, Source, SourceKey, SubRef};
 use super::types::CloseReason;
+use crate::camera_budget::NOMINAL_CAMERA_RATE;
 use crate::ids::{TrackType, track_id};
-use crate::layers::Layer;
+use crate::layers::{Layer, LayerRates, Steps};
 use crate::metrics::Direction;
 use crate::peer::AUDIO_LEVEL_URI;
 use crate::rate::RateMonitor;
@@ -341,7 +342,8 @@ impl Engine {
         let is_vp8 = codec.mime_type.eq_ignore_ascii_case("video/vp8");
         // The base temporal layer has a frame in four, a keyframe among them now and then: it is
         // measured over longer, so one keyframe does not read as a rate.
-        let temporal_rates = (is_vp8 && ty == TrackType::Screen)
+        let temporal_rates = (is_vp8
+            && (ty == TrackType::Screen || ty == TrackType::Video && self.cfg.camera_budget))
             .then(|| super::session::TemporalRates::new(window * 2));
         s.up.sources.push(Source {
             id,
@@ -355,6 +357,7 @@ impl Engine {
             out_track_id,
             rate: RateMonitor::new(window),
             temporal_rates,
+            steps: Steps::of(LayerRates::default(), NOMINAL_CAMERA_RATE),
             last_packet: Some(now),
             last_pli: None,
             gap: false,
@@ -563,6 +566,8 @@ impl Engine {
             target: video.then_some(source),
             rewrite: Rewriter::new(ssrc, 0, is_vp8),
             temporal: Default::default(),
+            paused: false,
+            pausing: false,
         };
         let Some(r) = self.sessions.get_mut(receiver) else {
             return;
@@ -643,15 +648,23 @@ impl Engine {
             let size = packet.marshal_size() as u64;
             let mut sent = [0u64; 4];
             let mut switched = Vec::new();
-            // A screen share's frames go to each receiver as far as its temporal layers allow.
-            let frame = (fan.vp8 && fan.ty == TrackType::Screen).then(|| Frame {
+            let mut pausing = Vec::new();
+            // The frames of a VP8 screen share, or camera when they are held to the receivers'
+            // paths, go to each receiver as far as its temporal layers allow.
+            let layered =
+                fan.ty == TrackType::Screen || fan.ty == TrackType::Video && self.cfg.camera_budget;
+            let frame = (fan.vp8 && layered).then(|| Frame {
                 descriptor: vp8::Descriptor::parse(&packet.payload),
                 key: vp8::is_keyframe(&packet.payload),
             });
 
             // Receivers waiting for this stream join it at a keyframe (any packet, for codecs whose
             // keyframes are not recognised).
-            if !fan.waiting.is_empty() && (!fan.vp8 || vp8::is_keyframe(&packet.payload)) {
+            if !fan.waiting.is_empty()
+                && frame
+                    .as_ref()
+                    .map_or_else(|| !fan.vp8 || vp8::is_keyframe(&packet.payload), |f| f.key)
+            {
                 for &sub in &fan.waiting {
                     let Some(r) = self.sessions.get_mut(sub.session) else {
                         continue;
@@ -660,7 +673,7 @@ impl Engine {
                     let Some(ds) = r.down.get_mut(sub.stream) else {
                         continue;
                     };
-                    if ds.phase != DownPhase::Active {
+                    if ds.phase != DownPhase::Active || ds.paused {
                         continue;
                     }
                     ds.rewrite.switch_to(&packet);
@@ -694,6 +707,10 @@ impl Engine {
                 if wrote {
                     sent[type_slot(ty)] += size;
                 }
+                // A camera being paused goes when the frame it is in is complete.
+                if packet.header.marker && r.down.get(sub.stream).is_some_and(|d| d.pausing) {
+                    pausing.push(sub);
+                }
                 if let Some(started) = started {
                     self.metrics
                         .rtp_write_time(&r.cfg.group_id, ty, started.elapsed());
@@ -706,6 +723,9 @@ impl Engine {
             }
             for sub in switched {
                 self.complete_switch(sk, sub);
+            }
+            for sub in pausing {
+                self.finish_pause(sub.session, sub.stream);
             }
         }
     }
@@ -842,15 +862,14 @@ fn type_slot(ty: TrackType) -> usize {
     }
 }
 
-/// What the forwarder reads once of a packet of a screen share, for every receiver's temporal
-/// layers.
+/// What the forwarder reads once of a packet of a video, for every receiver's temporal layers.
 struct Frame {
     descriptor: Option<vp8::Descriptor>,
     key: bool,
 }
 
 /// Writes `packet` to the receiver's copy of the stream, rewritten for it, unless it is of a
-/// temporal layer the receiver is not sent (`frame`, for a screen share). Returns whether it was
+/// temporal layer the receiver is not sent (`frame`, for a video). Returns whether it was
 /// accepted for sending.
 fn write_down(
     r: &mut Session,

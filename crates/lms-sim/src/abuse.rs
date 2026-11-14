@@ -1711,4 +1711,38 @@ mod tests {
         }
         w.env.finish().await;
     }
+
+    /// A rebind changes the source the server sees, not the client's own address: the student's
+    /// media path never drops, however often it rebinds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rebinding_student_keeps_its_media_path() {
+        let Some(w) = world("rebind", 0, 0).await else {
+            return;
+        };
+        for _ in 0..12 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            w.lesson[1].control(Ctl::Rebind);
+        }
+        let rows = lines(&w.path);
+        assert!(
+            !rows.iter().any(|l| l["kind"] == "event"
+                && l["id"] == "s00"
+                && l["detail"] == "connection:failed"),
+            "the student's connection failed after a rebind"
+        );
+        let voice: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|l| {
+                l["kind"] == "recv" && l["id"].as_str().is_some_and(|i| i.starts_with("s00/voice"))
+            })
+            .collect();
+        let packets = |l: &serde_json::Value| l["packets"].as_u64().unwrap_or(0);
+        let last = voice.last().expect("the student measured the voice");
+        let before = voice[voice.len().saturating_sub(10)];
+        assert!(
+            packets(last) > packets(before) && last["stalled"] == false,
+            "the voice stalled after the last rebind: {last}"
+        );
+        w.end().await;
+    }
 }

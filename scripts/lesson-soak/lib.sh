@@ -59,6 +59,18 @@ prepare() {
   fi
 }
 
+# Turns off UDP segmentation offload on the SFU's interface, for both services alike. rtcd-rs sends a
+# peer's datagrams as one GSO super-packet, which the shaped downlink (netem on ifb) would drop and
+# count as a single packet; with the offload off the stack splits it into the datagrams a real link
+# carries. The setting is recorded in machine.txt; a failure stops the soak rather than skew it.
+segment_in_software() {
+  local state
+  state=$(docker run --rm --network container:soak-sfu --cap-add NET_ADMIN "$LESSON_IMAGE"     sh -c 'ethtool -K eth0 tx-udp-segmentation off && ethtool -k eth0 | grep -i segmentation') ||
+    { echo "cannot turn off UDP segmentation offload on soak-sfu's eth0" >&2; return 1; }
+  case "$state" in *"tx-udp-segmentation: off"*) ;; *) echo "UDP segmentation offload is still on: $state" >&2; return 1 ;; esac
+  { echo "sfu eth0 segmentation offload:"; echo "$state"; } >>"$OUT/machine.txt"
+}
+
 # The SFU in a container named soak-sfu, with the same settings for both services by the RTCD_*
 # variables they share, and waits until it answers.
 start_sfu() {
@@ -74,6 +86,7 @@ start_sfu() {
   )
   docker run -d --name soak-sfu --network "$NET" --ip "$SFU_IP" "${sfu_cpu[@]}" \
     --memory=4g --memory-swap=4g --ulimit nofile=65536:65536 "${envs[@]}" "$SFU_IMAGE" >/dev/null
+  segment_in_software
   for _ in $(seq 60); do
     docker run --rm --network "$NET" "$LESSON_IMAGE" curl -sf "http://$SFU_IP:8045/version" >/dev/null 2>&1 && break
     sleep 1

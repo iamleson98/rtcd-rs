@@ -51,56 +51,56 @@ const KEYFRAME_DRAIN: f64 = 2.5;
 /// is not shrinking, carries less than it is given (the queue a keyframe leaves shrinks once the
 /// keyframe has gone in), as does one holding [`QUEUE_CRITICAL`] whatever the queue does. The
 /// feedback that says so comes through the queue too, so it is late by as much as it reports...
-const QUEUE_HIGH: f64 = 0.15;
-const QUEUE_PERSISTS: Duration = Duration::from_secs(1);
-const QUEUE_CRITICAL: f64 = 1.5;
+pub(crate) const QUEUE_HIGH: f64 = 0.15;
+pub(crate) const QUEUE_PERSISTS: Duration = Duration::from_secs(1);
+pub(crate) const QUEUE_CRITICAL: f64 = 1.5;
 /// A queue shrinking by less than this over the half second the trend covers is not shrinking.
-const QUEUE_SHRINKING: f64 = -0.02;
+pub(crate) const QUEUE_SHRINKING: f64 = -0.02;
 /// One growing by this much over the half second is fed at least a third more than the path
 /// carries: that is acted on without waiting for it to last, except in the seconds after a move to
 /// the large layer, whose keyframe sets a queue all at once.
-const QUEUE_SURGING: f64 = 0.15;
-const KEYFRAME_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const QUEUE_SURGING: f64 = 0.15;
+pub(crate) const KEYFRAME_GRACE: Duration = Duration::from_secs(2);
 /// For a few seconds after a temporal layer is added (which costs no keyframe), a queue that grows
 /// past this means the layer did not fit.
 const TRIAL_QUEUE: f64 = 0.08;
-const TRIAL: Duration = Duration::from_secs(3);
+pub(crate) const TRIAL: Duration = Duration::from_secs(3);
 /// ...and one holding less than this carries all of it.
 const QUEUE_LOW: f64 = 0.05;
 /// Less than this share of what is sent arriving is a path that drops what it cannot carry (one
 /// that queues little, or not at all)...
-const CONGESTED_DELIVERY: f64 = 0.85;
+pub(crate) const CONGESTED_DELIVERY: f64 = 0.85;
 /// ...unless nothing stands queued and the narrowest link of the path is known to carry this many
 /// times what is sent: then what was lost is a burst (a wireless hiccup, a router's blip) that
 /// the receiver's requests for packets sent again repair, not a path that carries less than it is
 /// given. A picture that is still sends little, so what the path delivered says nothing of what it
 /// can carry, and cutting the rate to it left the receiver on the lowest rung until the long climb
 /// back.
-const LOSS_ROOM: f64 = 1.5;
+pub(crate) const LOSS_ROOM: f64 = 1.5;
 /// The next rung is tried only while this much of what is sent arrives: a path that loses more
 /// than a tenth at random is not given more to lose.
 const RAISE_DELIVERY: f64 = 0.9;
 /// After congestion the screen is given this share of what the path delivered, or less while it
 /// has a queue to drain, so the queue is gone within [`DRAIN_SECONDS`] instead of holding the
 /// voice back...
-const HEADROOM: f64 = 0.85;
-const DRAIN_SECONDS: f64 = 3.0;
-const LEAST_SHARE: f64 = 0.25;
+pub(crate) const HEADROOM: f64 = 0.85;
+pub(crate) const DRAIN_SECONDS: f64 = 3.0;
+pub(crate) const LEAST_SHARE: f64 = 0.25;
 /// ...and nothing more is tried for a while.
-const HOLD: Duration = Duration::from_secs(3);
+pub(crate) const HOLD: Duration = Duration::from_secs(3);
 /// A path that has stayed clear this long on a rung is trusted with a little more each second, up
 /// to twice what it was seen to deliver or the rate of the rung above, whichever is more (a layer
 /// without temporal layers is one step of five times its rate)...
-const CLEAR_FOR: Duration = Duration::from_secs(2);
-const GROWTH_PER_SECOND: f64 = 0.08;
-const GROWTH_CEILING: f64 = 2.0;
+pub(crate) const CLEAR_FOR: Duration = Duration::from_secs(2);
+pub(crate) const GROWTH_PER_SECOND: f64 = 0.08;
+pub(crate) const GROWTH_CEILING: f64 = 2.0;
 /// ...and the next rung is tried once that adds up to its rate, and fits in this share of what the
 /// narrowest link of the path carries (when that is known). A rung that brought congestion is not
 /// tried again for a wait that doubles each time, and is forgotten once held without trouble.
-const CAPACITY_SHARE: f64 = 0.85;
-const INITIAL_BACKOFF: Duration = Duration::from_secs(10);
-const MAX_BACKOFF: Duration = Duration::from_secs(120);
-const FORGET_AFTER: Duration = Duration::from_secs(30);
+pub(crate) const CAPACITY_SHARE: f64 = 0.85;
+pub(crate) const INITIAL_BACKOFF: Duration = Duration::from_secs(10);
+pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(120);
+pub(crate) const FORGET_AFTER: Duration = Duration::from_secs(30);
 
 /// One step of what a receiver can be sent of a screen share: a simulcast layer, and the highest
 /// of its temporal layers sent (`None`: every frame of the layer).
@@ -120,6 +120,52 @@ pub struct LayerRates {
     pub temporal: Option<[Option<u64>; 2]>,
     /// The size of the layer's last keyframe, bits.
     pub keyframe_bits: Option<f64>,
+}
+
+/// What one layer of a stream costs a receiver at each of its temporal steps, cheapest first: the
+/// base layer, the base and the second, and the whole layer (the only step of a layer that has no
+/// temporal layers).
+#[derive(Debug, Clone, Copy)]
+pub struct Steps {
+    /// The highest temporal layer sent (`None`: every frame), and the bits per second it costs.
+    steps: [(Option<u8>, f64); 3],
+    len: usize,
+}
+
+impl Steps {
+    /// The steps of a layer from what was measured of it, `nominal` bits per second while it has
+    /// not been measured.
+    pub fn of(rates: LayerRates, nominal: u64) -> Self {
+        let total = rates.total.unwrap_or(nominal) as f64;
+        let mut steps = [(None, total); 3];
+        let mut len = 0;
+        if let Some(temporal) = rates.temporal {
+            let mut below = 0.0;
+            for (tid, measured) in temporal.iter().enumerate() {
+                let rate = match measured {
+                    Some(r) => below + *r as f64,
+                    None => total * NOMINAL_TEMPORAL_SHARE[tid],
+                };
+                below = rate;
+                steps[len] = (Some(tid as u8), rate.min(total));
+                len += 1;
+            }
+        }
+        steps[len] = (None, total);
+        Self {
+            steps,
+            len: len + 1,
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (Option<u8>, f64)> + '_ {
+        self.steps[..self.len].iter().copied()
+    }
+
+    /// How many steps there are (at least one).
+    pub fn count(&self) -> usize {
+        self.len
+    }
 }
 
 /// The rungs a screen share offers now, lowest first, with the bits per second each costs, and the
@@ -142,28 +188,14 @@ impl Ladder {
             (Layer::High, high, NOMINAL_HIGH_RATE),
         ] {
             let Some(rates) = rates else { continue };
-            let total = rates.total.unwrap_or(nominal) as f64;
             keyframe_bits[layer as usize] = rates
                 .keyframe_bits
                 .unwrap_or(nominal as f64 * NOMINAL_KEYFRAME_SECONDS);
-            if let Some(temporal) = rates.temporal {
-                let mut below = 0.0;
-                for (tid, measured) in temporal.iter().enumerate() {
-                    let rate = match measured {
-                        Some(r) => below + *r as f64,
-                        None => total * NOMINAL_TEMPORAL_SHARE[tid],
-                    };
-                    below = rate;
-                    rungs.push((
-                        Rung {
-                            layer,
-                            tid: Some(tid as u8),
-                        },
-                        rate.min(total),
-                    ));
-                }
-            }
-            rungs.push((Rung { layer, tid: None }, total));
+            rungs.extend(
+                Steps::of(rates, nominal)
+                    .iter()
+                    .map(|(tid, rate)| (Rung { layer, tid }, rate)),
+            );
         }
         Self {
             rungs,
@@ -181,6 +213,11 @@ impl Ladder {
 
     fn rate(&self, i: usize) -> f64 {
         self.rungs[i].1
+    }
+
+    /// Bits per second `rung` costs, if the sharer offers it.
+    pub fn rate_of(&self, rung: Rung) -> Option<f64> {
+        self.position(rung).map(|i| self.rate(i))
     }
 
     fn top(&self) -> usize {
@@ -227,7 +264,8 @@ pub struct ScreenInputs {
     pub capacity: Option<f64>,
     /// The share of what was sent over the last seconds that arrived.
     pub delivery: Option<f64>,
-    /// Bits per second of the other video the receiver is sent (cameras): it shares the path.
+    /// Bits per second of the other video the receiver is sent (the cameras, for a screen; the
+    /// screen, for the cameras): it shares the path.
     pub other: f64,
 }
 
@@ -238,11 +276,11 @@ impl ScreenInputs {
         self.queue.is_some_and(|q| q >= QUEUE_HIGH) || self.dropping()
     }
 
-    fn dropping(&self) -> bool {
+    pub(crate) fn dropping(&self) -> bool {
         self.delivery.is_some_and(|d| d < CONGESTED_DELIVERY)
     }
 
-    fn clear(&self) -> bool {
+    pub(crate) fn clear(&self) -> bool {
         self.queue.is_some_and(|q| q < QUEUE_LOW)
             && self.delivery.is_none_or(|d| d >= RAISE_DELIVERY)
     }

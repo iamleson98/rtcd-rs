@@ -338,6 +338,27 @@ impl World {
 
     /// Starts a browser named `name` that is `user`'s: two of the same user make two sessions.
     pub fn start_as(&mut self, name: &str, user: &str, call: &str, camera: bool) -> usize {
+        self.start_session(name, user, call, camera, false)
+    }
+
+    /// Like [`join_with_camera`](Self::join_with_camera), for the call's host (a class's teacher).
+    pub fn join_host_with_camera(&mut self, name: &str, call: &str) -> usize {
+        let i = self.start_session(name, &format!("user-{name}"), call, true, true);
+        let ok = self.run_until(Duration::from_secs(20), |w| {
+            w.browsers[i].connected && w.browsers[i].dc.is_some()
+        });
+        assert!(ok, "{name} did not connect");
+        i
+    }
+
+    fn start_session(
+        &mut self,
+        name: &str,
+        user: &str,
+        call: &str,
+        camera: bool,
+        host: bool,
+    ) -> usize {
         let session_id = format!("session-{name}");
         let cfg = SessionConfig {
             group_id: self.group.clone(),
@@ -353,7 +374,7 @@ impl World {
                     channel_id: "ch".into(),
                     av1_support: false,
                     dc_signaling: true,
-                    host: false,
+                    host,
                     observer: false,
                 },
             )
@@ -1295,10 +1316,31 @@ impl World {
         packets: usize,
         temporal: bool,
     ) {
+        self.send_layered_frame(i, true, layer, key, packets, temporal);
+    }
+
+    /// `send_screen_frame` for browser `i`'s camera, at 30 frames a second.
+    pub fn send_camera_frame(&mut self, i: usize, layer: Layer, key: bool, packets: usize) {
+        self.send_layered_frame(i, false, layer, key, packets, true);
+    }
+
+    fn send_layered_frame(
+        &mut self,
+        i: usize,
+        screen: bool,
+        layer: Layer,
+        key: bool,
+        packets: usize,
+        temporal: bool,
+    ) {
         let now = self.now;
         let sent = (now - self.epoch).as_micros() as u64;
         let b = &mut self.browsers[i];
-        let v = b.screen.as_mut().expect("a screen share");
+        let v = if screen {
+            b.screen.as_mut().expect("a screen share")
+        } else {
+            b.camera.as_mut().expect("a camera")
+        };
         let l = layer as usize;
         let (pt, mid_ext, rid_ext) = {
             let mut s = b.pc.rtp_sender(v.sender).expect("sender");
@@ -1336,7 +1378,12 @@ impl World {
         }
         v.wide_picture_id[l] = (v.wide_picture_id[l] + 1) & 0x7fff;
         let pid = v.wide_picture_id[l];
-        v.ts[l] = v.ts[l].wrapping_add(if layer == Layer::High { 6000 } else { 18_000 });
+        let frame_time = match (screen, layer) {
+            (false, _) => 3000,
+            (true, Layer::High) => 6000,
+            (true, Layer::Low) => 18_000,
+        };
+        v.ts[l] = v.ts[l].wrapping_add(frame_time);
         for n in 0..packets {
             let first = n == 0;
             let mut payload = vec![

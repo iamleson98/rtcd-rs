@@ -29,6 +29,9 @@ therefore each participant's, not shared by the group: in the bw phase each one'
 rate (`bytes` of its `recv` lines, all tracks together) sits at its cap. The teacher and the **clean**
 group are never touched, so drift on the server shows in the clean group and what the network does
 shows in the impaired one.
+Before the SFU is used, `lib.sh` turns UDP segmentation offload off on its `eth0` (and records it in
+`machine.txt`): rtcd-rs sends a peer's datagrams as one GSO super-packet, which the shaper would drop and
+count as one packet, so the stack must split it into the wire packets Go sends and a real link carries.
 
 **Signaling.** In production the browser's signaling websocket goes to the LMS server, which holds a
 connection to rtcd on a datacenter link; only media, ICE, DTLS and SCTP cross the user's network. The
