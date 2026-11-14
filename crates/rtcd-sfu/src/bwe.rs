@@ -56,10 +56,13 @@ const TREND_SPAN: Duration = Duration::from_millis(500);
 const BURST_GAP: Duration = Duration::from_millis(5);
 /// A burst of fewer packets than this, or that arrived over less than [`TRAIN_MIN_SPREAD`] (the
 /// feedback's clock counts quarter milliseconds), says nothing of the link; the median of the last
-/// [`TRAINS`] that do is its rate.
+/// [`TRAINS`] that do, less than [`TRAIN_AGE`] old, is its rate.
 const TRAIN_MIN_PACKETS: usize = 5;
 const TRAIN_MIN_SPREAD: Duration = Duration::from_millis(2);
 const TRAINS: usize = 15;
+/// A train older than this says nothing of the link now: a receiver sent nothing (its cameras
+/// paused) forms no bursts, and would otherwise keep the rate it was last held to.
+const TRAIN_AGE: Duration = Duration::from_secs(10);
 
 /// What the estimator last said. Floats are stored as bits so reads are lock-free.
 #[derive(Debug, Default)]
@@ -210,9 +213,10 @@ struct PathMeter {
     /// What arrived over the last [`ACKED_WINDOW`]: when (on the receiver's clock) and how big.
     arrivals: VecDeque<(Duration, usize)>,
     arrived_bytes: usize,
-    /// The burst being reported on, and the rates the last ones arrived at.
+    /// The burst being reported on, and the rates the last ones arrived at, by when each was
+    /// complete.
     train: Train,
-    trains: VecDeque<f64>,
+    trains: VecDeque<(Instant, f64)>,
 }
 
 /// One burst, as its packets are reported.
@@ -223,7 +227,9 @@ struct Train {
     bytes: usize,
     first: Option<Duration>,
     last: Option<Duration>,
-    /// A packet of it was lost: its spread no longer says anything.
+    /// A packet of it was lost, or arrived before one sent earlier: its spread no longer says
+    /// anything (a link that is the bottleneck delivers in order, so a path that reorders is
+    /// jittery, and the spread is the jitter).
     broken: bool,
 }
 
@@ -240,6 +246,9 @@ impl Train {
             self.broken = true;
             return;
         };
+        if self.last.is_some_and(|last| at < last) {
+            self.broken = true;
+        }
         if self.packets > 0 {
             self.bytes += size;
         }
@@ -263,7 +272,7 @@ impl PathMeter {
             self.last_departure = Some(r.departure);
             // A burst begins: the one before is complete.
             if head && let Some(rate) = std::mem::take(&mut self.train).rate() {
-                self.trains.push_back(rate);
+                self.trains.push_back((now, rate));
                 if self.trains.len() > TRAINS {
                     self.trains.pop_front();
                 }
@@ -340,9 +349,15 @@ impl PathMeter {
         self.trains.clear();
     }
 
-    /// The rate of the narrowest link: the median of what the last bursts arrived at.
-    fn capacity(&self) -> Option<f64> {
-        let mut rates: Vec<f64> = self.trains.iter().copied().collect();
+    /// The rate of the narrowest link: the median of what the last bursts arrived at, as long as
+    /// enough of them are recent.
+    fn capacity(&self, now: Instant) -> Option<f64> {
+        let mut rates: Vec<f64> = self
+            .trains
+            .iter()
+            .filter(|&&(at, _)| now.saturating_duration_since(at) <= TRAIN_AGE)
+            .map(|&(_, rate)| rate)
+            .collect();
         if rates.len() < TRAINS / 3 {
             return None;
         }
@@ -468,7 +483,7 @@ impl BandwidthEstimator for SharedGcc {
         store_known(&self.out.queue, self.path.queue);
         store_known(&self.out.queue_trend, self.path.trend());
         store_known(&self.out.acked, self.path.acked());
-        store_known(&self.out.capacity, self.path.capacity());
+        store_known(&self.out.capacity, self.path.capacity(now));
         // The newest packet a feedback reports arrived just before the feedback was sent: from its
         // departure to now is the round trip, give or take the time the receiver held it.
         if let Some(left) = reports
@@ -491,6 +506,8 @@ impl BandwidthEstimator for SharedGcc {
 
     fn handle_timeout(&mut self, now: Instant) {
         self.inner.handle_timeout(now);
+        // No feedback comes while nothing is sent: the rate it last said must still age out.
+        store_known(&self.out.capacity, self.path.capacity(now));
         self.publish();
     }
 
@@ -780,5 +797,34 @@ mod tests {
             .collect();
         gcc.on_reports(t0 + Duration::from_millis(5_300), &reports);
         assert_eq!(estimate.snapshot().acked, None);
+    }
+
+    #[test]
+    fn bursts_that_arrive_out_of_order_say_nothing_of_the_link() {
+        let (mut gcc, estimate) = SharedGcc::new(300_000.0, 100_000.0, 4_000_000.0);
+        let t0 = Instant::now();
+        // Frames of 10 packets whose arrivals are shuffled over 45 ms: jitter, not a bottleneck.
+        const SHUFFLED: [u64; 10] = [0, 20, 5, 35, 10, 45, 15, 30, 25, 40];
+        for frame in 0..20 {
+            let at = frame * 100;
+            let reports: Vec<_> = SHUFFLED
+                .iter()
+                .map(|&late| timed(t0, at, 115 + late))
+                .collect();
+            gcc.on_reports(t0 + Duration::from_millis(at + 115 + 100), &reports);
+        }
+        assert_eq!(estimate.snapshot().capacity, None);
+    }
+
+    #[test]
+    fn the_rate_of_the_narrowest_link_is_forgotten_once_no_bursts_come() {
+        let (mut gcc, estimate) = SharedGcc::new(300_000.0, 100_000.0, 4_000_000.0);
+        let t0 = Instant::now();
+        frames(&mut gcc, t0, 0, 20, 5);
+        assert!(estimate.snapshot().capacity.is_some());
+        gcc.handle_timeout(t0 + Duration::from_millis(2_100 + 9_000));
+        assert!(estimate.snapshot().capacity.is_some(), "still recent");
+        gcc.handle_timeout(t0 + Duration::from_millis(2_100 + 11_000));
+        assert_eq!(estimate.snapshot().capacity, None);
     }
 }

@@ -83,6 +83,7 @@ fn share(path: Path) -> Run {
 fn far(loss: f64, rate_bps: Option<u64>) -> Path {
     Path {
         loss,
+        jitter: Duration::ZERO,
         delay: Duration::from_millis(115),
         rate_bps,
         queue: Duration::from_millis(200),

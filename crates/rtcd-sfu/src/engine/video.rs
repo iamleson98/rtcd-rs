@@ -649,6 +649,7 @@ impl Engine {
             .review(now, &path, camera_budget::Load::of(&cameras));
         let raise = s.down.cameras.raise_ceiling(now);
         let limit = s.down.cameras.limit();
+        let cause = s.down.cameras.cause();
         let trial = s.down.cameras.pause_trial(now);
         camera_budget::allocate(limit, raise, trial, &mut cameras);
         let (mut raised, mut changed) = (false, false);
@@ -672,7 +673,18 @@ impl Engine {
             s.down.cameras.raised(now);
         }
         if changed {
-            debug!(session = %s.cfg.session_id, ?limit, paused, thinned, cameras = cameras.len(), "cameras held to the path");
+            debug!(
+                session = %s.cfg.session_id,
+                ?limit,
+                ?cause,
+                queue = ?path.queue,
+                delivery = ?path.delivery,
+                capacity = ?path.capacity,
+                paused,
+                thinned,
+                cameras = cameras.len(),
+                "cameras held to the path"
+            );
         }
         if limit.is_none() {
             self.release_small_cameras(key, now);

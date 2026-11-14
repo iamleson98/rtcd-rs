@@ -34,6 +34,8 @@ const KEYFRAME_EVERY: u32 = 2 * FPS;
 const LARGE_PACKETS: usize = 3 * FRAME_PACKETS;
 const LARGE_KEYFRAME_PACKETS: usize = 3 * KEYFRAME_PACKETS;
 const LINK: u64 = 2_500_000;
+/// The gap before a packet that begins a burst in the estimator (`bwe::BURST_GAP`).
+const BURST_GAP: Duration = Duration::from_millis(5);
 /// The longest wait after a step that failed (`layers::MAX_BACKOFF`), and how long a step is on
 /// trial (`layers::TRIAL`).
 const LONGEST_WAIT: Duration = Duration::from_secs(20);
@@ -146,11 +148,15 @@ impl Class {
     }
 
     /// Every camera sends a frame at 30 per second (a keyframe every two seconds, one when the SFU
-    /// asks for it), spread over the frame time as unsynchronised encoders are. A camera that
+    /// asks for it), spread over the frame time as unsynchronised encoders are. With so many
+    /// cameras that an even spread would put every frame closer to the one before than the gap that
+    /// begins a burst (see `bwe::BURST_GAP`), which no real set of encoders does, they are spread
+    /// unevenly, so that the path's queue can be read from the frames that follow a gap. A camera that
     /// sends two layers sends a frame of each, and a keyframe of each layer is asked for on its
     /// own.
     fn run(&mut self, seconds: u32) {
         let slot = Duration::from_secs(1) / FPS / self.senders.len() as u32;
+        let uneven = slot < BURST_GAP;
         for _ in 0..seconds * FPS {
             for (k, &s) in self.senders.iter().enumerate() {
                 let layers: &[Layer] = if k < self.simulcast {
@@ -189,7 +195,11 @@ impl Class {
                         self.w.send_video(s, false, layer, key, packets);
                     }
                 }
-                self.w.run_for(slot);
+                self.w.run_for(match (uneven, k % 2) {
+                    (false, _) => slot,
+                    (true, 0) => slot / 2,
+                    (true, _) => slot * 3 / 2,
+                });
             }
             if self.screen && self.frame.is_multiple_of(6) {
                 // Five frames a second of three packets, and a keyframe of twelve every ten
@@ -326,6 +336,7 @@ impl Window {
 fn limited(rate_bps: u64) -> Path {
     Path {
         loss: 0.0,
+        jitter: Duration::ZERO,
         delay: Duration::from_millis(40),
         rate_bps: Some(rate_bps),
         queue: Duration::from_millis(300),
@@ -542,6 +553,56 @@ fn a_clear_link_with_random_loss_pauses_nothing() {
     seen.print("lossy", 30);
     // Every camera plays whole (a packet in fifty is lost, and sent again when asked for).
     assert_eq!(seen.flowing(30).len(), STUDENTS + 1, "{seen:?}");
+}
+
+/// Runs the class for a minute (twenty seconds of it before anything is looked at) and checks that
+/// every camera was sent in every second of the rest, and at least `kept` tenths of what a
+/// camera on a clear link is sent over it: a link that loses or delays packets does not take
+/// cameras away from the viewer.
+fn assert_nothing_paused(c: &mut Class, kept: usize) {
+    c.run(20);
+    let line = c.timeline(40);
+    let paused: Vec<usize> = (0..c.senders.len())
+        .map(|k| c.longest_pause(&line, k))
+        .collect();
+    eprintln!("longest pauses {paused:?} s");
+    assert!(paused.iter().all(|&n| n == 0), "cameras paused: {paused:?}");
+    for k in 0..c.senders.len() {
+        let name = c.name(k);
+        let got: usize = line
+            .iter()
+            .map(|w| w.packets.get(&name).copied().unwrap_or(0))
+            .sum();
+        assert!(
+            got * 10 >= c.whole_packets(k) * 40 * kept,
+            "{name}: {got} packets of {}",
+            c.whole_packets(k) * 40
+        );
+    }
+}
+
+#[test]
+fn a_wide_link_that_loses_a_fifth_of_the_packets_pauses_no_camera() {
+    // Random loss does not fall as the rate does: cutting the cameras for it only pauses them.
+    let mut path = limited(50_000_000);
+    path.loss = 0.2;
+    assert_nothing_paused(&mut Class::new(path), 6);
+}
+
+#[test]
+fn a_wide_link_that_delays_each_packet_differently_pauses_no_camera() {
+    // Packets overtake one another over some hundred milliseconds, and a tenth are lost.
+    let mut path = limited(50_000_000);
+    path.jitter = Duration::from_millis(200);
+    path.loss = 0.1;
+    assert_nothing_paused(&mut Class::new(path), 7);
+}
+
+#[test]
+fn a_wide_link_that_reorders_packets_pauses_no_camera() {
+    let mut path = limited(50_000_000);
+    path.jitter = Duration::from_millis(100);
+    assert_nothing_paused(&mut Class::new(path), 9);
 }
 
 #[test]

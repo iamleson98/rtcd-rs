@@ -131,6 +131,7 @@ impl Seen {
 fn bottleneck(rate_bps: u64, loss: f64) -> Path {
     Path {
         loss,
+        jitter: Duration::ZERO,
         delay: ONE_WAY,
         rate_bps: Some(rate_bps),
         queue: Duration::from_secs(2),
@@ -271,6 +272,7 @@ fn a_link_that_carries_everything_gets_everything() {
 fn a_slow_viewer_costs_the_others_nothing() {
     let fast = Path {
         loss: 0.0,
+        jitter: Duration::ZERO,
         delay: Duration::from_millis(20),
         rate_bps: None,
         queue: Duration::ZERO,

@@ -80,7 +80,8 @@ pub enum Layer {
 }
 
 /// What the network between the SFU and one browser does: packets from the SFU can be lost, take
-/// time, and queue behind a link of limited rate; what the browser sends (its feedback among it)
+/// time (and a different time each, so that they arrive out of order), and queue behind a link of
+/// limited rate; what the browser sends (its feedback among it)
 /// takes the same time.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Path {
@@ -88,6 +89,9 @@ pub struct Path {
     pub loss: f64,
     /// Time a packet takes each way.
     pub delay: Duration,
+    /// A time, up to this much, added at random to each packet of the SFU's: they may overtake
+    /// one another.
+    pub jitter: Duration,
     /// The downlink's rate, bits per second; unlimited when `None`.
     pub rate_bps: Option<u64>,
     /// A packet that would wait longer than this for the link is dropped.
@@ -737,8 +741,9 @@ impl World {
             b.link_free = start + Duration::from_secs_f64(data.len() as f64 * 8.0 / bps as f64);
             leaves = b.link_free;
         }
+        let late = path.jitter.mul_f64(self.unit());
         self.to_browsers.push(InFlight {
-            due: leaves + path.delay,
+            due: leaves + path.delay + late,
             browser: i,
             local: from,
             data,
@@ -749,10 +754,12 @@ impl World {
     fn deliver_due(&mut self) -> bool {
         let now = self.now;
         let mut moved = false;
-        let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.to_browsers)
+        let (mut ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.to_browsers)
             .into_iter()
             .partition(|f| f.due <= now);
         self.to_browsers = later;
+        // In the order they arrive in, which with jitter is not the order they were sent in.
+        ready.sort_by_key(|f| f.due);
         for f in ready {
             moved = true;
             self.read_by_browser(f.browser, f.local, f.data);
@@ -770,16 +777,18 @@ impl World {
 
     /// True with probability `p`, the same way on every run.
     fn chance(&mut self, p: f64) -> bool {
-        if p <= 0.0 {
-            return false;
-        }
+        p > 0.0 && self.unit() < p
+    }
+
+    /// A number in `[0, 1)`, the same sequence on every run.
+    fn unit(&mut self) -> f64 {
         let mut x = self.rng;
         x ^= x >> 12;
         x ^= x << 25;
         x ^= x >> 27;
         self.rng = x;
         let r = x.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11;
-        (r as f64) / ((1u64 << 53) as f64) < p
+        (r as f64) / ((1u64 << 53) as f64)
     }
 
     /// A NAT gives browser `i` another port: its datagrams reach the SFU from there, and the

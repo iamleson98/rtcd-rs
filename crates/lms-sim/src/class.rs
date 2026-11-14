@@ -304,8 +304,8 @@ pub fn message(session: &str, call: &str, kind: MessageType, data: Vec<u8>) -> C
 }
 
 /// Opens a websocket to rtcd and joins `call` as `name`; returns the connection and the session
-/// Opens a websocket to rtcd and joins `call` as `name`; returns the connection and the session
-/// and user ids.
+/// and user ids. The participant named `teacher` joins as the call's host, as a class's teacher
+/// does: the host's camera keeps a protected minimum a student's does not.
 pub async fn open_session(rtcd: &Rtcd, call: &str, name: &str) -> (RtcdConn, String, String) {
     try_open_session(rtcd, call, name)
         .await
@@ -330,7 +330,7 @@ pub async fn try_open_session(
         channel_id: format!("channel-{call}"),
         av1_support: false,
         dc_signaling: true,
-        host: false,
+        host: name == "teacher",
         observer: false,
     }));
     Some((conn, session_id, user_id))

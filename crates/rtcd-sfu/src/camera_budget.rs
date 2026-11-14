@@ -464,6 +464,23 @@ pub struct CameraBudget {
     /// Since when the last step has held without trouble (nothing while none has been taken since
     /// the path was last congested).
     held_since: Option<Instant>,
+    /// What the last review found the path congested by, for the log.
+    cause: Option<Cause>,
+}
+
+/// What made a review find the path congested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cause {
+    /// A queue stands on the path and it drops what it is sent.
+    Queue,
+    /// The queue is past [`QUEUE_CRITICAL`].
+    Critical,
+    /// The queue is growing.
+    Surging,
+    /// The queue has stood for [`QUEUE_PERSISTS`] and is not shrinking.
+    Persisting,
+    /// No queue, but the path drops what it is sent and its narrowest link is too narrow for it.
+    Dropping,
 }
 
 impl Default for CameraBudget {
@@ -484,6 +501,7 @@ impl Default for CameraBudget {
             backoff: INITIAL_BACKOFF,
             calm_since: None,
             held_since: None,
+            cause: None,
         }
     }
 }
@@ -491,6 +509,11 @@ impl Default for CameraBudget {
 impl CameraBudget {
     pub fn limit(&self) -> Option<f64> {
         self.limit
+    }
+
+    /// What the last review found the path congested by.
+    pub fn cause(&self) -> Option<Cause> {
+        self.cause
     }
 
     /// What a camera paused for [`MAX_PAUSE`] may be tried against (see [`allocate`]), unless the
@@ -505,20 +528,33 @@ impl CameraBudget {
         .then_some(self.reach)
     }
 
-    /// Whether the path carries less than the receiver is sent (see `ScreenLevel`, whose reading
-    /// of the queue this is, less the screen share's own keyframes).
-    fn congested(&mut self, now: Instant, path: &ScreenInputs, room: bool) -> bool {
+    /// Why the path carries less than the receiver is sent, if it does (see `ScreenLevel`, whose
+    /// reading of the queue this is, less the screen share's own keyframes).
+    ///
+    /// Loss with nothing standing queued counts only where the narrowest link is known and too
+    /// narrow for what is sent: a path that drops at random (a lossy mobile link, a reordering
+    /// one) drops as much at any rate, so cutting for it only pauses the cameras.
+    fn congested(&mut self, now: Instant, path: &ScreenInputs, room: bool) -> Option<Cause> {
         let Some(q) = path.queue.filter(|&q| q >= QUEUE_HIGH) else {
             self.queued_since = None;
-            return path.dropping() && !room;
+            return (path.dropping() && path.capacity.is_some() && !room)
+                .then_some(Cause::Dropping);
         };
         let since = *self.queued_since.get_or_insert(now);
         let trend = path.queue_trend.unwrap_or(0.0);
         let surging = trend >= QUEUE_SURGING && self.grace_until.is_none_or(|t| now >= t);
-        path.dropping()
-            || q >= QUEUE_CRITICAL
-            || surging
-            || (now.saturating_duration_since(since) >= QUEUE_PERSISTS && trend >= QUEUE_SHRINKING)
+        if path.dropping() {
+            Some(Cause::Queue)
+        } else if q >= QUEUE_CRITICAL {
+            Some(Cause::Critical)
+        } else if surging {
+            Some(Cause::Surging)
+        } else if now.saturating_duration_since(since) >= QUEUE_PERSISTS && trend >= QUEUE_SHRINKING
+        {
+            Some(Cause::Persisting)
+        } else {
+            None
+        }
     }
 
     /// Reads the path (`path.other` is the screen share's rate) for the cameras `load` describes:
@@ -538,7 +574,8 @@ impl CameraBudget {
         let room = path
             .capacity
             .is_some_and(|c| c * CAPACITY_SHARE >= (load.sent + path.other) * LOSS_ROOM);
-        let congested = self.congested(now, path, room);
+        self.cause = self.congested(now, path, room);
+        let congested = self.cause.is_some();
         self.unsteady = congested || !path.empty();
         if congested {
             self.clear_since = None;
@@ -862,11 +899,14 @@ mod tests {
         }
     }
 
+    /// A path that drops a quarter of what it is sent with nothing queued, its narrowest link
+    /// known and carrying what the path delivers.
     fn congested() -> ScreenInputs {
         ScreenInputs {
             queue: Some(0.0),
             delivery: Some(0.75),
             acked: Some(2_300_000.0),
+            capacity: Some(2_300_000.0),
             ..Default::default()
         }
     }
@@ -898,6 +938,38 @@ mod tests {
         b.review(t, &congested(), load(3_300_000.0, 3_300_000.0));
         let limit = b.limit().expect("held");
         assert!((limit - 2_300_000.0 * HEADROOM).abs() < 1.0, "{limit}");
+    }
+
+    #[test]
+    fn loss_alone_on_a_path_whose_narrowest_link_is_unknown_holds_nothing() {
+        let mut b = CameraBudget::default();
+        let t = Instant::now();
+        let path = ScreenInputs {
+            capacity: None,
+            ..congested()
+        };
+        b.review(t, &path, load(3_300_000.0, 3_300_000.0));
+        assert_eq!(b.limit(), None);
+        assert_eq!(b.cause(), None);
+    }
+
+    #[test]
+    fn loss_alone_on_a_path_whose_narrowest_link_is_wide_holds_nothing() {
+        let mut b = CameraBudget::default();
+        let path = ScreenInputs {
+            capacity: Some(50_000_000.0),
+            ..congested()
+        };
+        b.review(Instant::now(), &path, load(3_300_000.0, 3_300_000.0));
+        assert_eq!(b.limit(), None);
+    }
+
+    #[test]
+    fn loss_on_a_path_whose_narrowest_link_is_narrow_cuts_and_says_why() {
+        let mut b = CameraBudget::default();
+        b.review(Instant::now(), &congested(), load(3_300_000.0, 3_300_000.0));
+        assert!(b.limit().is_some());
+        assert_eq!(b.cause(), Some(Cause::Dropping));
     }
 
     #[test]
@@ -1038,8 +1110,9 @@ mod tests {
         assert_eq!(b.limit(), None);
     }
 
-    /// A path that carries `link` bits a second, as the cameras sent now find it, and the budget
-    /// with the cameras it has been holding.
+    /// A path that carries `link` bits a second, as the cameras sent now find it (its narrowest
+    /// link is read while it drops what is sent, and not while it is clear), and the budget with
+    /// the cameras it has been holding.
     struct Sim {
         budget: CameraBudget,
         cameras: Vec<Camera>,
@@ -1065,6 +1138,7 @@ mod tests {
                     queue: Some(0.0),
                     delivery: Some(link / load.sent),
                     acked: Some(link),
+                    capacity: Some(link),
                     ..Default::default()
                 }
             };
@@ -1415,15 +1489,17 @@ mod tests {
         let t = Instant::now();
         let low = ScreenInputs {
             acked: Some(500_000.0),
+            capacity: Some(500_000.0),
             ..congested()
         };
         b.review(t, &low, load(1_000_000.0, 3_300_000.0));
         let first = b.limit().unwrap();
         let better = ScreenInputs {
             acked: Some(2_000_000.0),
+            capacity: Some(2_000_000.0),
             ..congested()
         };
-        b.review(t + CUT_SETTLES, &better, load(1_000_000.0, 3_300_000.0));
+        b.review(t + CUT_SETTLES, &better, load(3_300_000.0, 3_300_000.0));
         assert!(b.limit().unwrap() > first, "{:?} after {first}", b.limit());
     }
 
@@ -1687,7 +1763,7 @@ mod tests {
         let mut b = CameraBudget::default();
         let mut t = Instant::now();
         let dropping = ScreenInputs {
-            queue: Some(0.0),
+            queue: Some(0.5),
             delivery: Some(0.5),
             ..Default::default()
         };
