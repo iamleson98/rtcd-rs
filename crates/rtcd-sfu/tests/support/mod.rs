@@ -110,6 +110,8 @@ pub struct Browser {
     pub session_id: String,
     pub pc: RTCPeerConnection,
     pub addr: SocketAddr,
+    /// The address the SFU hears the browser from: `addr` until a NAT remaps it ([`World::rebind`]).
+    pub mapped: SocketAddr,
     pub dc: Option<usize>,
     /// The verdict of the last lock request.
     pub lock_answer: Option<bool>,
@@ -331,11 +333,16 @@ impl World {
     }
 
     pub fn start_with(&mut self, name: &str, call: &str, camera: bool) -> usize {
+        self.start_as(name, &format!("user-{name}"), call, camera)
+    }
+
+    /// Starts a browser named `name` that is `user`'s: two of the same user make two sessions.
+    pub fn start_as(&mut self, name: &str, user: &str, call: &str, camera: bool) -> usize {
         let session_id = format!("session-{name}");
         let cfg = SessionConfig {
             group_id: self.group.clone(),
             call_id: call.to_owned(),
-            user_id: format!("user-{name}"),
+            user_id: user.to_owned(),
             session_id: session_id.clone(),
             props: SessionConfig::from_join(
                 "",
@@ -436,6 +443,7 @@ impl World {
             session_id: session_id.clone(),
             pc,
             addr,
+            mapped: addr,
             dc: None,
             lock_answer: None,
             tracks: vec![],
@@ -603,8 +611,15 @@ impl World {
 
     // --------------------------------------------------------------------------- the network
 
-    /// Moves everything that can move right now.
+    /// Starts a turn of the engine, as the shard does each time round its loop.
+    fn begin_turn(&mut self) {
+        (self.around_engine)("turn", true);
+        self.engine.begin_turn(self.now);
+    }
+
+    /// Moves everything that can move right now, which is one turn of the engine.
     fn settle(&mut self) {
+        self.begin_turn();
         for _ in 0..100_000 {
             let mut moved = false;
             // What has come over a path by now.
@@ -622,7 +637,7 @@ impl World {
                 let Some(i) = self
                     .browsers
                     .iter()
-                    .position(|b| b.addr == t.peer && !b.unreachable)
+                    .position(|b| b.mapped == t.peer && !b.unreachable)
                 else {
                     continue;
                 };
@@ -668,7 +683,7 @@ impl World {
 
     /// The engine reads a datagram that browser `i` sent.
     fn engine_reads(&mut self, i: usize, data: BytesMut) {
-        let from = self.browsers[i].addr;
+        let from = self.browsers[i].mapped;
         let started = Instant::now();
         (self.around_engine)("datagram", true);
         self.engine
@@ -740,6 +755,12 @@ impl World {
         self.rng = x;
         let r = x.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11;
         (r as f64) / ((1u64 << 53) as f64) < p
+    }
+
+    /// A NAT gives browser `i` another port: its datagrams reach the SFU from there, and the
+    /// browser itself is not told.
+    pub fn rebind(&mut self, i: usize, port: u16) {
+        self.browsers[i].mapped.set_port(port);
     }
 
     /// Puts browser `i` behind a network that does what `path` says.
@@ -985,6 +1006,7 @@ impl World {
     }
 
     fn tick_engine(&mut self) {
+        self.begin_turn();
         let started = Instant::now();
         (self.around_engine)("timeout", true);
         self.engine.handle_timeout(self.now);

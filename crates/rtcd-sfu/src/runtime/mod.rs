@@ -238,6 +238,11 @@ impl Core {
             let _ = thread.join();
         }
         self.table.set(slot, None);
+        // Addresses taken from the stopped shard are no one's to forget now; a shard started later
+        // in this slot must not forget addresses it learns itself.
+        if let Some(dir) = &self.directory {
+            dir.take_lost(slot);
+        }
         info!(shard = slot, shards = self.table.len(), "sfu shard stopped");
         true
     }

@@ -32,6 +32,7 @@ use rtc::sansio::Protocol;
 use rtcd_proto::{Message, MessageType};
 use tracing::{debug, error, info, warn};
 
+pub(crate) use route::ADDRESS_SILENCE;
 pub(crate) use route::FastMap;
 pub use route::RouteUpdate;
 pub(crate) use route::stun_local_ufrag;
@@ -39,7 +40,7 @@ pub use signaling::Channel;
 pub use types::{CloseReason, Command, Event, Proto, Transmit};
 
 use self::route::Routes;
-use self::session::{SessionKey, Sessions, SourceKey};
+use self::session::{OfferTurn, SessionKey, Sessions, SourceKey};
 use crate::config::EngineConfig;
 use crate::ids::Rng;
 use crate::loudest::Selector;
@@ -56,6 +57,13 @@ pub enum Load {
     /// At the limit: the same, harder, and the shard takes no new sessions.
     Saturated,
 }
+
+/// How many offers the engine makes per turn (see [`Engine::begin_turn`]). An offer costs about a
+/// millisecond (applying the tracks, the description, its rewrites), and when a voice starts every
+/// other session of its call needs one: made in one turn, they would hold the shard away from its
+/// sockets for as long as all of them take, and the media already flowing would arrive late, in a
+/// bunch. The sessions that do not fit wait in a queue that the next turns work through, in order.
+pub const MAX_OFFERS_PER_TURN: usize = 2;
 
 /// A call: the sessions that hear each other.
 #[derive(Debug)]
@@ -109,6 +117,14 @@ pub struct Engine {
     dirty: Vec<SessionKey>,
     timers: BTreeMap<(Instant, u64), SessionKey>,
     timer_seq: u64,
+    /// Sessions that need an offer and were turned away by [`MAX_OFFERS_PER_TURN`], first come
+    /// first served.
+    negotiations: VecDeque<SessionKey>,
+    /// How many more offers this turn may make.
+    offers_left: usize,
+    /// When the turn began, which is when the engine wants to be called again while
+    /// `negotiations` is not empty.
+    turn_began: Instant,
     out: VecDeque<Transmit>,
     events: VecDeque<Event>,
 }
@@ -145,6 +161,9 @@ impl Engine {
             dirty: Vec::new(),
             timers: BTreeMap::new(),
             timer_seq: 0,
+            negotiations: VecDeque::new(),
+            offers_left: MAX_OFFERS_PER_TURN,
+            turn_began: Instant::now(),
             out: VecDeque::new(),
             events: VecDeque::new(),
         }
@@ -179,7 +198,7 @@ impl Engine {
         peer: std::net::SocketAddr,
         data: BytesMut,
     ) -> bool {
-        let routed = self.route(proto, local, peer, &data);
+        let routed = self.route(now, proto, local, peer, &data);
         if let Some(key) = routed {
             if let Some(s) = self.sessions.get_mut(key) {
                 s.last_rx = now;
@@ -208,6 +227,18 @@ impl Engine {
     /// Advances time: wakes every session whose deadline has passed.
     pub fn handle_timeout(&mut self, now: Instant) {
         self.retry_recordings(now);
+        // The sessions that have waited longest are offered first, with offers set aside for them
+        // (see `advance_negotiation`).
+        let due = self.offers_left.min(self.negotiations.len());
+        self.offers_left -= due;
+        for _ in 0..due {
+            if let Some(key) = self.negotiations.pop_front() {
+                if let Some(s) = self.sessions.get_mut(key) {
+                    s.offer_turn = OfferTurn::Due;
+                }
+                self.mark_dirty(key);
+            }
+        }
         while let Some((&(at, seq), &key)) = self.timers.iter().next() {
             if at > now {
                 break;
@@ -227,11 +258,17 @@ impl Engine {
 
     /// When the engine next needs [`handle_timeout`](Self::handle_timeout).
     pub fn poll_timeout(&self) -> Option<Instant> {
-        let timer = self.timers.keys().next().map(|&(at, _)| at);
-        match (timer, self.recordings.retry_at()) {
-            (Some(t), Some(r)) => Some(t.min(r)),
-            (t, r) => t.or(r),
+        let mut next = self.timers.keys().next().map(|&(at, _)| at);
+        for t in [
+            self.recordings.retry_at(),
+            (!self.negotiations.is_empty()).then_some(self.turn_began),
+        ] {
+            next = match (next, t) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
         }
+        next
     }
 
     /// How many datagrams are waiting to be taken by [`poll_transmit`](Self::poll_transmit).
@@ -255,6 +292,14 @@ impl Engine {
             self.close_session(key, CloseReason::Shutdown, now);
         }
         self.drive(now);
+    }
+
+    /// Starts a turn of the shard: one pass of its loop, which reads what its sockets have and
+    /// then lets time pass, in as many engine calls as that takes. The engine makes at most
+    /// [`MAX_OFFERS_PER_TURN`] offers in it, whichever calls they happen in.
+    pub fn begin_turn(&mut self, now: Instant) {
+        self.turn_began = now;
+        self.offers_left = MAX_OFFERS_PER_TURN;
     }
 
     fn mark_dirty(&mut self, key: SessionKey) {

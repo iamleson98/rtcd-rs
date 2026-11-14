@@ -385,6 +385,8 @@ impl Shard {
             let now = Instant::now();
             self.turn_reads = 0;
             self.turn_began = now;
+            self.engine.begin_turn(now);
+            self.forget_lost_addresses();
 
             let mut commands_ready = false;
             for ev in events.iter() {
@@ -494,28 +496,18 @@ impl Shard {
                 }
             };
             for k in 0..n {
-                let Some((peer, data)) = self.recv.get(k) else {
+                let Some((_, data)) = self.recv.get(k) else {
                     continue;
                 };
                 self.traffic.udp_in_bytes += data.len() as u64;
                 self.traffic.udp_in_packets += 1;
                 self.turn_reads += 1;
-                if let Some(dir) = &self.directory
-                    && !self.engine.would_route(Proto::Udp, peer, data)
-                    && let Some(owner) = dir.owner(Proto::Udp, peer, data)
-                    && owner != self.id
-                {
-                    if owner >= self.forward.len() {
-                        self.forward.resize_with(owner + 1, Vec::new);
-                    }
-                    self.forward[owner].push(Forwarded {
-                        proto: Proto::Udp,
-                        local: advertised,
-                        peer,
-                        data: BytesMut::from(data),
-                    });
+                if self.forward_elsewhere(advertised, k) {
                     continue;
                 }
+                let Some((peer, data)) = self.recv.get(k) else {
+                    continue;
+                };
                 self.engine.handle_datagram(
                     now,
                     Proto::Udp,
@@ -623,12 +615,20 @@ impl Shard {
                 }
             };
             for k in 0..n {
-                let Some((peer, data)) = self.recv.get(k) else {
+                let Some((_, data)) = self.recv.get(k) else {
                     continue;
                 };
                 self.traffic.udp_in_bytes += data.len() as u64;
                 self.traffic.udp_in_packets += 1;
                 self.turn_reads += 1;
+                // The kernel gives a participant's datagrams to the socket connected to its
+                // address, a new session's first checks among them if it has come to another shard.
+                if self.forward_elsewhere(advertised, k) {
+                    continue;
+                }
+                let Some((peer, data)) = self.recv.get(k) else {
+                    continue;
+                };
                 self.engine.handle_datagram(
                     now,
                     Proto::Udp,
@@ -638,6 +638,7 @@ impl Shard {
                 );
                 self.relieve();
             }
+            self.send_forwards();
             if n < self.cfg.recv_batch {
                 return;
             }
@@ -645,6 +646,47 @@ impl Shard {
                 self.peer_ready.push(slot);
             }
         }
+    }
+
+    /// Lets go of the addresses that another shard has taken since the last turn: the engine stops
+    /// routing them here and their sockets close, so the kernel stops delivering them to this shard.
+    fn forget_lost_addresses(&mut self) {
+        let Some(dir) = &self.directory else {
+            return;
+        };
+        let lost = dir.take_lost(self.id);
+        for &(proto, peer) in &lost {
+            self.engine.forget_address(proto, peer);
+        }
+        for change in socket_changes(&[], &[], &lost) {
+            if let SocketChange::Close(peer) = change {
+                self.close_peer_socket(peer);
+            }
+        }
+    }
+
+    /// Queues datagram `k` of the last read for the shard that owns it, if this engine does not
+    /// take it and another shard does.
+    fn forward_elsewhere(&mut self, local: SocketAddr, k: usize) -> bool {
+        let (Some(dir), Some((peer, data))) = (&self.directory, self.recv.get(k)) else {
+            return false;
+        };
+        if self.engine.would_route(Proto::Udp, peer, data) {
+            return false;
+        }
+        let Some(owner) = dir.owner(Proto::Udp, peer, data).filter(|&o| o != self.id) else {
+            return false;
+        };
+        if owner >= self.forward.len() {
+            self.forward.resize_with(owner + 1, Vec::new);
+        }
+        self.forward[owner].push(Forwarded {
+            proto: Proto::Udp,
+            local,
+            peer,
+            data: BytesMut::from(data),
+        });
+        true
     }
 
     /// Passes the datagrams read for other shards on, one wake-up per shard.
@@ -955,19 +997,17 @@ impl Shard {
 
     /// Sends what the engine wants sent and reports what it wants reported.
     fn flush(&mut self) {
-        if self.directory.is_some() {
+        if let Some(dir) = &self.directory {
             let updates = self.engine.take_route_updates();
-            for update in &updates {
-                match update {
-                    RouteUpdate::AddAddr(Proto::Udp, local, peer) => {
-                        self.open_peer_socket(*local, *peer)
-                    }
-                    RouteUpdate::RemoveAddr(Proto::Udp, peer) => self.close_peer_socket(*peer),
-                    _ => {}
-                }
+            let refused = dir.apply(self.id, &updates);
+            for (proto, peer) in &refused {
+                self.engine.forget_address(*proto, *peer);
             }
-            if let Some(dir) = &self.directory {
-                dir.apply(self.id, updates);
+            for change in socket_changes(&updates, &refused, &[]) {
+                match change {
+                    SocketChange::Open { local, peer } => self.open_peer_socket(local, peer),
+                    SocketChange::Close(peer) => self.close_peer_socket(peer),
+                }
             }
         }
         // What goes to the node's send gauge is added once for the batch: every shard adds to the
@@ -1020,6 +1060,45 @@ impl Shard {
             self.sink.event(event);
         }
     }
+}
+
+/// What the shard does with the sockets it holds for its participants.
+#[derive(Debug, PartialEq, Eq)]
+enum SocketChange {
+    Open { local: SocketAddr, peer: SocketAddr },
+    Close(SocketAddr),
+}
+
+/// The socket changes the route `updates` of this shard call for, given the addresses the
+/// directory `refused` it and those it `lost` to another shard: an address gets a socket when it is
+/// learned and keeps it until it is gone, refused or taken away.
+fn socket_changes(
+    updates: &[RouteUpdate],
+    refused: &[(Proto, SocketAddr)],
+    lost: &[(Proto, SocketAddr)],
+) -> Vec<SocketChange> {
+    let mut changes = Vec::new();
+    for update in updates {
+        match update {
+            RouteUpdate::AddAddr {
+                proto: Proto::Udp,
+                local,
+                peer,
+                ..
+            } if !refused.contains(&(Proto::Udp, *peer)) => changes.push(SocketChange::Open {
+                local: *local,
+                peer: *peer,
+            }),
+            RouteUpdate::RemoveAddr(Proto::Udp, peer) => changes.push(SocketChange::Close(*peer)),
+            _ => {}
+        }
+    }
+    for &(proto, peer) in refused.iter().chain(lost) {
+        if proto == Proto::Udp {
+            changes.push(SocketChange::Close(peer));
+        }
+    }
+    changes
 }
 
 #[cfg(test)]
@@ -1089,5 +1168,60 @@ mod tests {
             queued += batch.len();
         }
         assert!(queued < 2 * MAX_FORWARD_QUEUE + 64, "{queued}");
+    }
+
+    /// The participants' sockets one shard holds, as `socket_changes` leaves them.
+    fn apply(open: &mut std::collections::HashSet<SocketAddr>, changes: Vec<SocketChange>) {
+        for change in changes {
+            match change {
+                SocketChange::Open { peer, .. } => open.insert(peer),
+                SocketChange::Close(peer) => open.remove(&peer),
+            };
+        }
+    }
+
+    fn learned(user: &str, peer: SocketAddr, heard: Instant, refresh: bool) -> RouteUpdate {
+        RouteUpdate::AddAddr {
+            proto: Proto::Udp,
+            local: "127.0.0.1:8443".parse().unwrap(),
+            peer,
+            user: user.into(),
+            heard,
+            refresh,
+        }
+    }
+
+    #[test]
+    fn sockets_are_closed_for_addresses_that_were_refused_or_taken_away() {
+        use std::collections::HashSet;
+        let (dir, peer) = (Directory::default(), forwarded(0).peer);
+        let now = Instant::now();
+        let (mut one, mut two, mut three) = (HashSet::new(), HashSet::new(), HashSet::new());
+
+        // Shard 1 learns the address and opens a socket for it.
+        let updates = [learned("alice", peer, now, false)];
+        let refused = dir.apply(1, &updates);
+        apply(&mut one, socket_changes(&updates, &refused, &[]));
+        assert_eq!(one.len(), 1);
+
+        // Another user's session on shard 3 signs a check from it: refused, no socket.
+        let updates = [learned("mallory", peer, now, false)];
+        let refused = dir.apply(3, &updates);
+        apply(&mut three, socket_changes(&updates, &refused, &[]));
+        assert!(three.is_empty());
+
+        // Alice rejoins on shard 2, which takes the address: shard 1 closes its socket.
+        let updates = [learned("alice", peer, now, false)];
+        let refused = dir.apply(2, &updates);
+        apply(&mut two, socket_changes(&updates, &refused, &[]));
+        let lost = dir.take_lost(1);
+        apply(&mut one, socket_changes(&[], &[], &lost));
+        assert_eq!((one.len(), two.len()), (0, 1));
+
+        // Its republish, sent before it knew, opens nothing again.
+        let updates = [learned("alice", peer, now, true)];
+        let refused = dir.apply(1, &updates);
+        apply(&mut one, socket_changes(&updates, &refused, &[]));
+        assert!(one.is_empty(), "the sockets are back to where they began");
     }
 }
