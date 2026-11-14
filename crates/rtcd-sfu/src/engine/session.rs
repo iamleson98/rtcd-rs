@@ -18,8 +18,9 @@ use super::route::AddrBudget;
 use super::signaling::{Phase, SignalingLock};
 use super::types::Proto;
 use crate::bwe::Estimate;
+use crate::camera_budget::CameraBudget;
 use crate::ids::TrackType;
-use crate::layers::{Layer, ScreenLevel, StallWatch};
+use crate::layers::{Layer, ScreenLevel, StallWatch, Steps};
 use crate::rate::RateMonitor;
 use crate::rewrite::Rewriter;
 use crate::temporal::TemporalFilter;
@@ -62,9 +63,12 @@ pub(crate) struct Source {
     /// The id receivers see this stream under; layers of one camera share it.
     pub out_track_id: String,
     pub rate: RateMonitor,
-    /// For a VP8 screen share: what its base and second temporal layers bring, for the rungs a
-    /// receiver is offered (see `layers::Ladder`).
+    /// For a VP8 video: what its base and second temporal layers bring, for the rungs a receiver
+    /// is offered (see `layers::Ladder`, `camera_budget`).
     pub temporal_rates: Option<TemporalRates>,
+    /// For a camera: what it costs a receiver at each step, as measured at the last upkeep (once
+    /// a second per sender, not once per receiver).
+    pub steps: Steps,
     /// When a packet of this stream last arrived.
     pub last_packet: Option<Instant>,
     /// When a keyframe was last asked of the sender for this stream.
@@ -75,8 +79,8 @@ pub(crate) struct Source {
     pub gap: bool,
 }
 
-/// The rates of the lower temporal layers of a screen share's layer, measured as for the whole
-/// layer, and how big its keyframes are: a receiver moved onto the layer is sent one first.
+/// The rates of the lower temporal layers of a video's layer, measured as for the whole layer, and
+/// how big its keyframes are: a receiver moved onto the layer is sent one first.
 #[derive(Debug)]
 pub(crate) struct TemporalRates {
     pub base: RateMonitor,
@@ -170,8 +174,14 @@ pub(crate) struct DownStream {
     /// The source the stream is waiting to be moved onto, at its next keyframe.
     pub target: Option<u32>,
     pub rewrite: Rewriter,
-    /// Which temporal layers of a screen share the receiver is sent.
+    /// Which temporal layers of the stream the receiver is sent.
     pub temporal: TemporalFilter,
+    /// A camera the receiver's path cannot carry along with the others: it waits, for the one
+    /// keyframe that starts it again, on `target` (see `Engine::review_cameras`).
+    pub paused: bool,
+    /// The camera is being paused: it leaves the stream at the end of the frame it is in, so no
+    /// receiver is sent half a frame.
+    pub pausing: bool,
 }
 
 /// What the SFU sends a participant.
@@ -193,6 +203,9 @@ pub(crate) struct Downlink {
     pub screen_level: ScreenLevel,
     /// When the screen share's layer was last decided.
     pub screen_review: Option<Instant>,
+    /// What the receiver's path carries of its cameras, and when that was last looked at.
+    pub cameras: CameraBudget,
+    pub camera_review: Option<Instant>,
 }
 
 impl Downlink {

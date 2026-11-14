@@ -148,8 +148,8 @@ impl Rewriter {
                 .wrapping_add(FRAME_GAP)
                 .wrapping_sub(first.header.timestamp);
             if self.vp8 {
-                if let (Some(last), Some(d)) =
-                    (self.last_picture_id, vp8::Descriptor::parse(&first.payload))
+                let descriptor = vp8::Descriptor::parse(&first.payload);
+                if let (Some(last), Some(d)) = (self.last_picture_id, descriptor)
                     && let Some((id, _)) = d.picture_id
                 {
                     self.picture_id_offset = last.wrapping_add(1).wrapping_sub(id);
@@ -159,8 +159,7 @@ impl Rewriter {
                 // would read as referring to the old source's last one, and a receiver that has it
                 // before the keyframe (a keyframe is large, and the last of it to arrive) would
                 // decode it against a picture of the other layer.
-                if let (Some(last), Some(d)) =
-                    (self.last_tl0, vp8::Descriptor::parse(&first.payload))
+                if let (Some(last), Some(d)) = (self.last_tl0, descriptor)
                     && let Some(t) = d.tl0_pic_idx
                 {
                     self.tl0_offset = last.wrapping_add(1).wrapping_sub(t);

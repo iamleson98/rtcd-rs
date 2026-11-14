@@ -77,6 +77,9 @@ pub struct EngineConfig {
     /// How many voices of one call are forwarded when more microphones are open than that: the
     /// loudest (see `loudest`). 0 forwards every voice, as the Go rtcd does.
     pub audio_loudest: usize,
+    /// Whether a receiver is held to what its path carries of the cameras it is sent (see
+    /// `camera_budget`). Off sends every camera whole.
+    pub camera_budget: bool,
     /// The packet time, in milliseconds, browsers are asked to send their voice with (`a=ptime` in
     /// the descriptions they are given). A longer one makes fewer, larger packets: 40 ms halves the
     /// packets a call's microphones cost every listener, for 20 ms more delay. 0 leaves it to the
@@ -114,6 +117,7 @@ impl Default for EngineConfig {
             ice_lite: true,
             pacing: false,
             audio_loudest: 0,
+            camera_budget: true,
             audio_ptime_ms: 0,
             egress_budget_bps: 0,
             egress_budget_pps: 0,

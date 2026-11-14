@@ -170,6 +170,15 @@ ignores it stays at 20. Forwarded voice keeps the packet time it was sent with, 
 activity detector follows it. The value is 0 (the browser decides, the default) or a multiple of 20
 up to 120.
 
+## A receiver's path that carries less than its cameras
+
+A receiver whose downlink carries less than the cameras it is sent loses the excess at random, and
+every picture breaks. With `RTCD_RTC_CAMERABUDGET=true` (`rtc.camera_budget`, the default) the SFU
+holds that receiver's cameras to what its path was measured to deliver (less its screen share): the
+host's camera first, then the others in turn, each whole, or without its upper temporal layers when
+the browser sends them, or paused (restarted at a keyframe) until there is room again. Cameras
+that fit are untouched; `false` sends every camera whole, whatever the path drops (`src/camera_budget.rs`).
+
 ## Large calls: a send budget
 
 A node asked for more than its network carries does not slow down evenly: its send queues overflow

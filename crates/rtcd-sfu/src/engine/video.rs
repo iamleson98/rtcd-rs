@@ -14,10 +14,13 @@ use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use super::session::{DownPhase, SessionKey, SourceKey, SubRef};
+use super::session::{DownPhase, SessionKey, Source, SourceKey, SubRef};
 use super::{Engine, Load};
+use crate::camera_budget::{
+    self, Camera, NOMINAL_CAMERA_RATE, RANK_HOST, RANK_LOUD, RANK_SMALL, RANK_WATCHED,
+};
 use crate::ids::TrackType;
-use crate::layers::{Ladder, Layer, LayerRates, ScreenInputs, WATCH_EVERY};
+use crate::layers::{Ladder, Layer, LayerRates, ScreenInputs, Steps, WATCH_EVERY};
 
 /// The most cameras one receiver may name.
 pub const MAX_VIDEO_SUBSCRIPTIONS: usize = 100;
@@ -132,7 +135,7 @@ impl Engine {
             return;
         }
         ds.target = Some(to);
-        let active = ds.phase == DownPhase::Active;
+        let active = ds.phase == DownPhase::Active && !ds.paused;
         if let Some(fan) = self.fanout.get_mut(&SourceKey {
             session: publisher,
             source: to,
@@ -174,6 +177,18 @@ impl Engine {
         {
             debug!(session = %p.cfg.session_id, %err, "keyframe request failed");
         }
+        // The keyframe that answers goes to everyone the stream feeds, in a burst on each path
+        // that is not congestion (only a request that was sent brings one).
+        if let Some(fan) = self.fanout.get(&SourceKey {
+            session: publisher,
+            source,
+        }) {
+            for sub in fan.serving.iter().chain(&fan.waiting) {
+                if let Some(s) = self.sessions.get_mut(sub.session) {
+                    s.down.cameras.expect_keyframes(now);
+                }
+            }
+        }
         self.mark_dirty(publisher);
     }
 
@@ -202,7 +217,7 @@ impl Engine {
         let wanted: Vec<_> = s
             .down
             .iter()
-            .filter(|(_, d)| asked.contains(&d.ssrc))
+            .filter(|(_, d)| asked.contains(&d.ssrc) && !d.paused)
             .flat_map(|(_, d)| {
                 [d.source, d.target]
                     .into_iter()
@@ -267,7 +282,11 @@ impl Engine {
         // reading a session's statistics is not free on the thread that forwards the voices.
         if self.has_video(key) {
             self.watch_camera(key, now);
+            self.measure_cameras(key, now);
             self.retry_keyframes(key, now);
+            // The cameras are held first, so that the screen share, which comes before them, is
+            // not cut for the sake of cameras that are about to be.
+            self.review_cameras(key, now);
             self.review_screen_level(key, now, true);
             self.report_quality(key, now);
         }
@@ -362,7 +381,7 @@ impl Engine {
         let waiting: Vec<_> = s
             .down
             .iter()
-            .filter(|(_, d)| d.phase == DownPhase::Active)
+            .filter(|(_, d)| d.phase == DownPhase::Active && !d.paused)
             .filter_map(|(_, d)| d.target.map(|t| (d.publisher, t)))
             .collect();
         for (publisher, source) in waiting {
@@ -370,16 +389,17 @@ impl Engine {
         }
     }
 
-    /// Looks at a receiver's screen share again when its feedback says the path is congested,
-    /// without waiting for the next once-a-second review (see [`SCREEN_REVIEW_MIN`]).
-    pub(super) fn watch_screen_path(&mut self, key: SessionKey, now: Instant) {
+    /// Looks at a receiver's screen share and cameras again when its feedback says the path is
+    /// congested, without waiting for the next once-a-second review (see [`SCREEN_REVIEW_MIN`]).
+    pub(super) fn watch_path(&mut self, key: SessionKey, now: Instant) {
         let Some(s) = self.sessions.get(key) else {
             return;
         };
-        if s.down
-            .screen_review
-            .is_some_and(|t| now.saturating_duration_since(t) < SCREEN_REVIEW_MIN)
-        {
+        let due = |at: Option<Instant>| {
+            at.is_none_or(|t| now.saturating_duration_since(t) >= SCREEN_REVIEW_MIN)
+        };
+        let (screen, cameras) = (due(s.down.screen_review), due(s.down.camera_review));
+        if !screen && !cameras {
             return;
         }
         let e = s.estimate.snapshot();
@@ -391,7 +411,13 @@ impl Engine {
             delivery: e.delivery,
             other: 0.0,
         };
-        if path.congested() {
+        if !path.congested() {
+            return;
+        }
+        if cameras {
+            self.review_cameras(key, now);
+        }
+        if screen {
             self.review_screen_level(key, now, false);
         }
     }
@@ -415,23 +441,7 @@ impl Engine {
         let Some(p) = self.sessions.get(sharer) else {
             return;
         };
-        let rates = |layer: Layer| {
-            let src =
-                p.up.sources
-                    .iter()
-                    .find(|x| x.ty == TrackType::Screen && x.layer == layer)?;
-            let temporal = src.temporal_rates.as_ref();
-            Some(LayerRates {
-                total: src.rate.rate(now),
-                temporal: temporal
-                    .filter(|t| t.seen)
-                    .map(|t| [t.base.rate(now), t.second.rate(now)]),
-                keyframe_bits: temporal
-                    .and_then(|t| t.keyframe_bytes)
-                    .map(|b| b as f64 * 8.0),
-            })
-        };
-        let ladder = Ladder::new(rates(Layer::Low), rates(Layer::High));
+        let ladder = Self::screen_ladder(p, now);
         let serving = source
             .and_then(|id| p.up.sources.iter().find(|x| x.id == id))
             .map(|x| x.layer);
@@ -472,21 +482,279 @@ impl Engine {
         }
     }
 
+    /// What the sharer `p` offers of its screen share, rung by rung.
+    fn screen_ladder(p: &super::session::Session, now: Instant) -> Ladder {
+        let rates = |layer: Layer| {
+            let src =
+                p.up.sources
+                    .iter()
+                    .find(|x| x.ty == TrackType::Screen && x.layer == layer)?;
+            let temporal = src.temporal_rates.as_ref();
+            Some(LayerRates {
+                total: src.rate.rate(now),
+                temporal: temporal
+                    .filter(|t| t.seen)
+                    .map(|t| [t.base.rate(now), t.second.rate(now)]),
+                keyframe_bits: temporal
+                    .and_then(|t| t.keyframe_bytes)
+                    .map(|b| b as f64 * 8.0),
+            })
+        };
+        Ladder::new(rates(Layer::Low), rates(Layer::High))
+    }
+
+    /// Bits per second of the screen share a receiver is sent now: it comes first on the path.
+    fn screen_rate(&self, key: SessionKey, now: Instant) -> f64 {
+        let Some(s) = self.sessions.get(key) else {
+            return 0.0;
+        };
+        s.down
+            .iter()
+            .find(|(_, d)| d.ty == TrackType::Screen)
+            .and_then(|(_, d)| self.sessions.get(d.publisher))
+            .zip(s.down.screen_level.rung())
+            .and_then(|(p, rung)| Self::screen_ladder(p, now).rate_of(rung))
+            .unwrap_or(0.0)
+    }
+
+    /// Measures what each camera a session sends costs a receiver at each of its steps, once for
+    /// all its receivers (`review_cameras` reads it).
+    fn measure_cameras(&mut self, key: SessionKey, now: Instant) {
+        if !self.cfg.camera_budget {
+            return;
+        }
+        let Some(s) = self.sessions.get_mut(key) else {
+            return;
+        };
+        for src in s.up.sources.iter_mut().filter(|x| x.ty == TrackType::Video) {
+            src.steps = camera_steps(src, now);
+        }
+    }
+
+    /// Holds the cameras a receiver is sent to what its path carries (see `camera_budget`): each
+    /// is sent whole, or as much of its temporal layers as fits, or paused until a keyframe finds
+    /// it room again. Looked at once a second, and sooner while the path says it is congested.
+    pub(super) fn review_cameras(&mut self, key: SessionKey, now: Instant) {
+        if !self.cfg.camera_budget {
+            return;
+        }
+        if let Some(s) = self.sessions.get_mut(key) {
+            s.down.camera_review = Some(now);
+        }
+        let Some(s) = self.sessions.get(key) else {
+            return;
+        };
+        let e = s.estimate.snapshot();
+        let path = ScreenInputs {
+            queue: e.queue,
+            queue_trend: e.queue_trend,
+            acked: e.acked,
+            capacity: e.capacity,
+            delivery: e.delivery,
+            other: 0.0,
+        };
+        if s.down.cameras.limit().is_none() && !path.congested() {
+            return;
+        }
+        let voices = self.calls.get(&s.call).map(|c| &c.voices);
+        let mut streams = Vec::new();
+        let mut cameras = Vec::new();
+        for (id, d) in s
+            .down
+            .iter()
+            .filter(|(_, d)| d.ty == TrackType::Video && d.phase == DownPhase::Active)
+        {
+            let Some(p) = self.sessions.get(d.publisher) else {
+                continue;
+            };
+            let Some(src) = d
+                .target
+                .or(d.source)
+                .and_then(|id| p.up.sources.iter().find(|x| x.id == id))
+            else {
+                continue;
+            };
+            let rank = if p.cfg.props.host() {
+                RANK_HOST
+            } else if voices.is_some_and(|v| v.is_loud(d.publisher, now)) {
+                RANK_LOUD
+            } else if s.down.low_video.contains(&p.cfg.session_id) {
+                RANK_SMALL
+            } else {
+                RANK_WATCHED
+            };
+            streams.push(id);
+            cameras.push(Camera::new(
+                rank,
+                src.steps,
+                d.paused || d.pausing,
+                d.temporal.limit(),
+            ));
+        }
+        if cameras.is_empty() {
+            return;
+        }
+        let path = ScreenInputs {
+            other: self.screen_rate(key, now),
+            ..path
+        };
+        let before: Vec<usize> = cameras.iter().map(|c| c.level).collect();
+        let Some(s) = self.sessions.get_mut(key) else {
+            return;
+        };
+        s.down
+            .cameras
+            .review(now, &path, camera_budget::Load::of(&cameras));
+        let raise = s.down.cameras.raise_ceiling(now);
+        let limit = s.down.cameras.limit();
+        camera_budget::allocate(limit, raise, &mut cameras);
+        let (mut raised, mut changed) = (false, false);
+        let (mut paused, mut thinned) = (0, 0);
+        for ((id, camera), was) in streams.into_iter().zip(&cameras).zip(before) {
+            raised |= camera.level > was;
+            changed |= camera.level != was;
+            match camera.level {
+                0 => paused += 1,
+                n if n < camera.steps.count() => thinned += 1,
+                _ => {}
+            }
+            if camera.level != was {
+                self.apply_camera_level(key, id, camera, now);
+            }
+        }
+        let Some(s) = self.sessions.get_mut(key) else {
+            return;
+        };
+        if raised {
+            s.down.cameras.raised(now);
+        }
+        if changed {
+            debug!(session = %s.cfg.session_id, ?limit, paused, thinned, cameras = cameras.len(), "cameras held to the path");
+        }
+    }
+
+    /// Sends a receiver the camera `id` at the level `camera` was given: paused, or up to the
+    /// temporal layer it says.
+    fn apply_camera_level(&mut self, key: SessionKey, id: u32, camera: &Camera, now: Instant) {
+        let Some(ds) = self.sessions.get_mut(key).and_then(|s| s.down.get_mut(id)) else {
+            return;
+        };
+        if camera.level == 0 {
+            self.pause_camera(key, id);
+            return;
+        }
+        ds.temporal.set_limit(camera.limit(camera.level));
+        ds.pausing = false;
+        if ds.paused {
+            self.resume_camera(key, id, now);
+        }
+    }
+
+    /// Stops sending a receiver a camera: at the end of the frame it is in, or at once when it is
+    /// still waiting for a keyframe and nothing is sent.
+    fn pause_camera(&mut self, receiver: SessionKey, stream: u32) {
+        let Some(ds) = self
+            .sessions
+            .get_mut(receiver)
+            .and_then(|r| r.down.get_mut(stream))
+        else {
+            return;
+        };
+        if ds.paused || ds.pausing {
+            return;
+        }
+        if ds.source.is_some() {
+            ds.pausing = true;
+        } else {
+            self.finish_pause(receiver, stream);
+        }
+    }
+
+    /// Takes a camera out of the stream, to wait where a stream waits for its keyframe, but is not
+    /// started by one.
+    pub(super) fn finish_pause(&mut self, receiver: SessionKey, stream: u32) {
+        let Some(ds) = self
+            .sessions
+            .get_mut(receiver)
+            .and_then(|r| r.down.get_mut(stream))
+        else {
+            return;
+        };
+        let sub = SubRef {
+            session: receiver,
+            stream,
+        };
+        let publisher = ds.publisher;
+        let (feeding, waiting) = (ds.source.take(), ds.target);
+        ds.pausing = false;
+        let Some(held) = waiting.or(feeding) else {
+            return;
+        };
+        ds.target = Some(held);
+        ds.paused = true;
+        if let Some(fan) = feeding.and_then(|src| {
+            self.fanout.get_mut(&SourceKey {
+                session: publisher,
+                source: src,
+            })
+        }) {
+            fan.serving.retain(|s| *s != sub);
+        }
+        if let Some(fan) = self.fanout.get_mut(&SourceKey {
+            session: publisher,
+            source: held,
+        }) && !fan.waiting.contains(&sub)
+        {
+            fan.waiting.push(sub);
+        }
+    }
+
+    /// Lets a paused camera start again at the next keyframe of its sender, which is asked for.
+    fn resume_camera(&mut self, receiver: SessionKey, stream: u32, now: Instant) {
+        let Some(ds) = self
+            .sessions
+            .get_mut(receiver)
+            .and_then(|r| r.down.get_mut(stream))
+        else {
+            return;
+        };
+        ds.paused = false;
+        let publisher = ds.publisher;
+        // The camera may have another layer to be sent by now.
+        self.sync_stream(receiver, publisher, TrackType::Video, now);
+        let target = self
+            .sessions
+            .get(receiver)
+            .and_then(|r| r.down.get(stream))
+            .and_then(|d| d.target);
+        if let Some(source) = target {
+            self.request_keyframe(publisher, source, now);
+        }
+    }
+
     /// Bits per second of the cameras a receiver is sent now: they share its path with the
-    /// screen.
+    /// screen. While the cameras are held to the path (see `review_cameras`) the screen comes
+    /// first: only the host's camera at its lowest step is taken off the path for it, not the
+    /// rate of cameras that are about to be cut.
     fn other_video_rate(&self, key: SessionKey, now: Instant) -> f64 {
         let Some(s) = self.sessions.get(key) else {
             return 0.0;
         };
+        let held = s.down.cameras.limit().is_some();
         s.down
             .iter()
             .filter(|(_, d)| d.ty == TrackType::Video)
             .filter_map(|(_, d)| {
                 let p = self.sessions.get(d.publisher)?;
                 let src = p.up.sources.iter().find(|x| Some(x.id) == d.source)?;
-                src.rate.rate(now)
+                if held {
+                    let lowest = src.steps.iter().next().map(|(_, rate)| rate);
+                    lowest.filter(|_| p.cfg.props.host())
+                } else {
+                    src.rate.rate(now).map(|r| r as f64)
+                }
             })
-            .sum::<u64>() as f64
+            .sum()
     }
 
     /// Whether a session has media to look after once a second: video (its layers, keyframes,
@@ -501,4 +769,17 @@ impl Engine {
     pub(super) fn tick_interval() -> Duration {
         WATCH_EVERY
     }
+}
+
+/// What a camera costs at each step of its temporal layers, as measured.
+fn camera_steps(src: &Source, now: Instant) -> Steps {
+    let temporal = src.temporal_rates.as_ref().filter(|t| t.seen);
+    Steps::of(
+        LayerRates {
+            total: src.rate.rate(now),
+            temporal: temporal.map(|t| [t.base.rate(now), t.second.rate(now)]),
+            keyframe_bits: None,
+        },
+        NOMINAL_CAMERA_RATE,
+    )
 }

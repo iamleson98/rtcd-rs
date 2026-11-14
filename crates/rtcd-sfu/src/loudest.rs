@@ -111,6 +111,14 @@ impl<K: Copy + Eq + Hash> Selector<K> {
         }
     }
 
+    /// Whether `key` holds a slot now: it was heard lately and is among those forwarded. A call
+    /// that forwards every voice (no limit) says nothing of who is loud.
+    pub fn is_loud(&self, key: K, now: Instant) -> bool {
+        self.entries
+            .get(&key)
+            .is_some_and(|e| e.forwarded && now.saturating_duration_since(e.at) < ACTIVE_FOR)
+    }
+
     /// A source left the call or was muted: its slot is free.
     pub fn remove(&mut self, key: K) {
         if self.entries.remove(&key).is_some() {
