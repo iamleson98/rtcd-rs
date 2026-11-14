@@ -6,7 +6,7 @@
 //! changes go into one offer, so a participant joining a class of thirty is brought up to date in
 //! one round trip, not thirty.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rtc::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
 use rtc::peer_connection::state::RTCSignalingState;
@@ -17,11 +17,15 @@ use serde_json::Value;
 use tracing::{debug, error, info, warn};
 
 use super::Engine;
-use super::session::{DownPhase, SessionKey};
+use super::session::{DownPhase, OfferTurn, SessionKey};
 use super::signaling::{Channel, Phase};
 use super::types::CloseReason;
 use crate::ids::parse_track_id;
 use crate::metrics::Direction;
+
+/// A hostile client can send unreadable descriptions by the thousand; one is logged per session
+/// per interval (all are counted in the signaling error metric).
+const UNREADABLE_WARN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Puts a connection that is waiting for an answer back to stable.
 fn roll_back(pc: &mut rtc::peer_connection::RTCPeerConnection, now: Instant) {
@@ -85,7 +89,13 @@ impl Engine {
         let desc: RTCSessionDescription = match serde_json::from_slice(data) {
             Ok(d) => d,
             Err(err) => {
-                warn!(session = %self.session_id(key), %err, "unreadable session description");
+                if let Some(s) = self.sessions.get_mut(key)
+                    && s.last_unreadable_warn
+                        .is_none_or(|at| now.duration_since(at) >= UNREADABLE_WARN_INTERVAL)
+                {
+                    s.last_unreadable_warn = Some(now);
+                    warn!(session = %s.cfg.session_id, %err, "unreadable session description");
+                }
                 self.metrics.error(&self.group_id(key), "signaling");
                 return;
             }
@@ -346,6 +356,10 @@ impl Engine {
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
+        let due = s.offer_turn == OfferTurn::Due;
+        if due {
+            s.offer_turn = OfferTurn::Free;
+        }
         if s.phase != Phase::Idle || !s.down.ready {
             return;
         }
@@ -357,9 +371,21 @@ impl Engine {
             return;
         }
         let waiting_since = *s.wants_offer_since.get_or_insert(now);
+        // The offers of a turn are limited, and go in the order they were wanted: a session joins
+        // the back of the queue, and one that came after it does not pass it.
+        if !due && (self.offers_left == 0 || !self.negotiations.is_empty()) {
+            if s.offer_turn == OfferTurn::Free {
+                s.offer_turn = OfferTurn::Queued;
+                self.negotiations.push_back(key);
+            }
+            return;
+        }
         if !s.lock.server_lock(now, self.cfg.answer_wait(0)) {
             // The participant holds the lock; its unlock (or its expiry) wakes us.
             return;
+        }
+        if !due {
+            self.offers_left -= 1;
         }
         s.wants_offer_since = None;
         self.metrics.signaling_lock_grab_time(

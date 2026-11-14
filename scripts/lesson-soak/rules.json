@@ -1,7 +1,7 @@
 {
   "compare": [
     {"subject": "rtcd-rs", "baseline": "rtcd-go"},
-    {"subject": "rtcd-rs/chrome", "baseline": "rtcd-go/chrome"}
+    {"subject": "rtcd-rs/chrome", "baseline": "rtcd-go/chrome", "clean_zero": ["stalls", "closes", "ice_disc"]}
   ],
   "require_groups": ["clean", "impaired"],
   "ratio": 1.25,

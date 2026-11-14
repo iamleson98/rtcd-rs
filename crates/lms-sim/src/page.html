@@ -6,7 +6,8 @@
 <script>
 // A browser in the lesson, as lms-web's call client is: it joins the SFU through the signaling
 // relay of lms-sim (which passes messages on the way the LMS server does), answers the SFU's
-// offers over the "calls-dc" data channel, watches the teacher and reports what Chrome measures.
+// offers over the "calls-dc" data channel, watches the teacher and the student cameras the relay
+// subscribes it to, and reports what Chrome measures.
 const q = new URLSearchParams(location.search);
 const group = q.get('group') || 'clean';
 const teacher = q.get('teacher') || 'session-teacher';
@@ -125,7 +126,7 @@ async function start() {
 		joinedOnce = true;
 		lostAt = null;
 		tries = 0;
-		send({ t: 'subscribe', data: [teacher] });
+		send({ t: 'subscribe' });
 	};
 	dc.onmessage = (e) => {
 		const json = decodeSdp(new Uint8Array(e.data));
@@ -156,7 +157,8 @@ async function poll() {
 		const key = `${kind}:${session.replace(/^session-/, '')}`;
 		const prev = seen.get(r.ssrc);
 		const changed = prev && prev.packets === r.packetsReceived ? prev.changed : now;
-		seen.set(r.ssrc, { key, r, packets: r.packetsReceived, changed });
+		const framed = prev && prev.frames === (r.framesDecoded ?? 0) ? prev.framed : now;
+		seen.set(r.ssrc, { key, r, packets: r.packetsReceived, changed, frames: r.framesDecoded ?? 0, framed });
 	});
 	if (++ticks % 5) return;
 	// A renegotiation can give a stream a new track: only the one that moved last is reported.
@@ -164,8 +166,22 @@ async function poll() {
 	for (const e of seen.values()) {
 		if (!current.has(e.key) || e.changed > current.get(e.key).changed) current.set(e.key, e);
 	}
-	for (const [key, { r, changed }] of current) {
+	for (const [key, { r, changed, framed }] of current) {
 		const audio = r.kind === 'audio';
+		// Chrome counts a freeze once the frame that ends it is in. One that is still going on is
+		// counted up to now, as lms-sim's own receivers do (stats.rs): a frame that takes longer than
+		// max(3 x the average gap, the average + 150 ms), once there are five gaps to average over.
+		let freezes = r.freezeCount ?? 0;
+		let freezeMs = Math.round((r.totalFreezesDuration ?? 0) * 1000);
+		const gaps = (r.framesDecoded ?? 0) - 1;
+		if (!audio && gaps >= 5 && r.totalInterFrameDelay > 0) {
+			const avg = (r.totalInterFrameDelay / gaps) * 1000;
+			const open = now - framed;
+			if (open > Math.max(3 * avg, avg + 150)) {
+				freezes += 1;
+				freezeMs += Math.round(open);
+			}
+		}
 		send({
 			t: 'recv',
 			id: `chrome-${group}${epoch ? `#${epoch}` : ''}/${key}`,
@@ -173,8 +189,8 @@ async function poll() {
 				media: audio ? 'audio' : 'video',
 				group,
 				frames: r.framesDecoded ?? 0,
-				freezes: r.freezeCount ?? 0,
-				freeze_ms: Math.round((r.totalFreezesDuration ?? 0) * 1000),
+				freezes,
+				freeze_ms: freezeMs,
 				packets: r.packetsReceived ?? 0,
 				bytes: (r.bytesReceived ?? 0) + (r.headerBytesReceived ?? 0),
 				lost: Math.max(0, r.packetsLost ?? 0),

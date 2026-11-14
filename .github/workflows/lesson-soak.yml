@@ -78,6 +78,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     # A lesson is at most 150 minutes (checked in Plan); expressions have no arithmetic.
     timeout-minutes: 180
+    # The Go baseline failing (killed for memory, crashed) is its finding, not rtcd-rs's: the report
+    # shows it and compares rtcd-rs over the minutes the baseline ran.
+    continue-on-error: ${{ matrix.impl == 'go' }}
     strategy:
       fail-fast: false
       matrix:
@@ -157,6 +160,8 @@ jobs:
     needs: [plan, calibrate]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
+    # As in the lesson job: a Go baseline that does not survive the abuse is reported, not a failure.
+    continue-on-error: ${{ matrix.impl == 'go' }}
     strategy:
       fail-fast: false
       matrix:

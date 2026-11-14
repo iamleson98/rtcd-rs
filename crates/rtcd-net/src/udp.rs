@@ -12,6 +12,7 @@ use std::os::fd::{AsRawFd, RawFd};
 
 use bytes::BytesMut;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use tracing::{info, warn};
 
 mod sockaddr;
 
@@ -45,6 +46,7 @@ pub fn bind_udp(
     }
     if recv_buffer > 0 {
         let _ = socket.set_recv_buffer_size(recv_buffer);
+        report_recv_buffer(&socket, addr, recv_buffer);
     }
     if send_buffer > 0 {
         let _ = socket.set_send_buffer_size(send_buffer);
@@ -52,6 +54,29 @@ pub fn bind_udp(
     socket.set_nonblocking(true)?;
     socket.bind(&SockAddr::from(addr))?;
     Ok(socket.into())
+}
+
+/// Logs the receive buffer the system granted. A buffer smaller than requested drops datagrams
+/// whenever the threads fall briefly behind, so that is a warning, not a detail.
+fn report_recv_buffer(socket: &Socket, addr: SocketAddr, requested: usize) {
+    let Ok(granted) = socket.recv_buffer_size() else {
+        return;
+    };
+    // Linux doubles the value it accepts to leave room for its own bookkeeping, and reports the
+    // doubled size.
+    let wanted = if cfg!(target_os = "linux") {
+        requested.saturating_mul(2)
+    } else {
+        requested
+    };
+    if granted < wanted {
+        warn!(
+            %addr, requested, granted,
+            "UDP receive buffer is smaller than requested; raise the sysctl net.core.rmem_max"
+        );
+    } else {
+        info!(%addr, requested, granted, "UDP receive buffer");
+    }
 }
 
 /// A batch of received datagrams.

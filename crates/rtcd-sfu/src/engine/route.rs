@@ -5,6 +5,7 @@
 //! the ICE username fragment the SFU gave it in its answer.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 /// A map hashed with a fast, randomly seeded function: it is read for every datagram, and the
 /// standard SipHash costs more than the lookup is worth.
@@ -20,20 +21,83 @@ use super::types::Proto;
 /// Addresses remembered per session; a participant moving between networks adds one now and then.
 const MAX_ADDRS_PER_SESSION: usize = 8;
 
+/// How long an address may go unheard before another user's session can take it over: a browser
+/// sends an ICE consent check every few seconds, and consent lapses after this long without one
+/// (RFC 7675), so a NAT may since have handed the port to someone else.
+pub(crate) const ADDRESS_SILENCE: Duration = Duration::from_secs(30);
+
+/// How many addresses a session may gain in one [`NEW_ADDR_WINDOW`]. A participant changes network
+/// now and then; a peer signing checks for its own session from many addresses is churning the
+/// routes (and the shards' sockets), and its checks beyond this are dropped.
+const NEW_ADDRS_PER_WINDOW: usize = 4;
+const NEW_ADDR_WINDOW: Duration = Duration::from_secs(10);
+
+/// How often an address that is still being heard is published again, which is how the other
+/// shards tell it is alive.
+const REPUBLISH_EVERY: Duration = Duration::from_secs(10);
+
 /// A change to what this engine answers for, published so other shards can send it the datagrams
 /// that reached them instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteUpdate {
     AddUfrag(String),
     RemoveUfrag(String),
-    /// An address learned for a session: where it was heard (`local`, as advertised) and from whom.
-    AddAddr(Proto, SocketAddr, SocketAddr),
+    /// An address learned for a session of `user`: where it was heard (`local`, as advertised) and
+    /// from whom, and when it was last heard. Another shard's session takes the address only if
+    /// its user is the same (and not empty) or the address has been silent for
+    /// [`ADDRESS_SILENCE`]. A `refresh` only says the address is still heard: it never moves it.
+    AddAddr {
+        proto: Proto,
+        local: SocketAddr,
+        peer: SocketAddr,
+        user: String,
+        heard: Instant,
+        refresh: bool,
+    },
     RemoveAddr(Proto, SocketAddr),
+}
+
+/// How many new addresses a session may still gain in the current window.
+#[derive(Debug)]
+pub(crate) struct AddrBudget {
+    began: Instant,
+    used: usize,
+}
+
+impl AddrBudget {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            began: now,
+            used: 0,
+        }
+    }
+
+    /// Spends one new address, if the window has any left.
+    fn take(&mut self, now: Instant) -> bool {
+        if now.saturating_duration_since(self.began) >= NEW_ADDR_WINDOW {
+            *self = Self::new(now);
+        }
+        if self.used >= NEW_ADDRS_PER_WINDOW {
+            return false;
+        }
+        self.used += 1;
+        true
+    }
+}
+
+/// The session an address was learned for.
+#[derive(Debug)]
+struct Holder {
+    key: SessionKey,
+    /// When a datagram last came from the address.
+    heard: Instant,
+    /// When the address was last published.
+    published: Instant,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct Routes {
-    by_addr: FastMap<(Proto, SocketAddr), SessionKey>,
+    by_addr: FastMap<(Proto, SocketAddr), Holder>,
     by_ufrag: HashMap<String, SessionKey>,
     /// Whether changes are recorded in `updates` (only when other shards need to know).
     publish: bool,
@@ -77,18 +141,76 @@ impl Routes {
 
 impl Engine {
     /// The session `data` from `peer` is for, learning the address from a STUN check.
+    ///
+    /// An ICE check names its session by the username fragment, which is what routes it; every
+    /// other datagram goes by the address its sender was last heard from. A check that would give
+    /// a session an address it does not have is believed only if its MESSAGE-INTEGRITY holds for
+    /// the session it names, and takes an address that another session holds only from a session
+    /// of the same user (a rejoin from the same port) or when the holder has gone quiet there.
+    /// Whoever knows their own session's password can sign a check from any address they like, so
+    /// that is as far as a check is trusted.
     pub(super) fn route(
         &mut self,
+        now: Instant,
         proto: Proto,
         local: SocketAddr,
         peer: SocketAddr,
         data: &BytesMut,
     ) -> Option<SessionKey> {
-        if let Some(&key) = self.routes.by_addr.get(&(proto, peer)) {
-            return Some(key);
+        let named = stun_local_ufrag(data).and_then(|u| self.routes.by_ufrag.get(u).copied());
+        let Some(holder) = self.routes.by_addr.get_mut(&(proto, peer)) else {
+            return self.adopt(now, proto, local, peer, named?, data);
+        };
+        let owner = holder.key;
+        if let Some(key) = named
+            && key != owner
+        {
+            return self.adopt(now, proto, local, peer, key, data);
         }
-        let ufrag = stun_local_ufrag(data)?;
-        let key = *self.routes.by_ufrag.get(ufrag)?;
+        holder.heard = now;
+        let republish = self.routes.publish && now - holder.published >= REPUBLISH_EVERY;
+        if republish {
+            holder.published = now;
+            self.publish_addr(owner, proto, local, peer, now, true);
+        }
+        Some(owner)
+    }
+
+    /// Gives session `key`, which a check from `peer` names, that address, if the check may.
+    /// Returns where the datagram goes.
+    fn adopt(
+        &mut self,
+        now: Instant,
+        proto: Proto,
+        local: SocketAddr,
+        peer: SocketAddr,
+        key: SessionKey,
+        data: &[u8],
+    ) -> Option<SessionKey> {
+        let held = self
+            .routes
+            .by_addr
+            .get(&(proto, peer))
+            .map(|h| (h.key, h.heard));
+        if !self.check_integrity(key, data) {
+            return held.map(|(owner, _)| owner);
+        }
+        if let Some((owner, heard)) = held {
+            let user = &self.sessions.get(owner)?.cfg.user_id;
+            let same_user = !user.is_empty() && *user == self.sessions.get(key)?.cfg.user_id;
+            if !same_user && now.saturating_duration_since(heard) <= ADDRESS_SILENCE {
+                return Some(owner);
+            }
+        }
+        if !self.sessions.get_mut(key)?.new_addrs.take(now) {
+            return held.map(|(owner, _)| owner);
+        }
+        if let Some((owner, _)) = held {
+            self.sessions
+                .get_mut(owner)?
+                .addrs
+                .retain(|&a| a != (proto, peer));
+        }
         let s = self.sessions.get_mut(key)?;
         if s.addrs.len() >= MAX_ADDRS_PER_SESSION {
             // Forget the oldest address; the session is alive and recently seen ones win.
@@ -101,20 +223,80 @@ impl Engine {
             }
         }
         s.addrs.push((proto, peer));
-        self.routes.by_addr.insert((proto, peer), key);
-        if self.routes.publish {
-            self.routes
-                .updates
-                .push(RouteUpdate::AddAddr(proto, local, peer));
-        }
+        self.routes.by_addr.insert(
+            (proto, peer),
+            Holder {
+                key,
+                heard: now,
+                published: now,
+            },
+        );
+        self.publish_addr(key, proto, local, peer, now, false);
         Some(key)
     }
 
-    /// Whether this engine would take `data` from `peer`: the address is known, or the datagram
-    /// is an ICE check naming one of its sessions.
+    fn publish_addr(
+        &mut self,
+        key: SessionKey,
+        proto: Proto,
+        local: SocketAddr,
+        peer: SocketAddr,
+        now: Instant,
+        refresh: bool,
+    ) {
+        if !self.routes.publish {
+            return;
+        }
+        if let Some(s) = self.sessions.get(key) {
+            self.routes.updates.push(RouteUpdate::AddAddr {
+                proto,
+                local,
+                peer,
+                user: s.cfg.user_id.clone(),
+                heard: now,
+                refresh,
+            });
+        }
+    }
+
+    /// Forgets an address that another shard's session holds now: the directory refused it to a
+    /// session of this engine, or gave it away from one.
+    pub fn forget_address(&mut self, proto: Proto, peer: SocketAddr) {
+        if let Some(h) = self.routes.by_addr.remove(&(proto, peer))
+            && let Some(s) = self.sessions.get_mut(h.key)
+        {
+            s.addrs.retain(|&a| a != (proto, peer));
+        }
+    }
+
+    /// Whether the STUN check `data` is signed with the ICE password of session `key`.
+    fn check_integrity(&self, key: SessionKey, data: &[u8]) -> bool {
+        let Some(s) = self.sessions.get(key) else {
+            return false;
+        };
+        let (Ok(params), Ok(provider)) =
+            (s.pc.local_ice_parameters(), rtc::crypto::default_provider())
+        else {
+            return false;
+        };
+        let mut message = rtc::stun::message::Message::new();
+        message.unmarshal_binary(data).is_ok()
+            && rtc::stun::integrity::MessageIntegrity::check(
+                &mut message,
+                params.password.as_bytes(),
+                provider.crypto(),
+            )
+            .is_ok()
+    }
+
+    /// Whether this engine would take `data` from `peer`: an ICE check is its own if it names one
+    /// of its sessions, whoever the address was learned for; anything else, if the address is
+    /// known.
     pub fn would_route(&self, proto: Proto, peer: SocketAddr, data: &[u8]) -> bool {
-        self.routes.by_addr.contains_key(&(proto, peer))
-            || stun_local_ufrag(data).is_some_and(|u| self.routes.by_ufrag.contains_key(u))
+        match stun_local_ufrag(data) {
+            Some(u) => self.routes.by_ufrag.contains_key(u),
+            None => self.routes.by_addr.contains_key(&(proto, peer)),
+        }
     }
 
     /// Starts or stops recording route changes for [`Engine::take_route_updates`].
@@ -195,5 +377,17 @@ mod tests {
         let mut m = binding_request("abcd:wxyz");
         m[22] = 0xff;
         assert_eq!(stun_local_ufrag(&m), None);
+    }
+
+    #[test]
+    fn a_session_gains_only_a_few_addresses_per_window() {
+        let t0 = Instant::now();
+        let mut budget = AddrBudget::new(t0);
+        for n in 0..NEW_ADDRS_PER_WINDOW {
+            assert!(budget.take(t0 + Duration::from_millis(n as u64)), "{n}");
+        }
+        assert!(!budget.take(t0 + Duration::from_secs(1)), "one too many");
+        assert!(!budget.take(t0 + NEW_ADDR_WINDOW - Duration::from_millis(1)));
+        assert!(budget.take(t0 + NEW_ADDR_WINDOW), "the next window");
     }
 }

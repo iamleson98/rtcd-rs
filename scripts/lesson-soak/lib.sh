@@ -73,7 +73,7 @@ start_sfu() {
     -e RTCD_LOGGER_CONSOLELEVEL=INFO
   )
   docker run -d --name soak-sfu --network "$NET" --ip "$SFU_IP" "${sfu_cpu[@]}" \
-    --memory=2g --memory-swap=2g --ulimit nofile=65536:65536 "${envs[@]}" "$SFU_IMAGE" >/dev/null
+    --memory=4g --memory-swap=4g --ulimit nofile=65536:65536 "${envs[@]}" "$SFU_IMAGE" >/dev/null
   for _ in $(seq 60); do
     docker run --rm --network "$NET" "$LESSON_IMAGE" curl -sf "http://$SFU_IP:8045/version" >/dev/null 2>&1 && break
     sleep 1

@@ -6,7 +6,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Router;
+use axum::extract::ConnectInfo;
+use axum::{Extension, Router};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::service::TowerToHyperService;
@@ -72,7 +73,7 @@ pub async fn serve(
                 debug!(%peer, "tls handshake failed");
                 return;
             };
-            let service = TowerToHyperService::new(router);
+            let service = TowerToHyperService::new(router.layer(Extension(ConnectInfo(peer))));
             if let Err(err) = Builder::new(TokioExecutor::new())
                 .serve_connection_with_upgrades(TokioIo::new(stream), service)
                 .await

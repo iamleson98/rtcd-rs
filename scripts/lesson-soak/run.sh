@@ -119,11 +119,14 @@ if [ "$PROFILE" = abuse ]; then
   shape_chrome+=(-e NETEM_PROFILE=abuse -e NETEM_SEED="$((SEED + 1000))" -e NETEM_NAMES=chrome-impaired -v "$OUT":/out)
   chrome_netem_out=/out/netem-chrome.jsonl
 fi
+# Both shapers wait for one start second, so that their phases (and their end) are the same.
+netem_at=$(($(date +%s) + 10))
+shaper=(bash -c 'until [ "$(date +%s)" -ge "$1" ]; do sleep 0.2; done; shift; exec bash /soak/netem.sh "$@"' _ "$netem_at")
 docker run -d --name soak-netem-chrome --network container:soak-chrome-impaired --cap-add NET_ADMIN \
   -v "$SOAK_DIR":/soak:ro "${shape_chrome[@]}" -e NETEM_PORTS=udp "$LESSON_IMAGE" \
-  bash /soak/netem.sh eth0 "$MINUTES" "$CYCLE" "$chrome_netem_out" >/dev/null
+  "${shaper[@]}" eth0 "$MINUTES" "$CYCLE" "$chrome_netem_out" >/dev/null
 docker exec -d "${shape_lesson[@]}" -e NETEM_PORTS="$UDP_BASE:$STUDENTS_IMPAIRED" soak-impaired \
-  bash /soak/netem.sh eth0 "$MINUTES" "$CYCLE" /out/netem.jsonl
+  "${shaper[@]}" eth0 "$MINUTES" "$CYCLE" /out/netem.jsonl
 # The hostile, churning and junk-sending participants share the call, on an address of their own
 # that is not shaped.
 if [ "$PROFILE" = abuse ]; then
@@ -147,7 +150,12 @@ while docker ps -q -f name='^soak-clean$' | grep -q .; do
   [ "$(date +%s)" -ge "$deadline" ] && { echo "deadline passed"; break; }
   sleep 10
 done
-docker stop -t 20 soak-chrome-clean soak-chrome-impaired soak-netem-chrome soak-clean soak-impaired soak-abuse soak-load >/dev/null 2>&1 || true
+# The receivers go first (the browsers, then the lessons), then the other senders, and the SFU last
+# (the cleanup). The report ends every receiver's samples at the run's first `leave stop`, so the
+# lesson ending is never read as a stall.
+docker stop -t 20 soak-chrome-clean soak-chrome-impaired soak-netem-chrome >/dev/null 2>&1 || true
+docker stop -t 20 soak-clean soak-impaired >/dev/null 2>&1 || true
+docker stop -t 20 soak-abuse soak-load >/dev/null 2>&1 || true
 docker stop -t 5 soak-sample >/dev/null 2>&1 || true
 # The whole log of every container (the SFU's is the evidence of what it did), compressed when large.
 logs=(soak-sfu soak-clean soak-impaired soak-chrome-clean soak-chrome-impaired soak-netem-chrome)

@@ -14,6 +14,7 @@ use rtcd_proto::SessionConfig;
 use rtcd_proto::dc::DcMessage;
 
 use super::CallId;
+use super::route::AddrBudget;
 use super::signaling::{Phase, SignalingLock};
 use super::types::Proto;
 use crate::bwe::Estimate;
@@ -259,6 +260,17 @@ pub(crate) enum Lifecycle {
     Connected,
 }
 
+/// A session's place in the line for an offer (see `Engine::begin_turn`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OfferTurn {
+    /// Not waiting.
+    Free,
+    /// In the engine's queue, behind the sessions that came first.
+    Queued,
+    /// Taken off the queue, with an offer set aside for it in this turn.
+    Due,
+}
+
 /// A participant's connection and everything the engine tracks about it.
 pub(crate) struct Session {
     pub cfg: SessionConfig,
@@ -291,8 +303,14 @@ pub(crate) struct Session {
     pub lock: SignalingLock,
     /// Why the SFU has not offered yet, if it wants to: when the first change was noted.
     pub wants_offer_since: Option<Instant>,
+    /// How many addresses the session may still gain just now.
+    pub new_addrs: AddrBudget,
+    /// Where the session is in the engine's queue for an offer.
+    pub offer_turn: OfferTurn,
     /// Consecutive answers that never came.
     pub offer_failures: u8,
+    /// When an unreadable session description was last logged for this session.
+    pub last_unreadable_warn: Option<Instant>,
     pub dc: Option<DcState>,
     /// Data channel frames waiting for the channel to open.
     pub dc_queue: VecDeque<DcMessage>,

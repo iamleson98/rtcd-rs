@@ -58,6 +58,18 @@ const WRAP_SEQ: u16 = 0u16.wrapping_sub(300);
 const WRAP_VIDEO_TS: u32 = 0u32.wrapping_sub(20 * 90_000);
 const WRAP_AUDIO_TS: u32 = 0u32.wrapping_sub(20 * 48_000);
 
+/// The port of a try in a participant's block of four: tries alternate over the first two, so that
+/// a rejoin never reuses the port the SFU still knows of the try before it.
+fn rejoin_port(base: u16, epoch: u32) -> u16 {
+    base + (epoch % 2) as u16
+}
+
+/// The port of a NAT rebind in the block: rebinds alternate over the last two, which no try uses,
+/// so that a rebind never lands on the port of a rejoin.
+fn rebind_port(base: u16, slot: u32) -> u16 {
+    base + 2 + (slot % 2) as u16
+}
+
 /// What a participant sends.
 #[derive(Debug, Clone, Default)]
 pub struct Spec {
@@ -473,9 +485,9 @@ async fn build(
     // On loopback, unless the participants are on another machine than rtcd: then the address
     // they can be reached at.
     let local = std::env::var("LMS_SIM_LOCAL_IP").unwrap_or_else(|_| "127.0.0.1".into());
-    // A shaped network picks the participant's packets out by its port: a block of four, one per
-    // try (a rejoin does not reuse the port the SFU still knows).
-    let port = spec.udp_base.map_or(0, |b| b + (epoch % 4) as u16);
+    // A shaped network picks the participant's packets out by its port: a block of four, see
+    // `rejoin_port`.
+    let port = spec.udp_base.map_or(0, |b| rejoin_port(b, epoch));
     let socket = UdpSocket::bind(format!("{local}:{port}")).await.ok()?;
     let addr = socket.local_addr().ok()?;
     rtcd.exempt(addr);
@@ -1005,7 +1017,7 @@ async fn drive(
                     }
                     Ctl::Rebind => {
                         slot += 1;
-                        let port = env.udp_base.map_or(0, |b| b + (slot % 4) as u16);
+                        let port = env.udp_base.map_or(0, |b| rebind_port(b, slot));
                         let local = std::env::var("LMS_SIM_LOCAL_IP").unwrap_or_else(|_| "127.0.0.1".into());
                         if let Ok(s) = UdpSocket::bind(format!("{local}:{port}")).await
                             && let Ok(a) = s.local_addr()
@@ -1296,5 +1308,27 @@ fn send_frame(pc: &mut RTCPeerConnection, v: &mut Video, mask: [bool; 2]) {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejoins_and_rebinds_never_share_a_port_and_stay_in_the_block() {
+        let base = 40_008;
+        let rejoins: Vec<u16> = (0..16).map(|e| rejoin_port(base, e)).collect();
+        let rebinds: Vec<u16> = (0..16).map(|s| rebind_port(base, s)).collect();
+        assert!(rejoins.iter().all(|p| (base..base + 2).contains(p)));
+        assert!(rebinds.iter().all(|p| (base + 2..base + 4).contains(p)));
+        assert!(
+            rejoins.windows(2).all(|w| w[0] != w[1]),
+            "a try is on a new port"
+        );
+        assert!(
+            rebinds.windows(2).all(|w| w[0] != w[1]),
+            "a rebind is on a new port"
+        );
     }
 }

@@ -45,7 +45,7 @@ fresh peer connection on a fresh port of its block. It logs `error` (the cause) 
 seat and `event rejoin` with `downtime_ms` and `attempts` when it is back; the series of a later try
 is `name#N`. The Chromium page does the same.
 
-The SFU runs in a container held to 2 CPUs (cpuset) and 2 GiB, the clients on the other CPUs. Both servers
+The SFU runs in a container held to 2 CPUs (cpuset) and 4 GiB, the clients on the other CPUs. Both servers
 get the same settings through the `RTCD_*` variables they share: API address, self registration, ICE
 host override, UDP and TCP port, log level.
 
@@ -80,7 +80,10 @@ architecture, group and phase, on freezes, freeze time, audio gaps, residual los
 after outages, SFU-closed sessions and rejoin downtime, signaling closes, ICE disconnects, SFU CPU, RSS
 (peak and slope), threads and file descriptors: the subject may exceed the baseline by 25 % plus a
 small slack, and a count may not exceed the baseline's. The clean group must show zero stalls, freezes,
-SFU closes and ICE disconnects; the SFU process must not die; after 15 minutes of warmup the first and the
+SFU closes and ICE disconnects (for the Chromium receivers, freezes are left to the comparison: a headless
+browser on a shared runner freezes on its own, on either server); the SFU process must not die. A Go
+baseline that dies (killed for memory, crashed) does not fail the run: the report says when it stopped
+and compares rtcd-rs over the minutes it ran; after 15 minutes of warmup the first and the
 last 20-minute clean window must not differ by more than 2x in freeze rate (plus 0.5/min) or audio gap
 (plus 0.5 %) and the resident set must not grow more than 30 MB/h. Missing data for either side
 fails the report. The details are in `vendor/rtc/benchmarks/soak/README.md`; the report is

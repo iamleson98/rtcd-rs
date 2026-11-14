@@ -25,11 +25,13 @@ use crate::stats::Probe;
 const PAGE: &str = include_str!("page.html");
 
 /// Serves the page on `bind:port` and the relay on `bind:port + 1`, for as long as the process
-/// lives.
+/// lives. The browser watches the cameras of the sessions in `watch`, the same ones the synthetic
+/// students watch, so that the SFU carries the same load for it.
 pub async fn serve(
     rtcd: Arc<Rtcd>,
     call: String,
     probe: Probe,
+    watch: Vec<String>,
     bind: &str,
     port: u16,
 ) -> std::io::Result<()> {
@@ -41,14 +43,26 @@ pub async fn serve(
     });
     tokio::spawn(async move {
         while let Ok((stream, _)) = relay.accept().await {
-            tokio::spawn(session(rtcd.clone(), call.clone(), probe.clone(), stream));
+            tokio::spawn(session(
+                rtcd.clone(),
+                call.clone(),
+                probe.clone(),
+                watch.clone(),
+                stream,
+            ));
         }
     });
     Ok(())
 }
 
 /// One page: joins the call for it and carries messages both ways until either side is gone.
-async fn session(rtcd: Arc<Rtcd>, call: String, probe: Probe, stream: TcpStream) {
+async fn session(
+    rtcd: Arc<Rtcd>,
+    call: String,
+    probe: Probe,
+    watch: Vec<String>,
+    stream: TcpStream,
+) {
     let Ok(socket) = tokio_tungstenite::accept_async(stream).await else {
         return;
     };
@@ -70,7 +84,7 @@ async fn session(rtcd: Arc<Rtcd>, call: String, probe: Probe, stream: TcpStream)
                         &sid,
                         &call,
                         MessageType::VideoSubscribe,
-                        json!({ "session_ids": v["data"] }).to_string().into_bytes(),
+                        json!({ "session_ids": watch }).to_string().into_bytes(),
                     )),
                     Some("recv") => {
                         if let Some(id) = v["id"].as_str() {

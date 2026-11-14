@@ -250,9 +250,12 @@ impl App {
                 let shutdown = async move {
                     let _ = stop_rx.changed().await;
                 };
-                if let Err(err) = axum::serve(listener, router)
-                    .with_graceful_shutdown(shutdown)
-                    .await
+                if let Err(err) = axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(shutdown)
+                .await
                 {
                     warn!(%err, "api server ended with an error");
                 }

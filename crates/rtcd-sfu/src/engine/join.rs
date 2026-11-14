@@ -10,7 +10,10 @@ use rtc::sansio::Protocol;
 use rtcd_proto::SessionConfig;
 use tracing::{debug, error, info, warn};
 
-use super::session::{DownPhase, Downlink, Lifecycle, Session, SessionKey, SourceKey, Uplink};
+use super::route::AddrBudget;
+use super::session::{
+    DownPhase, Downlink, Lifecycle, OfferTurn, Session, SessionKey, SourceKey, Uplink,
+};
 use super::signaling::{Phase, SignalingLock};
 use super::types::{CloseReason, Event};
 use super::{Call, CallId, Engine};
@@ -82,6 +85,9 @@ impl Engine {
             },
             lock: SignalingLock::new(self.cfg.lock_max_hold),
             wants_offer_since: None,
+            new_addrs: AddrBudget::new(now),
+            offer_turn: OfferTurn::Free,
+            last_unreadable_warn: None,
             offer_failures: 0,
             dc: None,
             dc_queue: VecDeque::new(),
@@ -171,6 +177,9 @@ impl Engine {
         self.routes.remove_session(&s.ufrags, &s.addrs);
         if let Some(t) = s.timer.take() {
             self.timers.remove(&t);
+        }
+        if s.offer_turn == OfferTurn::Queued {
+            self.negotiations.retain(|&k| k != key);
         }
         self.metrics.session_ended(&s.cfg.group_id);
         self.metrics.connection_state("closed");
