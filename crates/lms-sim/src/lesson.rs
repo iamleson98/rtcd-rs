@@ -175,6 +175,10 @@ pub async fn run(args: impl Iterator<Item = String>, assets: PathBuf) {
             rtcd.clone(),
             a.call.clone(),
             chrome_probe,
+            std::iter::once("teacher".to_owned())
+                .chain((0..a.cameras).map(|i| format!("s{i:02}")))
+                .map(|n| format!("session-{n}"))
+                .collect(),
             &a.chrome_bind,
             port,
         )
