@@ -143,12 +143,12 @@ class Pairs(unittest.TestCase):
                          {"subject": "rtcd-rs/chrome", "baseline": "rtcd-go/chrome", "clean_zero": ["stalls"]}],
              "ratio": 1.25}
 
-    def test_rs_is_gated_against_go_and_the_budget_soak_is_report_only(self):
+    def test_the_shipped_budget_leg_is_gated_and_rs_is_report_only(self):
         got = pairs.build(self.rules, ["rs", "rs-budget", "go"])["compare"]
         self.assertEqual([(p["subject"], p["baseline"], p.get("gate", True)) for p in got], [
-            ("rtcd-rs", "rtcd-go", True), ("rtcd-rs/chrome", "rtcd-go/chrome", True),
-            ("rtcd-rs-budget", "rtcd-go", False), ("rtcd-rs-budget/chrome", "rtcd-go/chrome", False),
-            ("rtcd-rs-budget", "rtcd-rs", False), ("rtcd-rs-budget/chrome", "rtcd-rs/chrome", False)])
+            ("rtcd-rs-budget", "rtcd-go", True), ("rtcd-rs-budget/chrome", "rtcd-go/chrome", True),
+            ("rtcd-rs", "rtcd-go", False), ("rtcd-rs", "rtcd-rs-budget", False),
+            ("rtcd-rs/chrome", "rtcd-go/chrome", False), ("rtcd-rs/chrome", "rtcd-rs-budget/chrome", False)])
         self.assertEqual(got[5]["clean_zero"], ["stalls"])
 
     def test_without_the_budget_soak_rs_is_held_against_go(self):
