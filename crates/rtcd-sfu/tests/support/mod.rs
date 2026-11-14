@@ -209,6 +209,9 @@ pub struct World {
     rng: u64,
     /// Bytes added to the payload of every video packet, so that frames have the size of real ones.
     pub payload_pad: usize,
+    /// Bytes added to the payload of every frame that carries temporal layers (`send_camera_frame`
+    /// and the screen's), a thousand unless set.
+    pub frame_pad: usize,
     /// Time spent inside the engine (datagrams in, timeouts), for the cost tests.
     pub engine_spent: Duration,
     /// Called just before the world calls into the engine, with `"datagram"` or `"timeout"` and
@@ -299,6 +302,7 @@ impl World {
             to_engine: Vec::new(),
             rng: 0x9e37_79b9_7f4a_7c15,
             payload_pad: 0,
+            frame_pad: 1000,
             engine_spent: Duration::ZERO,
             around_engine: |_, _| {},
             nack_retry: None,
@@ -1335,6 +1339,7 @@ impl World {
     ) {
         let now = self.now;
         let sent = (now - self.epoch).as_micros() as u64;
+        let pad = self.frame_pad;
         let b = &mut self.browsers[i];
         let v = if screen {
             b.screen.as_mut().expect("a screen share")
@@ -1399,7 +1404,7 @@ impl World {
             if first {
                 payload.push(if key { 0x00 } else { 0x01 });
             }
-            payload.resize(payload.len() + 1000, 0xcc);
+            payload.resize(payload.len() + pad, 0xcc);
             payload.extend_from_slice(&sent.to_le_bytes());
             payload.extend_from_slice(&[layer as u8 + 1, 0xaa, 0xbb, 0xcc]);
             let mut header = rtc::rtp::header::Header {

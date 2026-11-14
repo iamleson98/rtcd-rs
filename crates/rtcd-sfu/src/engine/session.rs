@@ -179,6 +179,9 @@ pub(crate) struct DownStream {
     /// A camera the receiver's path cannot carry along with the others: it waits, for the one
     /// keyframe that starts it again, on `target` (see `Engine::review_cameras`).
     pub paused: bool,
+    /// Since when the camera has been paused: one paused too long is tried again at its lowest
+    /// step (see `camera_budget::MAX_PAUSE`).
+    pub paused_at: Option<Instant>,
     /// The camera is being paused: it leaves the stream at the end of the frame it is in, so no
     /// receiver is sent half a frame.
     pub pausing: bool,

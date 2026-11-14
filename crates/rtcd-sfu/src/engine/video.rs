@@ -551,6 +551,10 @@ impl Engine {
             return;
         };
         let e = s.estimate.snapshot();
+        // A path that is down, or has just come back, is not read.
+        if camera_budget::path_unreadable(now, e.fed_at, e.resumed_at) {
+            return;
+        }
         let path = ScreenInputs {
             queue: e.queue,
             queue_trend: e.queue_trend,
@@ -603,7 +607,10 @@ impl Engine {
             cameras.push(Camera::new(
                 rank,
                 steps,
-                d.paused || d.pausing,
+                (d.paused || d.pausing).then(|| {
+                    d.paused_at
+                        .map_or(Duration::ZERO, |t| now.saturating_duration_since(t))
+                }),
                 Rung {
                     layer,
                     tid: d.temporal.limit(),
@@ -626,7 +633,8 @@ impl Engine {
             .review(now, &path, camera_budget::Load::of(&cameras));
         let raise = s.down.cameras.raise_ceiling(now);
         let limit = s.down.cameras.limit();
-        camera_budget::allocate(limit, raise, &mut cameras);
+        let trial = s.down.cameras.pause_trial(now);
+        camera_budget::allocate(limit, raise, trial, &mut cameras);
         let (mut raised, mut changed) = (false, false);
         let (mut paused, mut thinned) = (0, 0);
         for ((id, camera), was) in streams.into_iter().zip(&cameras).zip(before) {
@@ -737,6 +745,7 @@ impl Engine {
         ds.target = Some(held);
         ds.paused = true;
         let sender_id = ds.publisher_session_id.clone();
+        ds.paused_at = Some(now);
         if let Some(fan) = feeding.and_then(|src| {
             self.fanout.get_mut(&SourceKey {
                 session: publisher,
@@ -772,6 +781,7 @@ impl Engine {
             return;
         };
         ds.paused = false;
+        ds.paused_at = None;
         let publisher = ds.publisher;
         let sender_id = ds.publisher_session_id.clone();
         self.dc_send(

@@ -565,6 +565,7 @@ impl Engine {
             rewrite: Rewriter::new(ssrc, 0, is_vp8),
             temporal: Default::default(),
             paused: false,
+            paused_at: None,
             pausing: false,
             budget_small: false,
         };
