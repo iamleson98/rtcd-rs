@@ -103,7 +103,10 @@ impl Engine {
         let group = self.group_id(key);
         match msg {
             DcMessage::Ping => self.dc_send(key, DcMessage::Pong, now),
-            DcMessage::Pong | DcMessage::MediaMap(_) | DcMessage::Lock(Some(_)) => {}
+            DcMessage::Pong
+            | DcMessage::MediaMap(_)
+            | DcMessage::CameraPaused { .. }
+            | DcMessage::Lock(Some(_)) => {}
             DcMessage::Sdp(json) => self.remote_description(key, &json, Channel::Dc, now),
             DcMessage::SharpScreen(on) => {
                 if let Some(s) = self.sessions.get_mut(key) {
