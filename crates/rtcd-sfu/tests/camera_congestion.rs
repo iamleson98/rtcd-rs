@@ -36,7 +36,7 @@ const LARGE_KEYFRAME_PACKETS: usize = 3 * KEYFRAME_PACKETS;
 const LINK: u64 = 2_500_000;
 /// The gap before a packet that begins a burst in the estimator (`bwe::BURST_GAP`).
 const BURST_GAP: Duration = Duration::from_millis(5);
-/// The longest wait after a step that failed (`layers::MAX_BACKOFF`), and how long a step is on
+/// The longest wait after a step that failed (`camera_budget::MAX_BACKOFF`), and how long a step is on
 /// trial (`layers::TRIAL`).
 const LONGEST_WAIT: Duration = Duration::from_secs(20);
 const TRIAL: Duration = Duration::from_secs(3);
