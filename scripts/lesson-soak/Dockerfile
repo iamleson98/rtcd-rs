@@ -22,7 +22,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates iproute2 kmod procps curl python3 \
+    && apt-get install -y --no-install-recommends ca-certificates ethtool iproute2 kmod procps curl python3 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/lms-sim /usr/local/bin/
 COPY --from=builder /assets /assets
