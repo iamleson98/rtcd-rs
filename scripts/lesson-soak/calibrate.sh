@@ -54,7 +54,7 @@ trap cleanup EXIT
 cleanup
 
 prepare
-start_sfu
+start_sfu ${SFU_EXTRA_ENV[@]+"${SFU_EXTRA_ENV[@]}"}
 start_sampler $((ramp_secs + 600))
 EXTRA="--teacher --first 0 --students 2"
 lesson soak-clean "$CLEAN_IP" clean

@@ -8,7 +8,7 @@
 # datacenter link, is not shaped. Everything is written as
 # soak JSONL and merged into OUTDIR/rtcd-<impl>-<arch>.jsonl for vendor/rtc/benchmarks/soak/report.py.
 #
-#   scripts/lesson-soak/run.sh <rs|go> <minutes> <cycle_minutes> <outdir>
+#   scripts/lesson-soak/run.sh <rs|rs-budget|go> <minutes> <cycle_minutes> <outdir>
 #
 # PROFILE=abuse (default lesson) runs the same lesson at the limit of the SFU: a background load of
 # LOAD_CLASSES classes, hostile clients, churn, junk and signaling abuse from `lms-sim abuse`, and
@@ -21,16 +21,18 @@
 # STUDENTS_IMPAIRED (8), MEASURE (6 receivers per group measured), TALK_SECS (30), BW_DOWN_MBIT (2.5)
 # and BW_UP_MBIT (1) for the bw phase's cap of each impaired participant, and, for the abuse profile,
 # ABUSE_INTENSITY (1..5) and ABUSE_ONLY (a comma separated list of attack classes).
+# rs-budget is rtcd-rs with the camera budget on, rs with it off (both set explicitly), the same
+# image; both are labelled rtcd-rs-budget and rtcd-rs in the output.
 # Needs Docker (Colima is fine), python3 and, for the Go baseline, network access to Docker Hub.
 set -euo pipefail
 
 if [ "$#" -ne 4 ]; then
-  echo "usage: $0 <rs|go> <minutes> <cycle_minutes> <outdir>" >&2
+  echo "usage: $0 <rs|rs-budget|go> <minutes> <cycle_minutes> <outdir>" >&2
   exit 2
 fi
 IMPL=$1 MINUTES=$2 CYCLE=$3 OUT=$4
-case "$IMPL" in rs | go) ;; *)
-  echo "the SFU is rs or go" >&2
+case "$IMPL" in rs | rs-budget | go) ;; *)
+  echo "the SFU is rs, rs-budget or go" >&2
   exit 2
   ;;
 esac
@@ -78,7 +80,7 @@ prepare chrome
 } >"$OUT/seed.txt"
 echo "profile $PROFILE, seed $SEED (replay: SEED=$SEED PROFILE=$PROFILE $0 $IMPL $MINUTES $CYCLE <outdir>)"
 
-start_sfu
+start_sfu ${SFU_EXTRA_ENV[@]+"${SFU_EXTRA_ENV[@]}"}
 start_sampler $((MINUTES * 60 + 900))
 
 chrome() { # name client group: in the namespace of the client, for the clean group

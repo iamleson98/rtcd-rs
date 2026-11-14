@@ -42,10 +42,10 @@ pub const NOMINAL_LOW_RATE: u64 = 500_000;
 /// browser's encoder gives the base layer two fifths of the bits and the second layer one fifth.
 const NOMINAL_TEMPORAL_SHARE: [f64; 2] = [0.4, 0.6];
 /// A keyframe not measured yet is taken to be this many seconds of its layer (six frames).
-const NOMINAL_KEYFRAME_SECONDS: f64 = 0.4;
+pub(crate) const NOMINAL_KEYFRAME_SECONDS: f64 = 0.4;
 /// Moving onto the other layer is tried only where its keyframe would drain within this long,
 /// with what the path carries beyond the new rung.
-const KEYFRAME_DRAIN: f64 = 2.5;
+pub(crate) const KEYFRAME_DRAIN: f64 = 2.5;
 
 /// A path holding this many seconds of what is sent to it for [`QUEUE_PERSISTS`], while the queue
 /// is not shrinking, carries less than it is given (the queue a keyframe leaves shrinks once the
@@ -79,7 +79,7 @@ pub(crate) const CONGESTED_DELIVERY: f64 = 0.85;
 pub(crate) const LOSS_ROOM: f64 = 1.5;
 /// The next rung is tried only while this much of what is sent arrives: a path that loses more
 /// than a tenth at random is not given more to lose.
-const RAISE_DELIVERY: f64 = 0.9;
+pub(crate) const RAISE_DELIVERY: f64 = 0.9;
 /// After congestion the screen is given this share of what the path delivered, or less while it
 /// has a queue to drain, so the queue is gone within [`DRAIN_SECONDS`] instead of holding the
 /// voice back...
@@ -98,9 +98,9 @@ pub(crate) const GROWTH_CEILING: f64 = 2.0;
 /// narrowest link of the path carries (when that is known). A rung that brought congestion is not
 /// tried again for a wait that doubles each time, and is forgotten once held without trouble.
 pub(crate) const CAPACITY_SHARE: f64 = 0.85;
-pub(crate) const INITIAL_BACKOFF: Duration = Duration::from_secs(10);
-pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(120);
-pub(crate) const FORGET_AFTER: Duration = Duration::from_secs(30);
+pub(crate) const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
+pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(20);
+pub(crate) const FORGET_AFTER: Duration = Duration::from_secs(12);
 
 /// One step of what a receiver can be sent of a screen share: a simulcast layer, and the highest
 /// of its temporal layers sent (`None`: every frame of the layer).
@@ -165,6 +165,11 @@ impl Steps {
     /// How many steps there are (at least one).
     pub fn count(&self) -> usize {
         self.len
+    }
+
+    /// Bits per second of the whole layer, the last step.
+    pub fn whole(&self) -> f64 {
+        self.steps[self.len - 1].1
     }
 }
 
@@ -281,7 +286,19 @@ impl ScreenInputs {
     }
 
     pub(crate) fn clear(&self) -> bool {
+        self.empty() && self.delivery.is_none_or(|d| d >= RAISE_DELIVERY)
+    }
+
+    /// Whether nothing stands queued on the path.
+    pub(crate) fn empty(&self) -> bool {
         self.queue.is_some_and(|q| q < QUEUE_LOW)
+    }
+
+    /// Whether the path is emptying its queue while it delivers what it is sent: a link that
+    /// flaps between wide and narrow never holds [`QUEUE_LOW`] for [`CLEAR_FOR`], but each wide
+    /// half is time the path carries more than it is given.
+    pub(crate) fn draining(&self) -> bool {
+        self.queue_trend.is_some_and(|t| t <= QUEUE_SHRINKING)
             && self.delivery.is_none_or(|d| d >= RAISE_DELIVERY)
     }
 }

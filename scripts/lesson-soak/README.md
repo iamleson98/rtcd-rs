@@ -13,6 +13,7 @@ One class in one call, run by two `lms-sim lesson` processes (`crates/lms-sim/sr
 | | |
 |---|---|
 | teacher (clean network) | microphone, camera, screen share in two simulcast layers |
+| cameras | as lms-web sends them (`cameraEncodings`): rid `l` 320x180, 15 fps, 150 kbit/s and rid `h` 640x360 (the teacher's 24 fps, 600 kbit/s, a student's 20 fps, 400 kbit/s), VP8 with three temporal layers (frames in layers 0, 2, 1, 2), a keyframe at the start and on each PLI or FIR for either layer. `--camera-layers single` (`lesson` and `abuse`) sends the one 640x360, 30 fps stream of before, to reproduce those runs |
 | 25 students | 17 on the clean network, 8 on the impaired one; students 0 to 3 send a camera; one student's microphone is open at a time, 30 s each, round the class by the clock |
 | watching | every student receives the teacher's voice, camera and screen and the four student cameras |
 | Chromium, one per network | headless Chromium (Playwright 1.65.0) loads a page that joins as one more student, answers the SFU's offers over the `calls-dc` data channel like lms-web, watches the teacher's camera and screen and reports `getStats` |
@@ -104,9 +105,12 @@ protocol and takes the same `RTCD_*` variables, so it runs as published: nothing
 ```bash
 colima start --cpu 6 --memory 10      # the SFU gets 2 CPUs, the clients and the browsers the rest
 scripts/lesson-soak/run.sh rs 4 2 /tmp/soak     # 4 minutes, a 2-minute cycle, rtcd-rs
+scripts/lesson-soak/run.sh rs-budget 4 2 /tmp/soak   # rtcd-rs with the camera budget on (rs: off)
 scripts/lesson-soak/run.sh go 4 2 /tmp/soak     # the same against the Go service
-python3 vendor/rtc/benchmarks/soak/report.py --rules scripts/lesson-soak/rules.json --out /tmp/soak/report \
-    /tmp/soak/rtcd-rs-*.jsonl /tmp/soak/rtcd-go-*.jsonl
+# the pairs for the services that ran (rs-budget against go gates; against rs it is report only)
+python3 scripts/lesson-soak/pairs.py scripts/lesson-soak/rules.json /tmp/soak/pairs.json rs rs-budget go
+python3 vendor/rtc/benchmarks/soak/report.py --rules /tmp/soak/pairs.json --out /tmp/soak/report \
+    /tmp/soak/rtcd-rs-*.jsonl /tmp/soak/rtcd-rs-budget-*.jsonl /tmp/soak/rtcd-go-*.jsonl
 ```
 
 The first run builds three images (`rtcd-rs:soak`, `rtcd-lesson:soak`, `rtcd-lesson-chrome:soak`; a few
@@ -119,12 +123,16 @@ On a Mac the architecture is aarch64; x64 is exercised by CI.
 ## In CI
 
 `.github/workflows/lesson-soak.yml` runs, on x64 (`ubuntu-latest`) and arm64 (`ubuntu-24.04-arm`), the
-`lesson` profile and the `abuse` profile (below) for `rs` and `go` in parallel: weekly on Saturday, by
-hand (`minutes`, default 120) and on pull requests that touch `crates/lms-sim`, this directory or the
-workflow (10 minutes, 5-minute cycle, a short calibration ramp). One `report` job per architecture and
-profile runs `report.py` over the files of both services (`rules.json` for `lesson`, `rules-abuse.json`
-for `abuse`), writes `summary.md` to the run's summary and uploads `report.html` and the JSONL; it fails
-when rtcd-rs broke a rule, when a soak job failed (an SFU crash fails `run.sh`) or when a soak left no
+`lesson` profile and the `abuse` profile (below) for `rs`, `rs-budget` and `go` in parallel: weekly on
+Saturday, by hand (`minutes`, default 120; `budget`: `both`, the default, `on` for rs-budget and go, `off` for
+rs and go) and on pull requests that touch `crates/lms-sim`, this directory or the
+workflow (10 minutes, 5-minute cycle, a short calibration ramp). `rs` and `rs-budget` are the same image with `RTCD_RTC_CAMERABUDGET` set to `false` and `true` (always set, so
+a change of the service's default moves neither), labelled `rtcd-rs` and `rtcd-rs-budget`; every leg uses one `SEED`
+(the run id). One `report` job per architecture and
+profile runs `report.py` over the files of the services that ran (`rules.json` for `lesson`, `rules-abuse.json`
+for `abuse`, turned into pairs by `pairs.py`: rtcd-rs-budget against Go is gated, as rtcd-rs was, and rtcd-rs-budget
+against rtcd-rs is in the report only; with `budget: off` rtcd-rs is held against Go), writes `summary.md` to the run's summary and uploads `report.html` and the JSONL; it fails
+when rtcd-rs-budget (rtcd-rs when the budget legs are off) broke a rule, when a soak job failed (an SFU crash fails `run.sh`) or when a soak left no
 measurements. Both services run on the same runner type for each architecture. Artifacts are named
 `lesson-soak-<profile>-<impl>-<arch>`.
 
