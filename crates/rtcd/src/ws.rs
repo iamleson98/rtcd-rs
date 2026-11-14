@@ -1,10 +1,11 @@
 //! The websocket endpoint clients keep open to the service.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
@@ -33,10 +34,11 @@ pub fn new_conn_id() -> String {
 
 pub async fn upgrade(
     State(svc): State<Arc<Service>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let client_id = match authenticate(&svc, &headers).await {
+    let client_id = match authenticate(&svc, &headers, peer.ip()).await {
         Ok(Caller::Client(id)) => id,
         Ok(Caller::Admin) => return (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response(),
         Err((code, msg)) => {

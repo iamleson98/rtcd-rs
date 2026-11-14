@@ -1,11 +1,12 @@
 //! The HTTP API: the endpoints of the Go service, with the same paths, authentication, status
 //! codes and bodies.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
@@ -33,8 +34,13 @@ pub enum Caller {
 pub type Denied = (StatusCode, String);
 
 /// Identifies the caller from its `Authorization` header: basic with a client id and key (or the
-/// admin key, when enabled), or bearer with a token from `/login`.
-pub async fn authenticate(svc: &Service, headers: &HeaderMap) -> Result<Caller, Denied> {
+/// admin key, when enabled), or bearer with a token from `/login`. `from` is the address the
+/// request came from, which wrong keys are counted against.
+pub async fn authenticate(
+    svc: &Service,
+    headers: &HeaderMap,
+    from: IpAddr,
+) -> Result<Caller, Denied> {
     let unauthorized = |m: &str| (StatusCode::UNAUTHORIZED, m.to_owned());
     let header = headers
         .get(header::AUTHORIZATION)
@@ -68,7 +74,7 @@ pub async fn authenticate(svc: &Service, headers: &HeaderMap) -> Result<Caller, 
     if id.is_empty() {
         return Err(unauthorized("authentication failed: unauthorized"));
     }
-    svc.auth.authenticate(&id, &key).await.map_err(|e| {
+    svc.auth.authenticate(&id, &key, from).await.map_err(|e| {
         error!(client = %id, %e, "authentication failed");
         unauthorized("authentication failed")
     })?;
@@ -143,6 +149,7 @@ fn json_response(v: &impl serde::Serialize) -> Response {
 
 async fn login(
     State(svc): State<Arc<Service>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     method: axum::http::Method,
     body: Bytes,
 ) -> Response {
@@ -157,7 +164,7 @@ async fn login(
         req.get("clientID").map_or("", String::as_str),
         req.get("authKey").map_or("", String::as_str),
     );
-    match svc.auth.login(id, key).await {
+    match svc.auth.login(id, key, peer.ip()).await {
         Ok(token) => {
             debug!(client = id, "logged in");
             let mut f = serde_json::Map::new();
@@ -170,6 +177,7 @@ async fn login(
 
 async fn register(
     State(svc): State<Arc<Service>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     method: axum::http::Method,
     headers: HeaderMap,
     body: Bytes,
@@ -178,7 +186,7 @@ async fn register(
         return not_found();
     }
     if !svc.cfg.api.security.allow_self_registration
-        && let Err((code, msg)) = authenticate(&svc, &headers).await
+        && let Err((code, msg)) = authenticate(&svc, &headers, peer.ip()).await
     {
         return failure(code, msg);
     }
@@ -203,6 +211,7 @@ async fn register(
 
 async fn unregister(
     State(svc): State<Arc<Service>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     method: axum::http::Method,
     headers: HeaderMap,
     body: Bytes,
@@ -217,7 +226,7 @@ async fn unregister(
         );
         return failure(StatusCode::FORBIDDEN, "unregister not enabled");
     }
-    let caller = match authenticate(&svc, &headers).await {
+    let caller = match authenticate(&svc, &headers, peer.ip()).await {
         Ok(c) => c,
         Err((code, msg)) => return failure(code, msg),
     };
@@ -245,8 +254,12 @@ async fn unregister(
 }
 
 /// Authenticates a lookup, which needs a client (the administrator has no calls).
-async fn lookup_client(svc: &Service, headers: &HeaderMap) -> Result<String, Box<Response>> {
-    match authenticate(svc, headers).await {
+async fn lookup_client(
+    svc: &Service,
+    headers: &HeaderMap,
+    from: IpAddr,
+) -> Result<String, Box<Response>> {
+    match authenticate(svc, headers, from).await {
         Ok(Caller::Client(id)) => Ok(id),
         Ok(Caller::Admin) => Err(Box::new(
             (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response(),
@@ -262,6 +275,7 @@ async fn lookup_client(svc: &Service, headers: &HeaderMap) -> Result<String, Box
 
 async fn sessions(
     State(svc): State<Arc<Service>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     method: axum::http::Method,
     headers: HeaderMap,
     Path(call_id): Path<String>,
@@ -269,7 +283,7 @@ async fn sessions(
     if method != axum::http::Method::GET {
         return not_found();
     }
-    let client = match lookup_client(&svc, &headers).await {
+    let client = match lookup_client(&svc, &headers, peer.ip()).await {
         Ok(c) => c,
         Err(r) => return *r,
     };
@@ -286,6 +300,7 @@ async fn sessions(
 
 async fn session(
     State(svc): State<Arc<Service>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     method: axum::http::Method,
     headers: HeaderMap,
     Path((call_id, session_id)): Path<(String, String)>,
@@ -293,7 +308,7 @@ async fn session(
     if method != axum::http::Method::GET {
         return not_found();
     }
-    let client = match lookup_client(&svc, &headers).await {
+    let client = match lookup_client(&svc, &headers, peer.ip()).await {
         Ok(c) => c,
         Err(r) => return *r,
     };
