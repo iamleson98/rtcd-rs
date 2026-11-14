@@ -78,7 +78,8 @@ pub struct EngineConfig {
     /// loudest (see `loudest`). 0 forwards every voice, as the Go rtcd does.
     pub audio_loudest: usize,
     /// Whether a receiver is held to what its path carries of the cameras it is sent (see
-    /// `camera_budget`). Off sends every camera whole.
+    /// `camera_budget`). Off (the default) sends every camera whole: on single-layer cameras the
+    /// budget can only pause, which the lesson soak showed costs more than the drops it saves.
     pub camera_budget: bool,
     /// The packet time, in milliseconds, browsers are asked to send their voice with (`a=ptime` in
     /// the descriptions they are given). A longer one makes fewer, larger packets: 40 ms halves the
@@ -117,7 +118,7 @@ impl Default for EngineConfig {
             ice_lite: true,
             pacing: false,
             audio_loudest: 0,
-            camera_budget: true,
+            camera_budget: false,
             audio_ptime_ms: 0,
             egress_budget_bps: 0,
             egress_budget_pps: 0,

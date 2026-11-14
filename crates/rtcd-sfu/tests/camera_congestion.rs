@@ -60,6 +60,14 @@ struct Window {
     incomplete_frames: usize,
 }
 
+/// The engine with the camera budget on (it is off by default).
+fn budget_on() -> EngineConfig {
+    EngineConfig {
+        camera_budget: true,
+        ..engine_config()
+    }
+}
+
 impl Class {
     fn new(path: Path) -> Class {
         Class::build(path, true)
@@ -68,7 +76,7 @@ impl Class {
     /// The viewer comes in `first`, or after the cameras, which then are all asked for a
     /// keyframe at once.
     fn build(path: Path, first: bool) -> Class {
-        Class::in_world(World::new(), path, first)
+        Class::in_world(World::with_config(budget_on()), path, first)
     }
 
     fn in_world(mut w: World, path: Path, first: bool) -> Class {
@@ -476,7 +484,7 @@ fn a_paused_camera_whose_sender_leaves_or_who_is_unsubscribed_is_let_go() {
 fn a_screen_share_keeps_its_large_layer_when_it_and_the_hosts_camera_fit_the_link() {
     // The teacher shares her screen (a large layer of 2.5 Mb/s) and has a camera, as do seven
     // students; the link carries the screen and the teacher's camera and two more.
-    let mut w = World::new();
+    let mut w = World::with_config(budget_on());
     let viewer = w.join("viewer", "call1");
     let teacher = w.join_host_with_camera("teacher", "call1");
     let mut senders = vec![teacher];

@@ -381,7 +381,7 @@ impl Default for RtcConfig {
             nack_disable_copy: true,
             shards: 0,
             audio_loudest: 3,
-            camera_budget: true,
+            camera_budget: false,
             audio_ptime_ms: 0,
             egress_budget_mbps: 0,
             egress_budget_pps: 0,
@@ -917,8 +917,8 @@ mod tests {
             "the three loudest voices of a call are forwarded unless asked otherwise"
         );
         assert!(
-            c.rtc.camera_budget,
-            "cameras are held to what a receiver's path carries unless asked otherwise"
+            !c.rtc.camera_budget,
+            "cameras are sent whole unless the camera budget is asked for"
         );
         assert!(
             c.rtc.refuse_when_saturated,
@@ -1043,7 +1043,7 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
             ("RTCD_API_SECURITY_ALLOWSELFREGISTRATION", "true"),
             ("RTCD_RTC_ICEPORTUDP", "30000"),
             ("RTCD_RTC_AUDIOLOUDEST", "5"),
-            ("RTCD_RTC_CAMERABUDGET", "false"),
+            ("RTCD_RTC_CAMERABUDGET", "true"),
             ("RTCD_RTC_AUDIOPTIMEMS", "40"),
             ("RTCD_RTC_EGRESSBUDGETMBPS", "250"),
             ("RTCD_RTC_EGRESSBUDGETPPS", "120000"),
@@ -1070,7 +1070,7 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
         assert!(c.api.security.allow_self_registration);
         assert_eq!(c.rtc.ice_port_udp, 30000);
         assert_eq!(c.rtc.audio_loudest, 5);
-        assert!(!c.rtc.camera_budget);
+        assert!(c.rtc.camera_budget);
         assert_eq!(c.rtc.audio_ptime_ms, 40);
         assert_eq!(c.rtc.egress_budget_mbps, 250);
         assert_eq!(c.rtc.egress_budget_pps, 120_000);
