@@ -149,9 +149,18 @@ async function poll() {
 			rtt = r.currentRoundTripTime * 1000;
 		}
 	});
+	// Whose stream each mid carries now, from the SFU's last description. Chrome names a
+	// receiver's track once, when its transceiver is made: a transceiver the SFU reuses for another
+	// sender (one whose own stream was removed) keeps reporting the first sender's track name.
+	const owner = new Map();
+	for (const section of (pc.remoteDescription?.sdp ?? '').split(/\r?\nm=/).slice(1)) {
+		const mid = /\na=mid:(\S+)/.exec(section)?.[1];
+		const track = /\na=msid:\S+ (\S+)/.exec(section)?.[1];
+		if (mid && track) owner.set(mid, track);
+	}
 	report.forEach((r) => {
 		if (r.type !== 'inbound-rtp') return;
-		const [kind, session] = String(r.trackIdentifier || '').split('_');
+		const [kind, session] = String(owner.get(r.mid) ?? r.trackIdentifier ?? '').split('_');
 		if (!['video', 'screen', 'voice'].includes(kind) || !session) return;
 		if (kind === 'voice' && session !== teacher) return;
 		const key = `${kind}:${session.replace(/^session-/, '')}`;

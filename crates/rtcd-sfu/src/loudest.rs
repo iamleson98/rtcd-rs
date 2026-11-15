@@ -39,6 +39,9 @@ struct Entry {
     score: f32,
     at: Instant,
     forwarded: bool,
+    /// Since when it has been forwarded without a break: of sources equally loud, the one
+    /// forwarded longest keeps its slot (the speaker, not a voice that came back a moment ago).
+    since: Instant,
 }
 
 /// Decides, packet by packet, whether a voice of one call is forwarded.
@@ -75,6 +78,7 @@ impl<K: Copy + Eq + Hash> Selector<K> {
             score: loudness,
             at: now,
             forwarded: free_slot,
+            since: now,
         });
         let elapsed = now.saturating_duration_since(entry.at).as_secs_f32();
         let tau = if loudness > entry.score {
@@ -105,7 +109,8 @@ impl<K: Copy + Eq + Hash> Selector<K> {
         self.ranked_at = None;
         if limit == 0 {
             for e in self.entries.values_mut() {
-                e.forwarded = true;
+                let at = e.at;
+                e.forward(true, at);
             }
             self.cutoff = f32::NEG_INFINITY;
         }
@@ -130,27 +135,45 @@ impl<K: Copy + Eq + Hash> Selector<K> {
         self.ranked_at = Some(now);
         self.entries
             .retain(|_, e| now.saturating_duration_since(e.at) < FORGET_AFTER);
-        let mut active: Vec<(K, f32)> = self
+        let active = |e: &Entry| now.saturating_duration_since(e.at) < ACTIVE_FOR;
+        let mut ranked: Vec<(K, f32, Instant)> = self
             .entries
             .iter()
-            .filter(|(_, e)| now.saturating_duration_since(e.at) < ACTIVE_FOR)
-            .map(|(&k, e)| (k, e.score + if e.forwarded { HYSTERESIS } else { 0.0 }))
+            .filter(|(_, e)| active(e))
+            .map(|(&k, e)| {
+                let bonus = if e.forwarded { HYSTERESIS } else { 0.0 };
+                (k, e.score + bonus, if e.forwarded { e.since } else { now })
+            })
             .collect();
-        if active.len() <= self.limit {
-            // Nobody is left out: everything is forwarded, including a source that was silent and
-            // starts again, so no first syllable is lost to a ranking not yet made.
+        if ranked.len() <= self.limit {
+            // Nobody is left out: every source sending is forwarded. One silent for a moment is
+            // not: kept forwarded, it would come back with the slot's bonus and, with others back
+            // too, could push out a speaker who never stopped. It is ranked again on its first
+            // packet (`hear`), against no cutoff, so no first syllable is lost.
             for e in self.entries.values_mut() {
-                e.forwarded = true;
+                let on = active(e);
+                e.forward(on, now);
             }
             self.cutoff = f32::NEG_INFINITY;
             return;
         }
-        active.sort_by(|a, b| b.1.total_cmp(&a.1));
-        self.cutoff = active[self.limit - 1].1;
-        let kept: Vec<K> = active[..self.limit].iter().map(|&(k, _)| k).collect();
+        // The loudest first; of equals, the one forwarded longest.
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.2.cmp(&b.2)));
+        self.cutoff = ranked[self.limit - 1].1;
+        let kept: Vec<K> = ranked[..self.limit].iter().map(|&(k, ..)| k).collect();
         for (k, e) in self.entries.iter_mut() {
-            e.forwarded = kept.contains(k);
+            e.forward(kept.contains(k), now);
         }
+    }
+}
+
+impl Entry {
+    /// Sets whether the source is forwarded, starting its run at `now` when it was not.
+    fn forward(&mut self, on: bool, now: Instant) {
+        if on && !self.forwarded {
+            self.since = now;
+        }
+        self.forwarded = on;
     }
 }
 
@@ -317,5 +340,56 @@ mod tests {
             sel.hear(4, 80, now + Duration::from_millis(20)),
             "no limit forwards everything"
         );
+    }
+
+    /// Abuse soak 43603411841: students whose microphones sent a packet every second or two at
+    /// the teacher's level made the call's active sources swing around the limit. Each time they
+    /// fell within it, every source was marked forwarded, silent ones included; back a moment
+    /// later, they tied with the teacher, and the map's order cut the teacher for minutes. Many
+    /// selectors, since each map orders its keys its own way.
+    #[test]
+    fn a_speaker_keeps_its_slot_when_silent_sources_come_back() {
+        for _ in 0..50 {
+            let mut sel = Selector::new(3);
+            let teacher = 0u32;
+            let mut now = Instant::now();
+            // The teacher speaks throughout; four students send a packet now and then.
+            for i in 0..400u32 {
+                now += STEP;
+                assert!(
+                    sel.hear(teacher, 25, now) || i < 2,
+                    "the teacher was cut at packet {i}"
+                );
+                // Each student every 1.6 to 2.2 s, out of step with the others.
+                for k in 1..=4u32 {
+                    if i % (80 + 10 * k) == 10 * k {
+                        sel.hear(k, 25, now);
+                    }
+                }
+            }
+            let forwarded = sel.entries.values().filter(|e| e.forwarded).count();
+            assert!(forwarded <= 3, "{forwarded} sources hold a slot");
+        }
+    }
+
+    #[test]
+    fn of_equal_voices_the_one_forwarded_longest_keeps_the_slot_when_the_limit_drops() {
+        for _ in 0..50 {
+            let mut sel = Selector::new(3);
+            let t = Instant::now();
+            for step in 0..50 {
+                let now = t + STEP * step;
+                sel.hear(1u32, 25, now);
+                if step >= 25 {
+                    sel.hear(2, 25, now);
+                    sel.hear(3, 25, now);
+                }
+            }
+            sel.set_limit(1);
+            let now = t + STEP * 51;
+            assert!(sel.hear(1, 25, now), "the first speaker lost its slot");
+            assert!(!sel.hear(2, 25, now));
+            assert!(!sel.hear(3, 25, now));
+        }
     }
 }

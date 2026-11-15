@@ -3,29 +3,37 @@
 
     pairs.py RULES.json OUT.json IMPL...        (IMPL: rs, rs-budget, go)
 
-rtcd-rs as it ships (rs, the camera budget off) is the gated subject whenever it ran: it is held
-against the Go rtcd (the pairs of RULES.json). The camera budget's soak (rs-budget) is held against
-the Go rtcd too, and against rs when that ran, for the report only (`"gate": false`: a breach shows
-in the tables and does not fail) while rs is gated; without rs, rs-budget is the gated subject.
+rtcd-rs as it ships is the gated subject: held against the Go rtcd (the pairs of RULES.json with
+their rtcd-rs replaced). It ships with the camera budget on (rs-budget); without that leg, rs is
+gated instead. The other leg, when it ran, is in the report only (`"gate": false`: a breach shows in
+the tables and does not fail), against the Go rtcd and against the shipped leg.
 """
 import json
 import sys
 
 SUBJECT = "rtcd-rs"
-BUDGET = "rtcd-rs-budget"
+LABELS = {"rs": "rtcd-rs", "rs-budget": "rtcd-rs-budget"}
+# The leg that runs rtcd-rs as it ships (`camera_budget` is on by default in rtcd-sfu's config).
+SHIPPED = "rs-budget"
 
 
 def build(rules, impls):
-    plain = "rs" in impls
-    pairs = [dict(p) for p in rules["compare"]] if plain else []
-    if "rs-budget" in impls:
-        budget = [{**p, "subject": BUDGET + p["subject"][len(SUBJECT):]} for p in rules["compare"]]
-        if plain:
-            pairs += [{**p, "gate": False} for p in budget]
-            pairs += [{**p, "baseline": SUBJECT + p["subject"][len(BUDGET):], "gate": False}
-                      for p in budget]
-        else:
-            pairs += budget
+    legs = [leg for leg in LABELS if leg in impls]
+    if not legs:
+        return rules
+    gated = SHIPPED if SHIPPED in legs else legs[0]
+
+    def as_subject(p, leg):
+        return {**p, "subject": LABELS[leg] + p["subject"][len(SUBJECT):]}
+
+    pairs = [as_subject(p, gated) for p in rules["compare"]]
+    for leg in legs:
+        if leg == gated:
+            continue
+        for p in rules["compare"]:
+            q = as_subject(p, leg)
+            pairs.append({**q, "gate": False})
+            pairs.append({**q, "baseline": LABELS[gated] + p["subject"][len(SUBJECT):], "gate": False})
     return {**rules, "compare": pairs}
 
 
