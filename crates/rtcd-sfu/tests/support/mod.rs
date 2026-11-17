@@ -1228,6 +1228,19 @@ impl World {
         }
     }
 
+    /// Sets the sequence numbers of a layer of a video sender back by `by`, as a sender does that
+    /// starts its numbers over.
+    pub fn rewind_sequence(&mut self, i: usize, screen: bool, layer: Layer, by: u16) {
+        let b = &mut self.browsers[i];
+        let v = if screen {
+            b.screen.as_mut()
+        } else {
+            b.camera.as_mut()
+        }
+        .expect("a video sender");
+        v.seq[layer as usize] = v.seq[layer as usize].wrapping_sub(by);
+    }
+
     /// Sends the packets `send_video_losing` kept back, now, on the sender they belong to.
     pub fn send_held_back(&mut self, i: usize, screen: bool) {
         let now = self.now;

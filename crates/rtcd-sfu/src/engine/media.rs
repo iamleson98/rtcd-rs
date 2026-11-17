@@ -41,6 +41,9 @@ pub(crate) struct Fan {
     /// The next packet follows a stretch that was left out: receivers carry on their sequence
     /// numbers from where they were.
     pub resume: bool,
+    /// The newest sequence number seen on the stream: a receiver waiting for a keyframe joins at
+    /// the first packet of one only if it is the newest, else the packets after it have gone by.
+    pub newest: Option<u16>,
     /// Where a copy of every packet goes, if the stream is being recorded.
     pub tap: Option<Tap>,
 }
@@ -214,7 +217,8 @@ impl Engine {
             }
             TrackType::ScreenAudio => true,
             TrackType::Screen | TrackType::Video => {
-                let small_camera = src.ty == TrackType::Video && src.layer == Layer::Low;
+                let small_video = src.layer == Layer::Low;
+                let ty = src.ty;
                 let size = packet.marshal_size();
                 src.rate.push(now, size);
                 if let Some(t) = src.temporal_rates.as_mut() {
@@ -229,14 +233,17 @@ impl Engine {
                     {
                         t.seen = true;
                         match layer.tid {
-                            0 => t.base.push(now, size),
+                            0 => {
+                                t.base.push(now, size);
+                                t.count_base_frame(packet.header.timestamp, now);
+                            }
                             1 => t.second.push(now, size),
                             _ => {}
                         }
                     }
                 }
-                if small_camera {
-                    self.watch_camera(key, now);
+                if small_video {
+                    self.watch_large_layer(key, ty, now);
                 }
                 true
             }
@@ -362,6 +369,7 @@ impl Engine {
             temporal_rates,
             last_packet: Some(now),
             last_pli: None,
+            bypassed: false,
             gap: false,
         });
         info!(session = %s.cfg.session_id, %ty, ?layer, ssrc = init.ssrc, "track received");
@@ -378,6 +386,7 @@ impl Engine {
                 vp8: is_vp8,
                 ty,
                 resume: false,
+                newest: None,
                 tap: None,
             },
         );
@@ -635,6 +644,11 @@ impl Engine {
                 continue;
             };
             let resume = std::mem::take(&mut fan.resume);
+            let seq = packet.header.sequence_number;
+            let newest = is_newer(fan.newest, seq);
+            if newest {
+                fan.newest = Some(seq);
+            }
             let fan = &*fan;
             // The uplink counts whether or not anyone receives the stream.
             let size = packet.marshal_size() as u64;
@@ -660,15 +674,20 @@ impl Engine {
             let frame = (fan.vp8 && layered).then(|| Frame {
                 descriptor: vp8::Descriptor::parse(&packet.payload),
                 key: vp8::is_keyframe(&packet.payload),
+                newest,
             });
 
             // Receivers waiting for this stream join it at a keyframe (any packet, for codecs whose
-            // keyframes are not recognised).
-            if !fan.waiting.is_empty()
-                && frame
-                    .as_ref()
-                    .map_or_else(|| !fan.vp8 || vp8::is_keyframe(&packet.payload), |f| f.key)
-            {
+            // keyframes are not recognised). The start of one that is not the newest packet is a
+            // retransmission that came after the rest of its frame went by unsent: joining there
+            // would hand the receiver a keyframe without its other packets, so it asks again.
+            let key_start = frame
+                .as_ref()
+                .map_or_else(|| vp8::is_keyframe(&packet.payload), |f| f.key);
+            let keyframe_start = !fan.waiting.is_empty() && (key_start || !fan.vp8);
+            let stale_keyframe =
+                !fan.waiting.is_empty() && is_stale_keyframe(fan.vp8, key_start, newest);
+            if keyframe_start && newest {
                 for &sub in &fan.waiting {
                     let Some(r) = self.sessions.get_mut(sub.session) else {
                         continue;
@@ -728,10 +747,26 @@ impl Engine {
             for sub in switched {
                 self.complete_switch(sk, sub);
             }
+            if stale_keyframe && self.waiter_ready(sk) {
+                self.request_keyframe(key, source, now, true);
+            }
             for sub in pausing {
                 self.finish_pause(sub.session, sub.stream, now);
             }
         }
+    }
+
+    /// Whether a receiver waiting on the stream could be sent a keyframe now: one still being
+    /// added to the connection, or paused, is not asking for it.
+    fn waiter_ready(&self, sk: SourceKey) -> bool {
+        self.fanout.get(&sk).is_some_and(|fan| {
+            fan.waiting.iter().any(|sub| {
+                self.sessions
+                    .get(sub.session)
+                    .and_then(|r| r.down.get(sub.stream))
+                    .is_some_and(|d| d.phase == DownPhase::Active && !d.paused)
+            })
+        })
     }
 
     /// A receiver waiting on `to` got its keyframe: it is fed from `to` now.
@@ -866,10 +901,31 @@ fn type_slot(ty: TrackType) -> usize {
     }
 }
 
+/// How far back a stream's sequence numbers may go and still be reordering (or a packet sent
+/// again): further than this, the sender started its numbers over.
+const REORDER_WINDOW: u16 = 512;
+
+/// Whether sequence number `seq` is newer than `newest`, the newest of the stream so far: one
+/// that comes after it, or that goes back by more than [`REORDER_WINDOW`] (a restart).
+fn is_newer(newest: Option<u16>, seq: u16) -> bool {
+    newest.is_none_or(|n| {
+        let ahead = seq.wrapping_sub(n);
+        (ahead != 0 && ahead < 0x8000) || ahead.wrapping_neg() > REORDER_WINDOW
+    })
+}
+
+/// Whether a packet is the start of a keyframe that came late (see `forward`). Only a codec whose
+/// keyframes are recognised has one: of any other every packet is taken for a start.
+fn is_stale_keyframe(vp8: bool, key_start: bool, newest: bool) -> bool {
+    vp8 && key_start && !newest
+}
+
 /// What the forwarder reads once of a packet of a video, for every receiver's temporal layers.
 struct Frame {
     descriptor: Option<vp8::Descriptor>,
     key: bool,
+    /// The packet is the newest of its stream: one that is not came late (a retransmission).
+    newest: bool,
 }
 
 /// Writes `packet` to the receiver's copy of the stream, rewritten for it, unless it is of a
@@ -891,7 +947,10 @@ fn write_down(
     }
     if let Some(f) = frame {
         let temporal = f.descriptor.and_then(|d| d.temporal);
-        if !ds.temporal.admit(packet.header.timestamp, temporal, f.key) {
+        if !ds
+            .temporal
+            .admit(packet.header.timestamp, temporal, f.key, f.newest)
+        {
             ds.rewrite.leave_out(packet, f.descriptor.as_ref());
             return false;
         }
@@ -925,4 +984,40 @@ fn write_down(
         dirty.push(sub.session);
     }
     ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_packet_is_newer_when_it_follows_the_newest_even_across_the_wrap() {
+        assert!(is_newer(None, 7));
+        assert!(is_newer(Some(7), 8));
+        assert!(is_newer(Some(65_535), 2));
+        assert!(!is_newer(Some(8), 8), "the same packet again");
+        assert!(
+            !is_newer(Some(8), 3),
+            "sent again after the ones that followed it"
+        );
+        assert!(!is_newer(Some(2), 65_535));
+        assert!(!is_newer(Some(1_000), 1_000 - REORDER_WINDOW));
+    }
+
+    #[test]
+    fn only_a_recognised_keyframe_start_can_be_stale() {
+        assert!(is_stale_keyframe(true, true, false));
+        assert!(!is_stale_keyframe(true, true, true));
+        assert!(!is_stale_keyframe(true, false, false), "not a keyframe");
+        assert!(
+            !is_stale_keyframe(false, true, false),
+            "a codec whose keyframes are not recognised takes every packet for one"
+        );
+    }
+
+    #[test]
+    fn numbers_that_start_over_are_a_restart_not_a_late_packet() {
+        assert!(is_newer(Some(40_000), 100), "going back by 39,900");
+        assert!(is_newer(Some(5_000), 5_000 - REORDER_WINDOW - 1));
+    }
 }

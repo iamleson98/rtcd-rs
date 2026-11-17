@@ -352,6 +352,141 @@ fn a_retransmission_that_comes_late_is_accepted() {
 }
 
 #[test]
+fn a_receiver_does_not_join_a_stream_at_a_keyframe_start_that_came_late() {
+    let mut w = World::new();
+    let a = w.join_with_camera("alice", "call1");
+    w.stream_video(a, false, 0.5, 30, &BOTH);
+    let b = w.join("bob", "call1");
+    // The SFU asks for the keyframe bob waits for once a second; the one that comes is a keyframe
+    // whose first packet is lost on the way to the SFU: the rest of it goes by while bob waits,
+    // and the first comes again after.
+    let before = w.browsers[a].keyframe_requests.len();
+    assert!(w.run_until(Duration::from_secs(5), |w| {
+        w.browsers[a].keyframe_requests.len() > before
+    }));
+    let asked = w.browsers[a].keyframe_requests.len();
+    w.send_video_losing(a, false, Layer::High, true, 4, Some(0));
+    w.run_for(Duration::from_millis(100));
+    w.send_held_back(a, false);
+    w.run_for(Duration::from_millis(200));
+    assert!(
+        video_of(&w, b, "video_").is_empty(),
+        "joined at a packet whose frame had gone by"
+    );
+    assert!(
+        w.browsers[a].keyframe_requests.len() > asked,
+        "another keyframe was asked for, though the last request was a moment ago"
+    );
+    // The next keyframe arrives whole.
+    w.send_video(a, false, Layer::High, true, 4);
+    w.run_for(Duration::from_millis(200));
+    let got = video_of(&w, b, "video_");
+    assert_eq!(got.len(), 4, "{got:?}");
+    assert!(got[0].1, "and it begins with the keyframe");
+}
+
+/// Alice's requests so far, once the SFU has just asked her for a keyframe for Bob, who waits.
+fn bob_waits_and_the_sfu_has_just_asked(w: &mut World) -> (usize, usize, usize) {
+    let a = w.join_with_camera("alice", "call1");
+    w.stream_video(a, false, 0.5, 30, &BOTH);
+    let b = w.join("bob", "call1");
+    let before = w.browsers[a].keyframe_requests.len();
+    assert!(w.run_until(Duration::from_secs(5), |w| {
+        w.browsers[a].keyframe_requests.len() > before
+    }));
+    let asked = w.browsers[a].keyframe_requests.len();
+    (a, b, asked)
+}
+
+/// A keyframe of four packets whose first is lost, which comes again after the rest.
+fn late_keyframe(w: &mut World, a: usize) {
+    w.send_video_losing(a, false, Layer::High, true, 4, Some(0));
+    w.run_for(Duration::from_millis(100));
+    w.send_held_back(a, false);
+    w.run_for(Duration::from_millis(200));
+}
+
+#[test]
+fn keyframes_that_come_late_one_after_the_other_skip_the_limit_once() {
+    let mut w = World::new();
+    let (a, _, asked) = bob_waits_and_the_sfu_has_just_asked(&mut w);
+    late_keyframe(&mut w, a);
+    assert_eq!(w.browsers[a].keyframe_requests.len(), asked + 1);
+    late_keyframe(&mut w, a);
+    assert_eq!(
+        w.browsers[a].keyframe_requests.len(),
+        asked + 1,
+        "the second is held to one a second like any other"
+    );
+}
+
+#[test]
+fn a_receiver_that_cannot_use_a_keyframe_yet_does_not_bring_another_request() {
+    // Alice ignores the SFU's offer: the stream she waits on is not in her connection.
+    let mut w = World::new();
+    let a = w.join("alice", "call1");
+    w.browsers[a].hold_answers = true;
+    let b = w.join_with_camera("bob", "call1");
+    w.stream_video(b, false, 0.5, 30, &BOTH);
+    assert!(
+        w.run_until(Duration::from_secs(5), |w| w.browsers[a].offers_received
+            >= 1)
+    );
+    w.run_for(Duration::from_secs(2));
+    let asked = w.browsers[b].keyframe_requests.len();
+    late_keyframe(&mut w, b);
+    assert_eq!(w.browsers[b].keyframe_requests.len(), asked);
+}
+
+#[test]
+fn a_sender_that_starts_its_sequence_numbers_over_is_joined_at_its_next_keyframe() {
+    let mut w = World::new();
+    let (a, b, _) = bob_waits_and_the_sfu_has_just_asked(&mut w);
+    w.rewind_sequence(a, false, Layer::High, 20_000);
+    w.send_video(a, false, Layer::High, true, 4);
+    w.run_for(Duration::from_millis(200));
+    assert_eq!(video_of(&w, b, "video_").len(), 4);
+}
+
+#[test]
+fn receivers_move_to_the_small_screen_layer_while_the_large_one_is_paused() {
+    let mut w = World::new();
+    let a = w.join("alice", "call1");
+    let b = w.join("bob", "call1");
+    w.dc_send(b, rtcd_proto::dc::DcMessage::SharpScreen(true));
+    w.share_screen(a);
+    w.run_for(Duration::from_secs(1));
+    w.stream_video(a, true, 1.5, 30, &BOTH);
+    assert!(
+        video_of(&w, b, "screen_")
+            .iter()
+            .all(|(l, _)| *l == Layer::High)
+    );
+
+    // The browser stops sending the large layer; the small one keeps flowing.
+    let seen = video_of(&w, b, "screen_").len();
+    w.stream_video(a, true, 8.0, 30, &[Layer::Low]);
+    let after = &video_of(&w, b, "screen_")[seen..];
+    assert!(
+        after.iter().any(|(l, _)| *l == Layer::Low),
+        "bob moved to the small layer"
+    );
+    assert!(
+        after.iter().rev().take(10).all(|(l, _)| *l == Layer::Low),
+        "and stays there while the large one is silent, whatever rung he was on"
+    );
+
+    // And back when the large layer returns.
+    let seen = video_of(&w, b, "screen_").len();
+    w.stream_video(a, true, 30.0, 30, &BOTH);
+    let after = &video_of(&w, b, "screen_")[seen..];
+    assert!(
+        after.iter().rev().take(10).all(|(l, _)| *l == Layer::High),
+        "and back to the large one, earned again"
+    );
+}
+
+#[test]
 fn a_second_screen_share_is_refused_while_one_is_live() {
     let mut w = World::new();
     let a = w.join("alice", "call1");

@@ -61,16 +61,26 @@ impl TemporalFilter {
     pub fn restart(&mut self) {
         self.synced = [true; LAYERS];
         self.used = 0;
+        self.next = 0;
     }
 
     /// Whether to send a packet of the frame with RTP timestamp `ts`, which is a keyframe or not
     /// and is in `temporal` (a stream without temporal layers is all base layer). Every packet of
-    /// a frame gets the answer its first one got.
-    pub fn admit(&mut self, ts: u32, temporal: Option<Temporal>, key: bool) -> bool {
+    /// a frame gets the answer its first one got. `newest`: the packet is the newest of its
+    /// stream; one that is not is a retransmission of a frame that went by long ago, which says
+    /// nothing of which frames the receiver has since, so it is judged by the state as it is and
+    /// changes none of it.
+    pub fn admit(&mut self, ts: u32, temporal: Option<Temporal>, key: bool, newest: bool) -> bool {
         if let Some(&(_, send)) = self.recent[..self.used].iter().find(|(t, _)| *t == ts) {
             return send;
         }
         let tid = usize::from(temporal.map_or(0, |t| t.tid)).min(LAYERS - 1);
+        if !newest {
+            return key
+                || tid == 0
+                || (self.limit.is_none_or(|l| tid <= usize::from(l))
+                    && self.synced[1..=tid].iter().all(|&s| s));
+        }
         let send = if key {
             self.synced = [true; LAYERS];
             true
@@ -118,7 +128,8 @@ mod tests {
         (from..from + frames)
             .filter_map(|n| {
                 let t = pattern(n);
-                f.admit(n as u32 * 6000, Some(t), n == 0).then_some(t.tid)
+                f.admit(n as u32 * 6000, Some(t), n == 0, true)
+                    .then_some(t.tid)
             })
             .collect()
     }
@@ -164,8 +175,11 @@ mod tests {
         run(&mut g, 0, 5);
         g.set_limit(None);
         // Frame 7 is layer 2 without the sync bit: it refers to frame 5... which was never sent.
-        assert!(!g.admit(7 * 6000, Some(pattern(7)), false));
-        assert!(g.admit(9 * 6000, Some(pattern(9)), false), "frame 9 has it");
+        assert!(!g.admit(7 * 6000, Some(pattern(7)), false, true));
+        assert!(
+            g.admit(9 * 6000, Some(pattern(9)), false, true),
+            "frame 9 has it"
+        );
     }
 
     #[test]
@@ -173,13 +187,13 @@ mod tests {
         let mut f = TemporalFilter::default();
         f.set_limit(Some(0));
         let t = Some(pattern(1));
-        assert!(!f.admit(6000, t, false));
+        assert!(!f.admit(6000, t, false, true));
         f.set_limit(None);
         assert!(
-            !f.admit(6000, t, false),
+            !f.admit(6000, t, false, true),
             "the rest of the frame left out too"
         );
-        assert!(f.admit(0, Some(pattern(0)), false));
+        assert!(f.admit(0, Some(pattern(0)), false, true));
     }
 
     #[test]
@@ -188,7 +202,7 @@ mod tests {
         f.set_limit(Some(0));
         run(&mut f, 0, 8);
         f.set_limit(None);
-        assert!(f.admit(100, Some(pattern(0)), true));
+        assert!(f.admit(100, Some(pattern(0)), true, true));
         // The first layer-2 frame without the sync bit right after the keyframe refers to it.
         assert!(f.admit(
             200,
@@ -196,7 +210,8 @@ mod tests {
                 tid: 2,
                 sync: false
             }),
-            false
+            false,
+            true
         ));
     }
 
@@ -204,6 +219,91 @@ mod tests {
     fn a_stream_without_temporal_layers_is_all_base() {
         let mut f = TemporalFilter::default();
         f.set_limit(Some(0));
-        assert!((0..10).all(|n| f.admit(n * 3000, None, n == 0)));
+        assert!((0..10).all(|n| f.admit(n * 3000, None, n == 0, true)));
+    }
+
+    #[test]
+    fn a_browsers_eight_frame_pattern_is_followed_through_every_limit() {
+        // Layers 0, 2, 1, 2 twice; the sync bit on the layer-1 frames and on the first layer-2
+        // frame after a base frame, as a browser sets it.
+        const FRAMES: [(u8, bool); 8] = [
+            (0, false),
+            (2, true),
+            (1, true),
+            (2, false),
+            (0, false),
+            (2, true),
+            (1, true),
+            (2, false),
+        ];
+        let frame = |f: &mut TemporalFilter, n: usize| {
+            let (tid, sync) = FRAMES[n];
+            f.admit(n as u32 * 6000, Some(Temporal { tid, sync }), n == 0, true)
+        };
+        let sent = |limit: Option<u8>, from: usize| {
+            let mut f = TemporalFilter::default();
+            f.set_limit(limit);
+            (0..8)
+                .map(|n| {
+                    if n == from {
+                        f.set_limit(None);
+                    }
+                    frame(&mut f, n)
+                })
+                .collect::<Vec<_>>()
+        };
+        let t = true;
+        let n = false;
+        assert_eq!(sent(None, 8), [t, t, t, t, t, t, t, t]);
+        assert_eq!(sent(Some(1), 8), [t, n, t, n, t, n, t, n]);
+        assert_eq!(sent(Some(0), 8), [t, n, n, n, t, n, n, n]);
+        // The limit lifted at frame 3 (layer 2, no sync bit): it refers to frame 1, which was left
+        // out, so it waits; the next frame 5 has the bit.
+        assert_eq!(sent(Some(1), 3), [t, n, t, n, t, t, t, t]);
+        // Lifted at frame 4 (base): frame 5 is the first layer-2 frame after it and has the bit,
+        // frame 6 is layer 1 with it, and frame 7 refers only to what was sent since.
+        assert_eq!(sent(Some(0), 4), [t, n, n, n, t, t, t, t]);
+    }
+
+    #[test]
+    fn a_packet_that_came_late_changes_nothing_of_what_the_receiver_has() {
+        let mut f = TemporalFilter::default();
+        f.set_limit(Some(0));
+        run(&mut f, 0, 4);
+        f.set_limit(None);
+        // The first packet of a keyframe, sent again long after the rest of it: it is passed on,
+        // but the receiver has not got the frames of the layers it left out.
+        assert!(f.admit(777, Some(pattern(0)), true, false));
+        assert!(
+            !f.admit(
+                888,
+                Some(Temporal {
+                    tid: 2,
+                    sync: false
+                }),
+                false,
+                true
+            ),
+            "frames of the layer above the base are still missing"
+        );
+        // A late frame of a layer that is left out is left out; one of the base goes through.
+        let mut g = TemporalFilter::default();
+        g.set_limit(Some(0));
+        assert!(!g.admit(10, Some(pattern(2)), false, false));
+        assert!(g.admit(20, Some(pattern(0)), false, false));
+    }
+
+    #[test]
+    fn a_restart_forgets_the_frames_it_remembered() {
+        let mut f = TemporalFilter::default();
+        run(&mut f, 0, REMEMBERED + 5);
+        f.restart();
+        f.set_limit(Some(0));
+        // A frame of layer 2 with the sync bit is left out, and so are the rest of its packets
+        // once the limit is lifted.
+        let t = Some(Temporal { tid: 2, sync: true });
+        assert!(!f.admit(5, t, false, true));
+        f.set_limit(None);
+        assert!(!f.admit(5, t, false, true));
     }
 }

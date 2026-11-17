@@ -106,6 +106,10 @@ pub trait Metrics: Send + Sync + 'static {
     fn camera_large_layer(&self, stalled: bool) {
         let _ = stalled;
     }
+    /// The same of a screen share's large layer.
+    fn screen_large_layer(&self, stalled: bool) {
+        let _ = stalled;
+    }
     /// Packets of a recording left out because its queue was full (or an event had to stay ahead
     /// of them), since the last report.
     fn record_dropped(&self, packets: u64) {

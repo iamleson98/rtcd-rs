@@ -348,6 +348,8 @@ pub struct Metrics {
     keyframe_requests: [Counter; 2],
     /// A camera's large layer: [stalled, resumed].
     camera_large_layer: [Counter; 2],
+    /// A screen share's large layer: [stalled, resumed].
+    screen_large_layer: [Counter; 2],
     record_dropped: Counter,
     record_queue_depth: prometheus::Histogram,
     /// Recordings being captured on this node.
@@ -721,6 +723,16 @@ impl Metrics {
                 );
                 ["stalled", "resumed"].map(|l| family.with_label_values(&[l]))
             },
+            screen_large_layer: {
+                let family = counter(
+                    r,
+                    "rtc",
+                    "screen_large_layer_total",
+                    "Screen shares whose large layer stopped while the small one flowed (receivers moved to the small one), and that resumed",
+                    &["state"],
+                );
+                ["stalled", "resumed"].map(|l| family.with_label_values(&[l]))
+            },
             record_dropped: {
                 let c = Counter::with_opts(
                     Opts::new(
@@ -998,6 +1010,10 @@ impl SfuMetrics for Metrics {
         self.camera_large_layer[usize::from(!stalled)].inc();
     }
 
+    fn screen_large_layer(&self, stalled: bool) {
+        self.screen_large_layer[usize::from(!stalled)].inc();
+    }
+
     fn record_dropped(&self, packets: u64) {
         self.record_dropped.inc_by(packets as f64);
     }
@@ -1045,6 +1061,7 @@ mod tests {
         m.screen_layer_time(true, Duration::from_secs(1));
         m.keyframe_request(false);
         m.camera_large_layer(true);
+        m.screen_large_layer(false);
         m.record_dropped(5);
         m.record_queue_depth(12);
         m.record_capture(1);
@@ -1080,6 +1097,7 @@ mod tests {
             "rtcd_rtc_screen_layer_seconds_total{layer=\"large\"} 1",
             "rtcd_rtc_keyframe_requests_total{result=\"held_back\"} 1",
             "rtcd_rtc_camera_large_layer_total{state=\"stalled\"} 1",
+            "rtcd_rtc_screen_large_layer_total{state=\"resumed\"} 1",
             "rtcd_record_dropped_packets_total 5",
             "rtcd_record_queue_depth_count 1",
             "rtcd_record_recordings 1",

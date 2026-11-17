@@ -21,7 +21,10 @@ use crate::camera_budget::{
     self, Camera, CameraSteps, RANK_HOST, RANK_LOUD, RANK_SMALL, RANK_WATCHED,
 };
 use crate::ids::TrackType;
-use crate::layers::{Ladder, Layer, LayerRates, Rung, ScreenInputs, WATCH_EVERY};
+use crate::layers::{
+    Ladder, Layer, LayerRates, Rung, SCREEN_STALL_AFTER, STALL_AFTER, ScreenInputs, WATCH_EVERY,
+    limit_for_pace,
+};
 
 /// The most cameras one receiver may name.
 pub const MAX_VIDEO_SUBSCRIPTIONS: usize = 100;
@@ -89,7 +92,7 @@ impl Engine {
                 self.pick_layer(&mut candidates, preferred)
             }
             TrackType::Screen => {
-                let preferred = if r.down.squeezed {
+                let preferred = if r.down.squeezed || p.up.screen_stall.stalled() {
                     Layer::Low
                 } else {
                     r.down.screen_level.level()
@@ -153,29 +156,43 @@ impl Engine {
             fan.waiting.push(sub);
         }
         if active {
-            self.request_keyframe(publisher, to, now);
+            self.request_keyframe(publisher, to, now, false);
         }
     }
 
     /// Asks the sender for a keyframe of one of its streams, unless it was asked a moment ago.
-    pub(super) fn request_keyframe(&mut self, publisher: SessionKey, source: u32, now: Instant) {
+    /// `urgent`: the keyframe that was asked for came, and is of no use (see `forward`), so the
+    /// request that brought it does not hold this one back; once, until a request that is not
+    /// urgent goes out, so a stream of such packets is not a stream of requests.
+    pub(super) fn request_keyframe(
+        &mut self,
+        publisher: SessionKey,
+        source: u32,
+        now: Instant,
+        urgent: bool,
+    ) {
         let Some(p) = self.sessions.get_mut(publisher) else {
             return;
         };
         let Some(src) = p.up.sources.iter_mut().find(|x| x.id == source) else {
             return;
         };
-        if src
+        let throttled = src
             .last_pli
-            .is_some_and(|t| now.saturating_duration_since(t) < KEYFRAME_INTERVAL)
-        {
+            .is_some_and(|t| now.saturating_duration_since(t) < KEYFRAME_INTERVAL);
+        if throttled && (!urgent || src.bypassed) {
             self.metrics.keyframe_request(false);
             return;
+        }
+        if !urgent {
+            src.bypassed = false;
+        } else if throttled {
+            src.bypassed = true;
         }
         self.metrics.keyframe_request(true);
         src.last_pli = Some(now);
         debug!(session = %p.cfg.session_id, ssrc = src.ssrc, "keyframe requested");
-        let (receiver, ssrc) = (src.receiver, src.ssrc);
+        let (receiver, ssrc, ty) = (src.receiver, src.ssrc, src.ty);
         if let Some(mut rx) = p.pc.rtp_receiver(receiver)
             && let Err(err) = rx.write_rtcp(
                 now,
@@ -188,7 +205,8 @@ impl Engine {
             debug!(session = %p.cfg.session_id, %err, "keyframe request failed");
         }
         // The keyframe that answers goes to everyone the stream feeds, in a burst on each path
-        // that is not congestion (only a request that was sent brings one).
+        // that is not congestion (only a request that was sent brings one), whichever of them
+        // asked. A screen's receivers' levels are told when it is the screen's.
         if let Some(fan) = self.fanout.get(&SourceKey {
             session: publisher,
             source,
@@ -196,6 +214,9 @@ impl Engine {
             for sub in fan.serving.iter().chain(&fan.waiting) {
                 if let Some(s) = self.sessions.get_mut(sub.session) {
                     s.down.cameras.expect_keyframes(now);
+                    if ty == TrackType::Screen {
+                        s.down.screen_level.expect_keyframe(now);
+                    }
                 }
             }
         }
@@ -236,7 +257,7 @@ impl Engine {
             })
             .collect();
         for (publisher, source) in wanted {
-            self.request_keyframe(publisher, source, now);
+            self.request_keyframe(publisher, source, now, false);
         }
     }
 
@@ -291,7 +312,8 @@ impl Engine {
         // What is left looks at video: a class without a camera has nothing in it to look at, and
         // reading a session's statistics is not free on the thread that forwards the voices.
         if self.has_video(key) {
-            self.watch_camera(key, now);
+            self.watch_large_layer(key, TrackType::Video, now);
+            self.watch_large_layer(key, TrackType::Screen, now);
             self.measure_cameras(key, now);
             self.retry_keyframes(key, now);
             // The cameras are held first, so that the screen share, which comes before them, is
@@ -363,26 +385,36 @@ impl Engine {
         }
     }
 
-    /// Moves the receivers of a camera between its layers as the large one pauses and resumes:
-    /// at each packet of the small layer, which is when a pause shows soonest, and in the upkeep.
-    pub(super) fn watch_camera(&mut self, key: SessionKey, now: Instant) {
+    /// Moves the receivers of a camera or a screen share (`ty`) between its layers as the large
+    /// one pauses and resumes: at each packet of the small layer, which is when a pause shows
+    /// soonest, and in the upkeep.
+    pub(super) fn watch_large_layer(&mut self, key: SessionKey, ty: TrackType, now: Instant) {
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
         let last = |layer| {
             s.up.sources
                 .iter()
-                .filter(|x| x.ty == TrackType::Video && x.layer == layer)
+                .filter(|x| x.ty == ty && x.layer == layer)
                 .filter_map(|x| x.last_packet)
                 .max()
         };
         let (high, low) = (last(Layer::High), last(Layer::Low));
-        if s.up.camera_stall.update(now, high, low) {
-            let stalled = s.up.camera_stall.stalled();
-            debug!(session = %s.cfg.session_id, stalled, "camera large layer changed");
-            self.metrics.camera_large_layer(stalled);
-            self.record_sync(key, TrackType::Video, now);
-            self.sync_call_stream(key, TrackType::Video, now);
+        let (watch, after) = if ty == TrackType::Screen {
+            (&mut s.up.screen_stall, SCREEN_STALL_AFTER)
+        } else {
+            (&mut s.up.camera_stall, STALL_AFTER)
+        };
+        if watch.update(now, high, low, after) {
+            let stalled = watch.stalled();
+            debug!(session = %s.cfg.session_id, %ty, stalled, "large layer changed");
+            if ty == TrackType::Screen {
+                self.metrics.screen_large_layer(stalled);
+            } else {
+                self.metrics.camera_large_layer(stalled);
+            }
+            self.record_sync(key, ty, now);
+            self.sync_call_stream(key, ty, now);
         }
     }
 
@@ -398,7 +430,7 @@ impl Engine {
             .filter_map(|(_, d)| d.target.map(|t| (d.publisher, t)))
             .collect();
         for (publisher, source) in waiting {
-            self.request_keyframe(publisher, source, now);
+            self.request_keyframe(publisher, source, now, false);
         }
     }
 
@@ -421,6 +453,7 @@ impl Engine {
             queue_trend: e.queue_trend,
             acked: e.acked,
             capacity: e.capacity,
+            link: e.link,
             delivery: e.delivery,
             other: 0.0,
         };
@@ -458,12 +491,20 @@ impl Engine {
         let serving = source
             .and_then(|id| p.up.sources.iter().find(|x| x.id == id))
             .map(|x| x.layer);
+        let base_gaps = [Layer::Low, Layer::High].map(|layer| {
+            p.up.sources
+                .iter()
+                .find(|x| x.ty == TrackType::Screen && x.layer == layer)
+                .and_then(|x| x.temporal_rates.as_ref())
+                .and_then(|t| t.base_gap(now))
+        });
         let estimate = s.estimate.snapshot();
         let inputs = ScreenInputs {
             queue: estimate.queue,
             queue_trend: estimate.queue_trend,
             acked: estimate.acked,
             capacity: estimate.capacity,
+            link: estimate.link,
             delivery: estimate.delivery,
             other: self.other_video_rate(key, now),
         };
@@ -482,6 +523,8 @@ impl Engine {
             }
             _ => rung.tid,
         };
+        let sent = serving.unwrap_or(rung.layer);
+        let limit = limit_for_pace(limit, base_gaps[sent as usize]);
         if let Some(ds) = s.down.get_mut(stream) {
             ds.temporal.set_limit(limit);
         }
@@ -513,7 +556,13 @@ impl Engine {
                     .map(|b| b as f64 * 8.0),
             })
         };
-        Ladder::new(rates(Layer::Low), rates(Layer::High))
+        // A large layer that stopped offers nothing: its rungs read at no rate at all, and a
+        // receiver would climb them for free and land on the layer when it flows again. Without
+        // them the rung restarts on the small layer and earns the large one back.
+        let high = (!p.up.screen_stall.stalled())
+            .then(|| rates(Layer::High))
+            .flatten();
+        Ladder::new(rates(Layer::Low), high)
     }
 
     /// Bits per second of the screen share a receiver is sent now: it comes first on the path.
@@ -565,6 +614,7 @@ impl Engine {
             queue_trend: e.queue_trend,
             acked: e.acked,
             capacity: e.capacity,
+            link: e.link,
             delivery: e.delivery,
             other: 0.0,
         };
@@ -833,7 +883,7 @@ impl Engine {
             .and_then(|r| r.down.get(stream))
             .and_then(|d| d.target);
         if let Some(source) = target {
-            self.request_keyframe(publisher, source, now);
+            self.request_keyframe(publisher, source, now, false);
         }
     }
 
