@@ -1,0 +1,67 @@
+name: nightly
+
+# Long fuzzing that does not belong on every pull request: each target of fuzz/ for ten minutes a
+# night (the pull request job runs each for one). The corpus of every target persists between runs, so
+# coverage builds up night after night; a crash is uploaded as a reproducer.
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: Seconds to fuzz each target
+        default: '600'
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  targets:
+    name: List the fuzz targets
+    runs-on: ubuntu-latest
+    outputs:
+      names: ${{ steps.list.outputs.names }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        run: |
+          names=$(awk '/^\[\[bin\]\]/ { bin = 1; next } bin && /^name = / { gsub(/"/, "", $3); print $3; bin = 0 }' fuzz/Cargo.toml | jq -R . | jq -sc .)
+          echo "names=$names" >> "$GITHUB_OUTPUT"
+
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    needs: targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.targets.outputs.names) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked --version 0.13.2
+      - name: Restore the corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz
+        working-directory: fuzz
+        env:
+          SECONDS_PER_TARGET: ${{ inputs.fuzz_seconds || '600' }}
+        run: |
+          $GITHUB_WORKSPACE/scripts/ci-run.sh cargo +nightly fuzz run "${{ matrix.target }}" -- \
+            -max_total_time="$SECONDS_PER_TARGET" -max_len=4096 -rss_limit_mb=4096 -timeout=20
+      - name: Upload the crashes
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}

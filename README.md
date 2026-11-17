@@ -548,8 +548,14 @@ for 100 people and 32 (release build, loopback).
 
 `fuzz/` holds libFuzzer targets for what comes from outside: data channel frames, websocket frames, the
 engine given a session and any SDP, ICE and announcements a client can send, VP8 payloads and the recording's
-stream writer. `cd fuzz && cargo +nightly fuzz run <target>`; the `rtc` crates have
-targets of their own for STUN, RTP, RTCP, SDP, DTLS, SCTP and SRTP.
+stream writer. Three more drive the SFU's own packet-path logic and assert what it guarantees, not only that it
+does not panic: `rewrite` (sequence numbers and picture ids closing up over what is left out, retransmissions,
+late packets, a switch of source), `temporal` (no frame sent whose reference the receiver lacks, no layer above
+the limit, a restart) and `bwe` (the bandwidth estimate and path readings stay finite and within bounds).
+`cd fuzz && cargo +nightly fuzz run <target>`; the `rtc` crates have targets of their own for STUN, RTP, RTCP,
+SDP, DTLS, SCTP and SRTP. Pull requests run each target for a minute; the `nightly` workflow runs each for ten
+minutes (`fuzz_seconds` when started by hand) with its corpus kept between runs, and uploads a crash as an
+artifact.
 
 ## Not done yet
 

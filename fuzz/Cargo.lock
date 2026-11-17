@@ -1241,7 +1241,6 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures-util",
- "rand",
  "reqwest",
  "rustls",
  "serde",
@@ -1620,6 +1619,7 @@ dependencies = [
  "rustc-hash",
  "socket2",
  "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]
