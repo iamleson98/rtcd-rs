@@ -16,6 +16,10 @@ const FRAME_GAP: u32 = 3000;
 /// Runs of numbers left out that are remembered: a packet older than all of them (a retransmission
 /// seconds late) can no longer be placed, and is not sent.
 const REMEMBERED_RUNS: usize = 64;
+/// A run that ended this share of the number space before the newest number seen is forgotten:
+/// numbers are compared within half the space, so a run kept longer would, once the stream had
+/// moved on half the space, read as being after every new number.
+const RUN_HORIZON_SHARE: u16 = 4;
 /// Picture ids are 15 bits wide, or 7.
 const WIDE_PICTURE_ID: u16 = 0x7fff;
 const SHORT_PICTURE_ID: u16 = 0x7f;
@@ -26,6 +30,12 @@ fn after(a: u16, b: u16, mask: u16) -> bool {
     d != 0 && d <= mask / 2
 }
 
+/// Whether `n` is further behind `newest` than the runs left out are kept: too late to be
+/// placed among the numbers the receiver was sent.
+fn beyond_horizon(n: u16, newest: Option<u16>, mask: u16) -> bool {
+    newest.is_some_and(|x| after(x, n, mask) && x.wrapping_sub(n) & mask > mask / RUN_HORIZON_SHARE)
+}
+
 /// The numbers of a source that were left out of the receiver's copy, as runs, so that the numbers
 /// after them can close up. Only numbers newer than any seen are added: a late packet of a frame
 /// left out fills no slot in the receiver's numbering.
@@ -33,8 +43,9 @@ fn after(a: u16, b: u16, mask: u16) -> bool {
 struct Omitted {
     runs: VecDeque<(u16, u16)>,
     total: u16,
-    /// Runs were forgotten, so numbers older than the oldest kept one cannot be placed.
-    forgot: bool,
+    /// Where the newest forgotten run ended: numbers older than the oldest kept run cannot be
+    /// placed once runs were forgotten.
+    floor: Option<u16>,
 }
 
 impl Omitted {
@@ -48,13 +59,42 @@ impl Omitted {
         }
         self.runs.push_back((n, 1));
         if self.runs.len() > REMEMBERED_RUNS {
-            self.runs.pop_front();
-            self.forgot = true;
+            self.forget_oldest(mask);
+        }
+    }
+
+    fn forget_oldest(&mut self, mask: u16) {
+        if let Some((start, len)) = self.runs.pop_front() {
+            self.floor = Some(start.wrapping_add(len) & mask);
+        }
+    }
+
+    /// Forgets the runs that ended long before `newest`, the newest number of the source seen,
+    /// and the floor once it is as old: a packet that late is not placed anyway.
+    fn age(&mut self, newest: u16, mask: u16) {
+        let stale = |end: u16| newest.wrapping_sub(end) & mask > mask / RUN_HORIZON_SHARE;
+        while let Some(&(start, len)) = self.runs.front() {
+            if !stale(start.wrapping_add(len) & mask) {
+                break;
+            }
+            self.forget_oldest(mask);
+        }
+        if self.runs.is_empty() && self.floor.is_some_and(stale) {
+            self.floor = None;
         }
     }
 
     /// How many numbers before `n` were left out, or `None` if `n` is older than what is kept.
     fn before(&self, n: u16, mask: u16) -> Option<u16> {
+        // A number at or after the end of the newest run (every packet but a late one) has all
+        // of them before it.
+        match self.runs.back() {
+            Some(&(start, len)) if !after(start.wrapping_add(len) & mask, n, mask) => {
+                return Some(self.total);
+            }
+            None => return Some(self.total),
+            Some(_) => {}
+        }
         let mut later = 0u16;
         for &(start, len) in self.runs.iter().rev() {
             if !after(n, start, mask) {
@@ -68,7 +108,9 @@ impl Omitted {
             }
             return Some(self.total.wrapping_sub(later) & mask);
         }
-        (!self.forgot).then(|| self.total.wrapping_sub(later) & mask)
+        self.floor
+            .is_none()
+            .then(|| self.total.wrapping_sub(later) & mask)
     }
 }
 
@@ -195,6 +237,7 @@ impl Rewriter {
         let newer_seq = self.newest_seq.is_none_or(|n| after(seq, n, u16::MAX));
         if newer_seq {
             self.newest_seq = Some(seq);
+            self.omitted_seqs.age(seq, u16::MAX);
         }
         let newer_picture = picture_id.is_some_and(|(id, wide)| {
             self.picture_mask = if wide {
@@ -207,6 +250,7 @@ impl Rewriter {
                 .is_none_or(|n| after(id, n, self.picture_mask));
             if newer {
                 self.newest_picture_id = Some(id);
+                self.omitted_pictures.age(id, self.picture_mask);
             }
             newer
         });
@@ -229,7 +273,8 @@ impl Rewriter {
     }
 
     /// Rewrites `packet` for the receiver. Returns false, and leaves it as it was, for a packet
-    /// too late to be placed among the numbers the receiver was sent (see `REMEMBERED_RUNS`).
+    /// too late to be placed among the numbers the receiver was sent (see `REMEMBERED_RUNS` and
+    /// `RUN_HORIZON_SHARE`).
     pub fn rewrite(&mut self, packet: &mut Packet) -> bool {
         let seq = packet.header.sequence_number;
         let descriptor = self
@@ -237,6 +282,16 @@ impl Rewriter {
             .then(|| vp8::Descriptor::parse(&packet.payload))
             .flatten();
         let picture_id = descriptor.and_then(|d| d.picture_id);
+        // Noted first, so that the runs a jump forward leaves far behind are forgotten before
+        // the jump's own numbers are placed.
+        let (newer_seq, _) = self.note(seq, picture_id);
+        if beyond_horizon(seq, self.newest_seq, u16::MAX)
+            || picture_id.is_some_and(|(id, _)| {
+                beyond_horizon(id, self.newest_picture_id, self.picture_mask)
+            })
+        {
+            return false;
+        }
         let Some(seq_gap) = self.omitted_seqs.before(seq, u16::MAX) else {
             return false;
         };
@@ -247,7 +302,6 @@ impl Rewriter {
             },
             None => 0,
         };
-        let (newer_seq, _) = self.note(seq, picture_id);
         let h = &mut packet.header;
         h.ssrc = self.ssrc;
         h.payload_type = self.payload_type;
@@ -476,6 +530,108 @@ mod tests {
         }
         let mut late = keep;
         assert!(!r.rewrite(&mut late), "too late to know its number");
+    }
+
+    /// A frame of two packets of a long stream, whose numbers wrap; `wide`: 15-bit picture ids,
+    /// else 7-bit.
+    fn long_frame(f: u32, wide: bool) -> [Packet; 2] {
+        [0u32, 1].map(|n| {
+            let mut p = packet(
+                (100 + 2 * f + n) as u16,
+                9000u32.wrapping_add(f.wrapping_mul(3000)),
+                ((500 + f) & 0x7fff) as u16,
+                7,
+            );
+            if !wide {
+                let mut payload = p.payload.to_vec();
+                payload.splice(2..4, [((500 + f) & 0x7f) as u8]);
+                p.payload = Bytes::from(payload);
+            }
+            p
+        })
+    }
+
+    /// Leaves out every other frame of the first `left_out * 2`, then sends `frames` frames in
+    /// order: every packet is sent, one number after the last, and every frame's picture one
+    /// after the last frame's.
+    fn sends_in_order_long_after(left_out: u32, frames: u32, wide: bool) {
+        let mut r = Rewriter::new(1, 96, true);
+        let mask = if wide { 0x7fff } else { 0x7f };
+        let (mut last_seq, mut last_picture): (Option<u16>, Option<u16>) = (None, None);
+        for f in 0..frames {
+            for (n, mut p) in long_frame(f, wide).into_iter().enumerate() {
+                if f < left_out * 2 && f % 2 == 1 {
+                    r.leave_out(&p, vp8::Descriptor::parse(&p.payload).as_ref());
+                    continue;
+                }
+                assert!(r.rewrite(&mut p), "frame {f} is sent");
+                let seq = p.header.sequence_number;
+                let picture = vp8::Descriptor::parse(&p.payload)
+                    .and_then(|d| d.picture_id)
+                    .unwrap()
+                    .0;
+                if let Some(s) = last_seq {
+                    assert_eq!(seq, s.wrapping_add(1), "frame {f}: no gap, no repeat");
+                }
+                last_seq = Some(seq);
+                if n == 0 {
+                    if let Some(pic) = last_picture {
+                        assert_eq!(picture, (pic + 1) & mask, "frame {f}: pictures close up");
+                    }
+                    last_picture = Some(picture);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn numbers_keep_closing_up_long_after_the_last_frame_left_out() {
+        // Over two turns of the sequence numbers and of the 15-bit picture ids, with more runs
+        // left out than are remembered and with fewer; many turns of 7-bit ids.
+        for left_out in [REMEMBERED_RUNS as u32 + 36, 20] {
+            sends_in_order_long_after(left_out, 70_000, true);
+            sends_in_order_long_after(left_out, 2_000, false);
+        }
+    }
+
+    #[test]
+    fn a_jump_forward_past_the_horizon_is_sent_and_numbered_on() {
+        let mut r = Rewriter::new(1, 96, true);
+        for f in 0..40u32 {
+            for p in long_frame(f, false) {
+                let mut p = p;
+                if f % 2 == 1 {
+                    r.leave_out(&p, vp8::Descriptor::parse(&p.payload).as_ref());
+                } else {
+                    assert!(r.rewrite(&mut p));
+                }
+            }
+        }
+        // The sender was cut off for 40 frames (7-bit ids move on more than a quarter turn).
+        for f in 80..200u32 {
+            for mut p in long_frame(f, false) {
+                assert!(r.rewrite(&mut p), "frame {f} is sent");
+            }
+        }
+    }
+
+    #[test]
+    fn a_packet_later_than_the_horizon_is_not_placed() {
+        let mut r = Rewriter::new(1, 96, true);
+        let early = long_frame(4, false)[0].clone();
+        // Frame 4 comes again 50 frames later: past the horizon of 7-bit ids (31), within half
+        // their turn (63), so it is known to be late.
+        for f in 0..55u32 {
+            for mut p in long_frame(f, false) {
+                if f < 20 && f % 2 == 1 {
+                    r.leave_out(&p, vp8::Descriptor::parse(&p.payload).as_ref());
+                } else {
+                    assert!(r.rewrite(&mut p));
+                }
+            }
+        }
+        let mut late = early;
+        assert!(!r.rewrite(&mut late), "50 pictures late");
     }
 
     #[test]
