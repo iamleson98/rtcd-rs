@@ -60,6 +60,14 @@ const CUT_SETTLES: Duration = Duration::from_millis(3500);
 /// costs the receiver a burst of what the link drops: on a link that is narrow for good, this is
 /// how often that happens.
 const CEILING_TRUST: Duration = Duration::from_secs(60);
+/// How long the rate is believed after a cut that confirmed it: the cut came from a queue while
+/// the path carried at least [`LINK_FILLED`] of the link's rate, so the link really was full and
+/// its reading is not the low one of a fast link. A step above it only refills the queue, so it
+/// is not tried before this. The ceiling still follows the live rate: when the cap lifts, it rises.
+const CONFIRMED_CEILING_TRUST: Duration = Duration::from_secs(300);
+/// The share of the link's rate the path carried when a queue cut it, from which the link counts
+/// as full (see [`CONFIRMED_CEILING_TRUST`]).
+const LINK_FILLED: f64 = 0.8;
 /// A step that brought congestion is not tried again for a wait that starts at this and doubles
 /// each time, up to [`MAX_BACKOFF`]; once a step has been held [`FORGET_AFTER`] without trouble,
 /// the failures are forgotten. Shorter than the screen share's (`layers`): a camera's steps are
@@ -457,6 +465,10 @@ pub struct CameraBudget {
     /// The most the cameras may cost after one is taken up: what the narrowest link of the path
     /// carries (less the screen), when that is known.
     ceiling: Option<f64>,
+    /// Whether the last cut confirmed the ceiling (see [`CONFIRMED_CEILING_TRUST`]). Every cut
+    /// sets it afresh, so a later cut that does not confirm clears it; it is only read through
+    /// the time since that cut, so it needs no clearing when the trust runs out.
+    ceiling_confirmed: bool,
     /// The most the cameras may cost for a camera paused too long to be tried (see
     /// [`MAX_PAUSE`]): what the narrowest link carries, less the screen and room for its
     /// keyframes; unbounded while unknown.
@@ -502,6 +514,7 @@ impl Default for CameraBudget {
             grace_until: None,
             trial_until: None,
             ceiling: None,
+            ceiling_confirmed: false,
             reach: f64::INFINITY,
             unsteady: false,
             raise_after: None,
@@ -610,6 +623,13 @@ impl CameraBudget {
                 self.limit = Some(cut);
                 self.hold_until = Some(now + HOLD);
                 self.cut_at = Some(now);
+                self.ceiling_confirmed = matches!(
+                    self.cause,
+                    Some(Cause::Queue | Cause::Persisting | Cause::Surging | Cause::Critical)
+                ) && path
+                    .link
+                    .zip(path.acked)
+                    .is_some_and(|(link, acked)| acked >= link * LINK_FILLED);
             }
         } else {
             // A step that held (the path stayed calm for [`STEP_HELD`] after it): the wait that
@@ -696,8 +716,13 @@ impl CameraBudget {
         .then(|| {
             self.ceiling
                 .filter(|_| {
+                    let trust = if self.ceiling_confirmed {
+                        CONFIRMED_CEILING_TRUST
+                    } else {
+                        CEILING_TRUST
+                    };
                     self.cut_at
-                        .is_some_and(|t| now.saturating_duration_since(t) < CEILING_TRUST)
+                        .is_some_and(|t| now.saturating_duration_since(t) < trust)
                 })
                 .unwrap_or(f64::INFINITY)
         })
@@ -1101,6 +1126,89 @@ mod tests {
             }
         }
         assert_eq!(b.raise_ceiling(t), Some(f64::INFINITY));
+    }
+
+    /// A budget cut by a queue on a link of 2.4 Mbit/s that the path carried `acked` of, then
+    /// clear for [`CLEAR_FOR`] at `capacity`; returns it with the time of the last review.
+    fn cut_by_queue_then_clear(acked: f64, capacity: f64) -> (CameraBudget, Instant) {
+        let mut b = CameraBudget::default();
+        let mut t = Instant::now();
+        let queued = ScreenInputs {
+            queue: Some(2.0),
+            acked: Some(acked),
+            capacity: Some(2_400_000.0),
+            link: Some(2_400_000.0),
+            ..Default::default()
+        };
+        b.review(t, &queued, load(3_300_000.0, 3_300_000.0));
+        let path = ScreenInputs {
+            capacity: Some(capacity),
+            link: Some(capacity),
+            ..clear(2_000_000.0)
+        };
+        t += Duration::from_secs(10);
+        b.review(t, &path, load(2_000_000.0, 3_300_000.0));
+        t += CLEAR_FOR;
+        b.review(t, &path, load(2_000_000.0, 3_300_000.0));
+        (b, t)
+    }
+
+    fn clear_until(b: &mut CameraBudget, mut t: Instant, capacity: f64, seconds: u64) -> Instant {
+        let path = ScreenInputs {
+            capacity: Some(capacity),
+            link: Some(capacity),
+            ..clear(2_000_000.0)
+        };
+        for _ in 0..seconds {
+            t += Duration::from_secs(1);
+            b.review(t, &path, load(2_000_000.0, 3_300_000.0));
+        }
+        t
+    }
+
+    #[test]
+    fn a_cut_that_found_the_link_full_keeps_its_rate_holding_a_camera_back_for_long() {
+        let (mut b, t) = cut_by_queue_then_clear(2_300_000.0, 2_400_000.0);
+        let held = CAPACITY_SHARE * 2_400_000.0;
+        let cut_at = b.cut_at.unwrap();
+        for seconds in [
+            CEILING_TRUST.as_secs() + 1,
+            CONFIRMED_CEILING_TRUST.as_secs() - 1,
+        ] {
+            let at = clear_until(&mut b, t, 2_400_000.0, seconds - (t - cut_at).as_secs());
+            let got = b.raise_ceiling(at).expect("may raise");
+            assert!((got - held).abs() < 1.0, "{seconds} s after the cut: {got}");
+        }
+        let at = clear_until(&mut b, t, 2_400_000.0, CONFIRMED_CEILING_TRUST.as_secs());
+        assert_eq!(b.raise_ceiling(at), Some(f64::INFINITY));
+    }
+
+    #[test]
+    fn a_cut_that_did_not_find_the_link_full_trusts_its_rate_only_for_a_minute() {
+        let (mut b, t) = cut_by_queue_then_clear(1_000_000.0, 2_400_000.0);
+        let cut_at = b.cut_at.unwrap();
+        let at = clear_until(
+            &mut b,
+            t,
+            2_400_000.0,
+            CEILING_TRUST.as_secs() + 1 - (t - cut_at).as_secs(),
+        );
+        assert_eq!(b.raise_ceiling(at), Some(f64::INFINITY));
+    }
+
+    #[test]
+    fn a_confirmed_rate_follows_the_link_up_when_the_cap_lifts() {
+        let (mut b, t) = cut_by_queue_then_clear(2_300_000.0, 2_400_000.0);
+        let cut_at = b.cut_at.unwrap();
+        let at = clear_until(&mut b, t, 2_400_000.0, 100 - (t - cut_at).as_secs());
+        let capped = b.raise_ceiling(at).expect("may raise");
+        let at = clear_until(&mut b, at, 6_000_000.0, 1);
+        let lifted = b.raise_ceiling(at).expect("may raise");
+        assert!(
+            (lifted - 6_000_000.0 * CAPACITY_SHARE).abs() < 1.0,
+            "{lifted}"
+        );
+        assert!(lifted > capped * 2.0);
     }
 
     #[test]
