@@ -579,7 +579,7 @@ impl CameraBudget {
             c * REACH_SHARE - path.other * SCREEN_KEYFRAME_ROOM
         });
         let room = path
-            .capacity
+            .link
             .is_some_and(|c| c * CAPACITY_SHARE >= (load.sent + path.other) * LOSS_ROOM);
         self.cause = self.congested(now, path, room);
         let congested = self.cause.is_some();
@@ -669,9 +669,7 @@ impl CameraBudget {
             // Enough to take the cheapest camera step up, with the margin that takes.
             let above = (load.sent + load.next) * RAISE_MARGIN;
             // A narrowest link known to carry more is trusted at once.
-            let link = path
-                .capacity
-                .map_or(0.0, |c| c * CAPACITY_SHARE - path.other);
+            let link = path.link.map_or(0.0, |c| c * CAPACITY_SHARE - path.other);
             self.limit = Some(grown.min((GROWTH_CEILING * seen).max(above)).max(link));
         }
         let calm = now.saturating_duration_since(*self.calm_since.get_or_insert(now));
@@ -914,6 +912,7 @@ mod tests {
             delivery: Some(0.75),
             acked: Some(2_300_000.0),
             capacity: Some(2_300_000.0),
+            link: Some(2_300_000.0),
             ..Default::default()
         }
     }
@@ -965,6 +964,7 @@ mod tests {
         let mut b = CameraBudget::default();
         let path = ScreenInputs {
             capacity: Some(50_000_000.0),
+            link: Some(50_000_000.0),
             ..congested()
         };
         b.review(Instant::now(), &path, load(3_300_000.0, 3_300_000.0));
@@ -1068,6 +1068,7 @@ mod tests {
         t += Duration::from_secs(5);
         let path = ScreenInputs {
             capacity: Some(4_000_000.0),
+            link: Some(4_000_000.0),
             ..clear(2_000_000.0)
         };
         b.review(t, &path, load(2_000_000.0, 3_300_000.0));
@@ -1081,6 +1082,7 @@ mod tests {
         b.review(t, &congested(), load(3_300_000.0, 3_300_000.0));
         let path = ScreenInputs {
             capacity: Some(2_400_000.0),
+            link: Some(2_400_000.0),
             ..clear(2_000_000.0)
         };
         t += Duration::from_secs(10);
@@ -1108,6 +1110,7 @@ mod tests {
         b.review(t, &congested(), load(3_300_000.0, 3_300_000.0));
         let path = ScreenInputs {
             capacity: Some(8_000_000.0),
+            link: Some(8_000_000.0),
             ..clear(3_300_000.0)
         };
         for _ in 0..40 {
@@ -1146,6 +1149,7 @@ mod tests {
                     delivery: Some(link / load.sent),
                     acked: Some(link),
                     capacity: Some(link),
+                    link: Some(link),
                     ..Default::default()
                 }
             };
@@ -1497,6 +1501,7 @@ mod tests {
         let low = ScreenInputs {
             acked: Some(500_000.0),
             capacity: Some(500_000.0),
+            link: Some(500_000.0),
             ..congested()
         };
         b.review(t, &low, load(1_000_000.0, 3_300_000.0));
@@ -1504,6 +1509,7 @@ mod tests {
         let better = ScreenInputs {
             acked: Some(2_000_000.0),
             capacity: Some(2_000_000.0),
+            link: Some(2_000_000.0),
             ..congested()
         };
         b.review(t + CUT_SETTLES, &better, load(3_300_000.0, 3_300_000.0));
@@ -1822,6 +1828,7 @@ mod tests {
         let mut t = Instant::now();
         let path = ScreenInputs {
             capacity: Some(2_000_000.0),
+            link: Some(2_000_000.0),
             ..congested()
         };
         b.review(t, &path, load(1_500_000.0, 2_000_000.0));
@@ -1831,6 +1838,7 @@ mod tests {
             queue: Some(0.1),
             delivery: Some(1.0),
             capacity: Some(2_000_000.0),
+            link: Some(2_000_000.0),
             ..Default::default()
         };
         b.review(t, &queued, load(1_500_000.0, 2_000_000.0));
@@ -1838,6 +1846,7 @@ mod tests {
         t += Duration::from_secs(1);
         let calm = ScreenInputs {
             capacity: Some(2_000_000.0),
+            link: Some(2_000_000.0),
             ..clear(1_500_000.0)
         };
         b.review(t, &calm, load(1_500_000.0, 2_000_000.0));

@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rtc::media_stream::MediaStreamTrackId;
 use rtc::peer_connection::RTCPeerConnection;
@@ -70,6 +70,9 @@ pub(crate) struct Source {
     pub last_packet: Option<Instant>,
     /// When a keyframe was last asked of the sender for this stream.
     pub last_pli: Option<Instant>,
+    /// The request that skips the limit on how often a keyframe is asked for was used since the
+    /// last one that did not (see `Engine::request_keyframe`).
+    pub bypassed: bool,
     /// Whether packets of this voice were left out (muted, or not among the loudest) since one
     /// was last forwarded: the receivers' sequence numbers must then carry on from where they
     /// were (see `Rewriter::resume_after_gap`).
@@ -87,6 +90,10 @@ pub(crate) struct TemporalRates {
     /// Bytes of the last keyframe, and of the one arriving (by its RTP timestamp).
     pub keyframe_bytes: Option<usize>,
     keyframe: Option<(u32, usize)>,
+    /// The RTP timestamp and arrival of the last base layer frame, and how long it came after the
+    /// one before: the pace a receiver sent only the base layer is sent frames at.
+    base_frame: Option<(u32, Instant)>,
+    base_gap: Option<Duration>,
 }
 
 impl TemporalRates {
@@ -97,7 +104,28 @@ impl TemporalRates {
             seen: false,
             keyframe_bytes: None,
             keyframe: None,
+            base_frame: None,
+            base_gap: None,
         }
+    }
+
+    /// Counts a packet of a base layer frame (by its RTP timestamp, which its packets share).
+    pub fn count_base_frame(&mut self, ts: u32, now: Instant) {
+        if self.base_frame.is_some_and(|(at, _)| at == ts) {
+            return;
+        }
+        if let Some((_, before)) = self.base_frame {
+            self.base_gap = Some(now.saturating_duration_since(before));
+        }
+        self.base_frame = Some((ts, now));
+    }
+
+    /// How long a receiver sent only the base layer waits between frames: the last gap between
+    /// two of them, or how long it has been since the last one, if that is longer.
+    pub fn base_gap(&self, now: Instant) -> Option<Duration> {
+        let (_, last) = self.base_frame?;
+        let since = now.saturating_duration_since(last);
+        Some(self.base_gap.map_or(since, |g| g.max(since)))
     }
 
     /// Counts a packet of the stream: `key` for the first packet of a keyframe, `last` for the
@@ -136,6 +164,8 @@ pub(crate) struct Uplink {
     pub audio_level_ext: Option<u8>,
     /// Whether the large layer of the camera has stopped while the small one flows.
     pub camera_stall: StallWatch,
+    /// The same for the screen share.
+    pub screen_stall: StallWatch,
     /// What the camera costs a receiver at each step, as measured at the last upkeep (once a
     /// second per sender, not once per receiver).
     pub camera_steps: CameraSteps,
@@ -439,5 +469,34 @@ impl Sessions {
                 idx: i as u32,
                 generation: s.generation,
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_base_layer_pace_is_the_gap_between_its_frames_or_how_long_it_has_been() {
+        let mut t = TemporalRates::new(Duration::from_secs(2));
+        let t0 = Instant::now();
+        assert_eq!(t.base_gap(t0), None, "nothing seen");
+        t.count_base_frame(1000, t0);
+        t.count_base_frame(1000, t0 + Duration::from_millis(5));
+        assert_eq!(
+            t.base_gap(t0 + Duration::from_millis(50)),
+            Some(Duration::from_millis(50)),
+            "the packets of a frame are not frames"
+        );
+        t.count_base_frame(1000 + 12_000, t0 + Duration::from_millis(133));
+        assert_eq!(
+            t.base_gap(t0 + Duration::from_millis(150)),
+            Some(Duration::from_millis(133))
+        );
+        // The picture goes still: the wait grows with the silence.
+        assert_eq!(
+            t.base_gap(t0 + Duration::from_secs(5)),
+            Some(Duration::from_millis(4_867))
+        );
     }
 }

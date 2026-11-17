@@ -496,7 +496,11 @@ impl Engine {
                 .iter()
                 .find(|x| x.ty == ty && x.layer == layer && recordable(x))
         };
-        let paused = ty == TrackType::Video && p.up.camera_stall.stalled();
+        let paused = match ty {
+            TrackType::Video => p.up.camera_stall.stalled(),
+            TrackType::Screen => p.up.screen_stall.stalled(),
+            _ => false,
+        };
         let chosen = if paused {
             of_type(Layer::Low).or_else(|| of_type(Layer::High))
         } else {
@@ -599,7 +603,7 @@ impl Engine {
         fan.tap = Some(Tap { rec, stream });
         // The file opens on a keyframe: ask for one now rather than at the next upkeep.
         if ty.is_video() {
-            self.request_keyframe(publisher, source, now);
+            self.request_keyframe(publisher, source, now, false);
         }
     }
 
@@ -676,7 +680,7 @@ impl Engine {
             self.abandon_recording(rec);
         }
         for source in wanted {
-            self.request_keyframe(key, source, now);
+            self.request_keyframe(key, source, now, false);
         }
     }
 

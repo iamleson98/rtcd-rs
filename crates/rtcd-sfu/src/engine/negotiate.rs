@@ -212,7 +212,7 @@ impl Engine {
             self.metrics.signaling_lock_held_time(&group, held);
         }
         for (publisher, source) in keyframes {
-            self.request_keyframe(publisher, source, now);
+            self.request_keyframe(publisher, source, now, false);
         }
         self.mark_dirty(key);
     }
