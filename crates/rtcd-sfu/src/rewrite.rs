@@ -214,7 +214,12 @@ impl Rewriter {
     /// while (a voice that was not among the loudest): the receiver's sequence numbers carry on from
     /// the last one it saw, so it counts nothing as lost, while the timestamps keep the real time
     /// that passed, which a receiver treats as a pause in the speech. Call before rewriting `first`.
+    ///
+    /// The packets left out never reached the rewriter, so what it knew of the source (the newest
+    /// number, the runs left out) is from before the gap and is forgotten: past half the sequence
+    /// space it would read `first` as late and refuse the voice when it speaks again.
     pub fn resume_after_gap(&mut self, first: &Packet) {
+        self.forget_source();
         if self.started {
             self.seq_offset = self
                 .last_seq
@@ -676,5 +681,25 @@ mod tests {
         let mut next = packet(1106, 1106 * 960, 0, 0);
         r.rewrite(&mut next);
         assert_eq!(next.header.sequence_number, 106);
+    }
+
+    #[test]
+    fn a_voice_resumed_after_more_than_half_the_sequence_space_is_sent() {
+        // Eleven minutes and more of 20 ms packets left out: 33,000 to 65,000 sequence numbers on.
+        for gap in [32_769u16, 33_000, 40_000, 49_999, 65_000] {
+            let mut r = Rewriter::new(7, 111, false);
+            for seq in 100..105u16 {
+                let mut p = packet(seq, u32::from(seq) * 960, 0, 0);
+                assert!(r.rewrite(&mut p));
+            }
+            let seq = 104u16.wrapping_add(gap);
+            let mut first = packet(seq, u32::from(seq) * 960, 0, 0);
+            r.resume_after_gap(&first);
+            assert!(r.rewrite(&mut first), "gap {gap}: the first packet is sent");
+            assert_eq!(first.header.sequence_number, 105, "gap {gap}");
+            let mut next = packet(seq.wrapping_add(1), u32::from(seq) * 960 + 960, 0, 0);
+            assert!(r.rewrite(&mut next), "gap {gap}: the next packet is sent");
+            assert_eq!(next.header.sequence_number, 106, "gap {gap}");
+        }
     }
 }
