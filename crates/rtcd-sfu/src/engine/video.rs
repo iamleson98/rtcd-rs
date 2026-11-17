@@ -21,13 +21,15 @@ use crate::camera_budget::{
     self, Camera, CameraSteps, RANK_HOST, RANK_LOUD, RANK_SMALL, RANK_WATCHED,
 };
 use crate::ids::TrackType;
-use crate::layers::{Ladder, Layer, LayerRates, Rung, STALL_AFTER, ScreenInputs, WATCH_EVERY};
+use crate::layers::{Ladder, Layer, LayerRates, Rung, ScreenInputs, WATCH_EVERY};
 
 /// The most cameras one receiver may name.
 pub const MAX_VIDEO_SUBSCRIPTIONS: usize = 100;
 /// At most one keyframe request per stream per this long: a sender asked too often spends its
 /// bandwidth on keyframes.
 const KEYFRAME_INTERVAL: Duration = Duration::from_secs(1);
+/// A layer that brought a packet this recently flows, for what a camera costs.
+const FLOWING_WITHIN: Duration = Duration::from_secs(2);
 /// Between the once-a-second reviews, a receiver's screen share is looked at again as soon as its
 /// feedback says its path is congested, at most this often: a queue that builds for a second
 /// before anything is done holds the voice back with it.
@@ -361,8 +363,9 @@ impl Engine {
         }
     }
 
-    /// Moves the receivers of a camera between its layers as the large one pauses and resumes.
-    fn watch_camera(&mut self, key: SessionKey, now: Instant) {
+    /// Moves the receivers of a camera between its layers as the large one pauses and resumes:
+    /// at each packet of the small layer, which is when a pause shows soonest, and in the upkeep.
+    pub(super) fn watch_camera(&mut self, key: SessionKey, now: Instant) {
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
@@ -375,7 +378,9 @@ impl Engine {
         };
         let (high, low) = (last(Layer::High), last(Layer::Low));
         if s.up.camera_stall.update(now, high, low) {
-            debug!(session = %s.cfg.session_id, stalled = s.up.camera_stall.stalled(), "camera large layer changed");
+            let stalled = s.up.camera_stall.stalled();
+            debug!(session = %s.cfg.session_id, stalled, "camera large layer changed");
+            self.metrics.camera_large_layer(stalled);
             self.record_sync(key, TrackType::Video, now);
             self.sync_call_stream(key, TrackType::Video, now);
         }
@@ -883,7 +888,7 @@ fn camera_steps(sources: &[Source], now: Instant) -> CameraSteps {
         src.rate.rate(now).is_some()
             && src
                 .last_packet
-                .is_some_and(|t| now.saturating_duration_since(t) < STALL_AFTER)
+                .is_some_and(|t| now.saturating_duration_since(t) < FLOWING_WITHIN)
     };
     let rates = |src: &Source| {
         let temporal = src.temporal_rates.as_ref();

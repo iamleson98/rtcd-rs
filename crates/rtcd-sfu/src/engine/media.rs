@@ -214,6 +214,7 @@ impl Engine {
             }
             TrackType::ScreenAudio => true,
             TrackType::Screen | TrackType::Video => {
+                let small_camera = src.ty == TrackType::Video && src.layer == Layer::Low;
                 let size = packet.marshal_size();
                 src.rate.push(now, size);
                 if let Some(t) = src.temporal_rates.as_mut() {
@@ -233,6 +234,9 @@ impl Engine {
                             _ => {}
                         }
                     }
+                }
+                if small_camera {
+                    self.watch_camera(key, now);
                 }
                 true
             }

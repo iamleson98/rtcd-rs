@@ -532,15 +532,28 @@ impl Default for ScreenLevel {
 }
 
 /// How long the large layer of a camera may be silent, while the small one flows, before receivers
-/// are moved to the small one: a browser drops its top layer when its upload is short.
-pub const STALL_AFTER: Duration = Duration::from_secs(2);
-/// How often a camera's layers are checked.
+/// are moved to the small one: a browser drops its top layer when its upload is short, and until
+/// the move whoever watched the large layer sees a frozen picture. A camera sends a frame every 40
+/// to 70 ms (an encoder short of CPU or upload skips a few), so this long without one is a layer
+/// that stopped, not one that slowed.
+pub const STALL_AFTER: Duration = Duration::from_millis(600);
+/// How long a large layer that stalled must flow again before receivers go back to it: a browser
+/// at the edge of its upload turns the layer on and off, and every move costs a keyframe.
+pub const RESUME_AFTER: Duration = Duration::from_secs(2);
+/// How often a session's video is looked after (see `housekeeping`).
 pub const WATCH_EVERY: Duration = Duration::from_secs(1);
 
 /// Tracks whether the large layer of one camera is paused.
 #[derive(Debug, Default)]
 pub struct StallWatch {
     stalled: bool,
+    /// Since when the large layer of a stalled camera flows again.
+    flowing_since: Option<Instant>,
+    /// The small layer's last packet as last seen, and since when it has flowed without a pause:
+    /// a camera that starts again (both layers paused) brings a packet of one layer a moment
+    /// before one of the other, which is not the large layer stopping.
+    low_last: Option<Instant>,
+    low_since: Option<Instant>,
 }
 
 impl StallWatch {
@@ -549,18 +562,34 @@ impl StallWatch {
     }
 
     /// Updates the state from when each layer last brought a packet. Returns whether it changed.
-    /// When neither layer flows the camera is off, and nothing changes.
+    /// When neither layer flows the camera is off, and nothing changes; a camera that never sent a
+    /// large layer has none to stall.
     pub fn update(&mut self, now: Instant, high: Option<Instant>, low: Option<Instant>) -> bool {
         let idle =
             |t: Option<Instant>| t.map_or(Duration::MAX, |t| now.saturating_duration_since(t));
-        let (high_idle, low_idle) = (idle(high), idle(low));
-        let stalled = if high_idle < WATCH_EVERY {
-            false
-        } else if high_idle >= STALL_AFTER && low_idle < WATCH_EVERY {
-            true
+        let high_flows = idle(high) < STALL_AFTER;
+        if low != self.low_last {
+            let resumed = match (self.low_last, low) {
+                (Some(before), Some(at)) => at.saturating_duration_since(before) >= STALL_AFTER,
+                _ => true,
+            };
+            if resumed {
+                self.low_since = low;
+            }
+            self.low_last = low;
+        }
+        let low_flowed = idle(low) < STALL_AFTER && idle(self.low_since) >= STALL_AFTER;
+        let stalled = if !self.stalled {
+            high.is_some() && !high_flows && low_flowed
+        } else if high_flows {
+            let since = *self.flowing_since.get_or_insert(now);
+            now.saturating_duration_since(since) < RESUME_AFTER
         } else {
-            self.stalled
+            true
         };
+        if !stalled || !high_flows {
+            self.flowing_since = None;
+        }
         std::mem::replace(&mut self.stalled, stalled) != stalled
     }
 }
@@ -925,31 +954,87 @@ mod tests {
     }
 
     #[test]
-    fn the_large_camera_layer_is_stalled_after_two_silent_seconds_while_the_small_flows() {
+    fn the_large_camera_layer_is_stalled_after_600_silent_ms_while_the_small_flows() {
         let t = Instant::now();
         let mut w = StallWatch::default();
         let at = |ms| Some(t + Duration::from_millis(ms));
+        let now = |ms| t + Duration::from_millis(ms);
+        for ms in (0..3000).step_by(50) {
+            assert!(!w.update(now(ms), at(ms), at(ms)), "flowing");
+        }
+        assert!(!w.update(now(3000), at(2960), at(2950)), "flowing");
         assert!(
-            !w.update(t + Duration::from_millis(3000), at(2900), at(2950)),
-            "flowing"
+            !w.update(now(3000), at(2500), at(2950)),
+            "silent for 500 ms: a slow frame, not yet"
         );
-        assert!(
-            !w.update(t + Duration::from_millis(3000), at(1500), at(2950)),
-            "silent for 1.5 s: not yet"
-        );
-        assert!(
-            w.update(t + Duration::from_millis(5000), at(2900), at(4950)),
-            "silent for 2.1 s"
-        );
+        assert!(w.update(now(3100), at(2500), at(3080)), "silent for 600 ms");
         assert!(w.stalled());
         assert!(
-            !w.update(t + Duration::from_millis(6000), at(2900), at(5950)),
+            !w.update(now(4000), at(2500), at(3990)),
             "still stalled, no change"
         );
+    }
+
+    #[test]
+    fn a_stalled_large_layer_is_taken_back_once_it_flowed_two_seconds() {
+        let t = Instant::now();
+        let mut w = StallWatch::default();
+        let at = |ms| Some(t + Duration::from_millis(ms));
+        let now = |ms| t + Duration::from_millis(ms);
+        for ms in (0..1000).step_by(50) {
+            w.update(now(ms), at(ms), at(ms));
+        }
+        for ms in (1000..1550).step_by(50) {
+            assert!(!w.update(now(ms), at(950), at(ms)), "not yet");
+        }
+        assert!(w.update(now(1600), at(950), at(1590)), "stalled");
         assert!(
-            w.update(t + Duration::from_millis(6000), at(5950), at(5950)),
-            "back"
+            !w.update(now(5000), at(4990), at(4990)),
+            "back, not for long"
         );
+        assert!(!w.update(now(6500), at(6490), at(6490)), "1.5 s of it");
+        assert!(
+            w.update(now(7000), at(6990), at(6990)),
+            "2 s of it: resumed"
+        );
+        assert!(!w.stalled());
+    }
+
+    #[test]
+    fn a_large_layer_that_flickers_stays_stalled() {
+        let t = Instant::now();
+        let mut w = StallWatch::default();
+        let at = |ms| Some(t + Duration::from_millis(ms));
+        let now = |ms| t + Duration::from_millis(ms);
+        for ms in (0..1000).step_by(50) {
+            w.update(now(ms), at(ms), at(ms));
+        }
+        for ms in (1000..1550).step_by(50) {
+            assert!(!w.update(now(ms), at(950), at(ms)), "not yet");
+        }
+        assert!(w.update(now(1600), at(950), at(1590)), "stalled");
+        assert!(!w.update(now(2000), at(1990), at(1990)), "back");
+        assert!(!w.update(now(3000), at(2200), at(2990)), "gone again");
+        assert!(!w.update(now(3500), at(3490), at(3490)), "back again");
+        assert!(
+            !w.update(now(4800), at(4790), at(4790)),
+            "1.3 s since it came back the second time"
+        );
+        assert!(w.update(now(5500), at(5490), at(5490)), "2 s of it");
+    }
+
+    #[test]
+    fn a_camera_starting_again_is_not_stalled_by_its_small_layer_arriving_first() {
+        let t = Instant::now();
+        let mut w = StallWatch::default();
+        let at = |ms| Some(t + Duration::from_millis(ms));
+        let now = |ms| t + Duration::from_millis(ms);
+        for ms in (0..1000).step_by(50) {
+            w.update(now(ms), at(ms), at(ms));
+        }
+        // Both layers paused for five seconds; the small one's packet comes first.
+        assert!(!w.update(now(6000), at(950), at(6000)));
+        assert!(!w.update(now(6010), at(6010), at(6000)));
         assert!(!w.stalled());
     }
 
@@ -960,5 +1045,9 @@ mod tests {
         assert!(!w.update(t + Duration::from_secs(60), Some(t), Some(t)));
         assert!(!w.stalled());
         assert!(!w.update(t, None, None));
+        assert!(
+            !w.update(t, None, Some(t)),
+            "a camera of one layer has no large one to stall"
+        );
     }
 }

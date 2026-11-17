@@ -101,6 +101,11 @@ pub trait Metrics: Send + Sync + 'static {
     fn keyframe_request(&self, sent: bool) {
         let _ = sent;
     }
+    /// A camera's large layer stopped while its small one flowed and its receivers were moved to
+    /// the small one (`stalled`), or it flowed again long enough to move them back.
+    fn camera_large_layer(&self, stalled: bool) {
+        let _ = stalled;
+    }
     /// Packets of a recording left out because its queue was full (or an event had to stay ahead
     /// of them), since the last report.
     fn record_dropped(&self, packets: u64) {
