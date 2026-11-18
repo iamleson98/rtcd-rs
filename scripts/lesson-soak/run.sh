@@ -21,6 +21,10 @@
 # STUDENTS_IMPAIRED (8), MEASURE (6 receivers per group measured), TALK_SECS (30), BW_DOWN_MBIT (2.5)
 # and BW_UP_MBIT (1) for the bw phase's cap of each impaired participant, and, for the abuse profile,
 # ABUSE_INTENSITY (1..5) and ABUSE_ONLY (a comma separated list of attack classes).
+# REMOTE_CLIENTS=1 PUBLIC_IP=<address> also takes one headless Chromium from another machine across the
+# internet: the SFU's media port (8443, udp and tcp) and the page and relay port of the remote client
+# (8099 and 8100) are published on the host (on REMOTE_BIND, default every address), and the remote
+# browser is told the SFU is at PUBLIC_IP. The other machine runs remote-client.sh. See README.md.
 # rs-budget is rtcd-rs with the camera budget on, rs with it off (both set explicitly), the same
 # image; both are labelled rtcd-rs-budget and rtcd-rs in the output.
 # Needs Docker (Colima is fine), python3 and, for the Go baseline, network access to Docker Hub.
@@ -60,10 +64,19 @@ BW_DOWN_MBIT=${BW_DOWN_MBIT:-2.5}
 BW_UP_MBIT=${BW_UP_MBIT:-1}
 # The first UDP port of the impaired students' blocks (four ports each; see lms-sim --udp-base).
 UDP_BASE=40000
-names=(soak-sfu soak-clean soak-impaired soak-chrome-clean soak-chrome-impaired soak-netem-chrome soak-abuse soak-load soak-sample)
+names=(soak-sfu soak-clean soak-impaired soak-chrome-clean soak-chrome-impaired soak-netem-chrome soak-abuse soak-load soak-sample soak-remote)
+REMOTE_CLIENTS=${REMOTE_CLIENTS:-0}
+if [ "$REMOTE_CLIENTS" = 1 ]; then
+  if [ -z "${PUBLIC_IP:-}" ]; then
+    echo "REMOTE_CLIENTS=1 needs PUBLIC_IP, the address the remote machine reaches this host on" >&2
+    exit 2
+  fi
+  REMOTE_BIND=${REMOTE_BIND:-0.0.0.0}
+  SFU_PUBLISH=(-p "$REMOTE_BIND:8443:8443/udp" -p "$REMOTE_BIND:8443:8443/tcp")
+fi
 
 # The per-process files are this run's; the merged file of the other SFU stays.
-rm -f "$OUT"/clean.jsonl "$OUT"/impaired.jsonl "$OUT"/proc.jsonl "$OUT"/netem.jsonl "$OUT"/netem-chrome.jsonl \
+rm -f "$OUT"/clean.jsonl "$OUT"/impaired.jsonl "$OUT"/remote.jsonl "$OUT"/proc.jsonl "$OUT"/netem.jsonl "$OUT"/netem-chrome.jsonl \
   "$OUT"/abuse.jsonl "$OUT"/sfu-events.jsonl "$OUT/rtcd-$IMPL"-*.jsonl
 
 cleanup() {
@@ -108,6 +121,14 @@ joined soak-impaired
 # synthetic student), and reaches the page and the signaling relay of the lesson on its address.
 docker run -d --name soak-chrome-impaired --network "$NET" --ip "$CHROME_IMPAIRED_IP" --shm-size=1g \
   "${client_cpu[@]}" "$CHROME_IMAGE" "http://$IMPAIRED_IP:8099/?group=impaired&ws=8100" >/dev/null
+# A Chromium on another machine joins through a lesson process of its own with no students (the page
+# and the relay are published on the host; the media goes straight to the SFU's published port).
+if [ "$REMOTE_CLIENTS" = 1 ]; then
+  EXTRA="--first 0 --students 0 --chrome-bind 0.0.0.0 --chrome-advertise $PUBLIC_IP"
+  lesson soak-remote "$REMOTE_IP" remote -p "$REMOTE_BIND:8099:8099" -p "$REMOTE_BIND:8100:8100"
+  joined soak-remote
+  echo "remote client: scripts/lesson-soak/remote-client.sh $PUBLIC_IP $MINUTES <outdir> on the other machine"
+fi
 # The impaired participants start misbehaving once they are in, each on its own: eth0 of the
 # lesson container by port block, eth0 of Chromium's namespace for all its UDP, both ways.
 shape=(-e NETEM_BW_DOWN_MBIT="$BW_DOWN_MBIT" -e NETEM_BW_UP_MBIT="$BW_UP_MBIT")
@@ -141,6 +162,7 @@ if [ "$PROFILE" = abuse ]; then
     --impl "rtcd-$IMPL" --seed "$SEED" --out /out/abuse.jsonl ${abuse_opts[@]+"${abuse_opts[@]}"} >/dev/null
 fi
 echo "lesson soak $IMPL ($ARCH), profile $PROFILE: $MINUTES min, cycle $CYCLE min, $TOTAL students + 2 Chromium"
+[ "$REMOTE_CLIENTS" = 1 ] && echo "and a Chromium across the internet, when remote-client.sh starts it"
 
 # Until the clients are done (they leave on their own after MINUTES), or the SFU is gone.
 deadline=$(($(date +%s) + (MINUTES + 10) * 60))
@@ -156,12 +178,13 @@ done
 # (the cleanup). The report ends every receiver's samples at the run's first `leave stop`, so the
 # lesson ending is never read as a stall.
 docker stop -t 20 soak-chrome-clean soak-chrome-impaired soak-netem-chrome >/dev/null 2>&1 || true
-docker stop -t 20 soak-clean soak-impaired >/dev/null 2>&1 || true
+docker stop -t 20 soak-clean soak-impaired soak-remote >/dev/null 2>&1 || true
 docker stop -t 20 soak-abuse soak-load >/dev/null 2>&1 || true
 docker stop -t 5 soak-sample >/dev/null 2>&1 || true
 # The whole log of every container (the SFU's is the evidence of what it did), compressed when large.
 logs=(soak-sfu soak-clean soak-impaired soak-chrome-clean soak-chrome-impaired soak-netem-chrome)
 [ "$PROFILE" = abuse ] && logs+=(soak-abuse soak-load)
+[ "$REMOTE_CLIENTS" = 1 ] && logs+=(soak-remote)
 for n in "${logs[@]}"; do
   docker logs "$n" >"$OUT/$n.log" 2>&1 || true
 done
@@ -170,7 +193,9 @@ done
 # be stopped for its deadline); the artifacts are written either way.
 failed=0
 sfu_check || failed=1
-for n in soak-clean soak-impaired; do
+lessons=(soak-clean soak-impaired)
+[ "$REMOTE_CLIENTS" = 1 ] && lessons+=(soak-remote)
+for n in "${lessons[@]}"; do
   code=$(docker inspect -f '{{.State.ExitCode}}' "$n")
   [ "$code" = 0 ] || { echo "the lesson container $n failed (exit $code)"; failed=1; }
 done

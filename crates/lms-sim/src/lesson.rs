@@ -14,6 +14,11 @@
 //!     --group impaired --first 17 --students 8 --out impaired.jsonl --chrome 8099
 //! ```
 //!
+//! A third process with `--group remote --students 0 --chrome 8099 --chrome-bind 0.0.0.0
+//! --chrome-advertise PUBLIC_IP` only serves the page and the relay, for a headless Chrome on another
+//! machine (`scripts/lesson-soak/remote-client.sh`): what it is sent names the SFU by PUBLIC_IP, not
+//! by the address of `--media`. Its lines have the `impl` `rtcd-rs/chrome-remote`.
+//!
 //! With `--udp-base PORT` (a multiple of four) student `k` of the process binds its media sockets to
 //! the ports `PORT + 4k` to `PORT + 4k + 3`, so that a network that shapes each participant on its own
 //! (`vendor/rtc/benchmarks/soak/netem.sh` with `NETEM_PORTS`) can tell them apart.
@@ -59,6 +64,7 @@ struct Args {
     talk_secs: u64,
     chrome: Option<u16>,
     chrome_bind: String,
+    chrome_advertise: Option<String>,
     udp_base: Option<u16>,
     seed: Option<u64>,
     teacher_reconnect_mins: Option<u64>,
@@ -85,6 +91,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
         talk_secs: 30,
         chrome: None,
         chrome_bind: "127.0.0.1".into(),
+        chrome_advertise: None,
         udp_base: None,
         seed: None,
         teacher_reconnect_mins: None,
@@ -122,7 +129,8 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
                 a.group = match v.as_str() {
                     "clean" => "clean",
                     "impaired" => "impaired",
-                    _ => return Err("--group is clean or impaired".into()),
+                    "remote" => "remote",
+                    _ => return Err("--group is clean, impaired or remote".into()),
                 }
             }
             "--first" => a.first = n()? as u32,
@@ -133,6 +141,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--talk-secs" => a.talk_secs = n()?.max(1),
             "--chrome" => a.chrome = Some(n()? as u16),
             "--chrome-bind" => a.chrome_bind = v.clone(),
+            "--chrome-advertise" => a.chrome_advertise = Some(v.clone()),
             "--udp-base" => a.udp_base = Some(n()? as u16),
             "--seed" => a.seed = Some(n()?),
             "--teacher-reconnect-every" => a.teacher_reconnect_mins = Some(n()?.max(1)),
@@ -180,7 +189,13 @@ pub async fn run(args: impl Iterator<Item = String>, assets: PathBuf) {
     };
 
     if let Some(port) = a.chrome {
-        let chrome_probe = probe(&format!("{}/chrome", a.imp), false, false);
+        // A browser on another machine, across the internet, is a series of its own.
+        let kind = if a.group == "remote" {
+            "chrome-remote"
+        } else {
+            "chrome"
+        };
+        let chrome_probe = probe(&format!("{}/{kind}", a.imp), false, false);
         chrome::serve(
             rtcd.clone(),
             a.call.clone(),
@@ -189,6 +204,19 @@ pub async fn run(args: impl Iterator<Item = String>, assets: PathBuf) {
                 .chain((0..a.cameras).map(|i| format!("s{i:02}")))
                 .map(|n| format!("session-{n}"))
                 .collect(),
+            chrome::Page {
+                references: match a.camera_layers {
+                    CameraLayers::Simulcast => vec![&assets.camera_teacher, &assets.camera_low],
+                    CameraLayers::Single => vec![&assets.camera],
+                }
+                .into_iter()
+                .map(|clip| clip.to_ivf())
+                .collect(),
+                advertise: a
+                    .chrome_advertise
+                    .clone()
+                    .map(|public| (a.media.ip().to_string(), public)),
+            },
             &a.chrome_bind,
             port,
         )

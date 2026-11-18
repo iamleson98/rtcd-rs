@@ -10,8 +10,12 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::response::Html;
+use axum::extract::Path;
+use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
+use axum::response::{Html, IntoResponse};
 use axum::routing::get;
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use rtcd_proto::{ClientMessage, MessageType, SessionRef};
 use serde_json::{Value, json};
@@ -23,6 +27,20 @@ use crate::host::Rtcd;
 use crate::stats::Probe;
 
 const PAGE: &str = include_str!("page.html");
+const QUALITY: &str = include_str!("quality.js");
+
+/// What the page gets besides itself.
+#[derive(Debug)]
+pub struct Page {
+    /// The clips the teacher's camera is sent from, as IVF files (`/reference/0.ivf`, `/reference/1.ivf`,
+    /// ..., and their number at `/reference/count`): the page decodes them to score the picture it
+    /// gets, against the clip it matches best.
+    pub references: Vec<Vec<u8>>,
+    /// For a browser outside the SFU's network: the address the SFU gives for its media (its own, on
+    /// the network the lesson runs on) and the one to put in its place in what the page is sent, the
+    /// way an SFU behind NAT offers its public address (`ice_host_override`) to those on the internet.
+    pub advertise: Option<(String, String)>,
+}
 
 /// Serves the page on `bind:port` and the relay on `bind:port + 1`, for as long as the process
 /// lives. The browser watches the cameras of the sessions in `watch`, the same ones the synthetic
@@ -32,13 +50,43 @@ pub async fn serve(
     call: String,
     probe: Probe,
     watch: Vec<String>,
+    page: Page,
     bind: &str,
     port: u16,
 ) -> std::io::Result<()> {
     let http = TcpListener::bind(format!("{bind}:{port}")).await?;
     let relay = TcpListener::bind(format!("{bind}:{}", port + 1)).await?;
+    let references: Arc<Vec<Bytes>> =
+        Arc::new(page.references.into_iter().map(Bytes::from).collect());
+    let advertise = page.advertise;
     tokio::spawn(async move {
-        let app = Router::new().route("/", get(|| async { Html(PAGE) }));
+        let app = Router::new()
+            .route("/", get(|| async { Html(PAGE) }))
+            .route(
+                "/quality.js",
+                get(|| async { ([(CONTENT_TYPE, "text/javascript")], QUALITY) }),
+            )
+            .route(
+                "/reference/{n}",
+                get(move |Path(n): Path<String>| {
+                    let references = references.clone();
+                    async move {
+                        if n == "count" {
+                            return references.len().to_string().into_response();
+                        }
+                        match n
+                            .strip_suffix(".ivf")
+                            .and_then(|n| n.parse::<usize>().ok())
+                            .and_then(|n| references.get(n))
+                        {
+                            Some(clip) => {
+                                ([(CONTENT_TYPE, "video/x-ivf")], clip.clone()).into_response()
+                            }
+                            None => StatusCode::NOT_FOUND.into_response(),
+                        }
+                    }
+                }),
+            );
         let _ = axum::serve(http, app).await;
     });
     tokio::spawn(async move {
@@ -48,6 +96,7 @@ pub async fn serve(
                 call.clone(),
                 probe.clone(),
                 watch.clone(),
+                advertise.clone(),
                 stream,
             ));
         }
@@ -61,6 +110,7 @@ async fn session(
     call: String,
     probe: Probe,
     watch: Vec<String>,
+    advertise: Option<(String, String)>,
     stream: TcpStream,
 ) {
     let Ok(socket) = tokio_tungstenite::accept_async(stream).await else {
@@ -91,6 +141,11 @@ async fn session(
                             probe.recv(id, v["fields"].clone());
                         }
                     }
+                    Some("quality") => {
+                        if let Some(id) = v["id"].as_str() {
+                            probe.quality(id, v["fields"].clone());
+                        }
+                    }
                     Some("rejoin") => probe.rejoined(
                         &name,
                         v["ms"].as_u64().unwrap_or_default(),
@@ -111,7 +166,10 @@ async fn session(
                         MessageType::Ice => "ice",
                         _ => continue,
                     };
-                    let data = String::from_utf8_lossy(&m.data).into_owned();
+                    let mut data = String::from_utf8_lossy(&m.data).into_owned();
+                    if let Some((private, public)) = &advertise {
+                        data = data.replace(private.as_str(), public);
+                    }
                     if page_tx.send(WsMessage::text(json!({ "t": t, "data": data }).to_string())).await.is_err() {
                         break;
                     }

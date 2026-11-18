@@ -3,6 +3,7 @@
 <title>lesson receiver</title>
 <style>video { width: 160px; height: 90px; background: #222; }</style>
 <body>
+<script src="quality.js"></script>
 <script>
 // A browser in the lesson, as lms-web's call client is: it joins the SFU through the signaling
 // relay of lms-sim (which passes messages on the way the LMS server does), answers the SFU's
@@ -87,6 +88,8 @@ async function onIce(json) {
 	else pending.push(init);
 }
 
+// The video element of each transceiver (by mid), to find the teacher's camera again.
+let els = new Map();
 function show(e) {
 	const el = document.createElement(e.track.kind === 'video' ? 'video' : 'audio');
 	el.autoplay = true;
@@ -94,6 +97,7 @@ function show(e) {
 	el.muted = e.track.kind === 'video';
 	el.srcObject = e.streams[0] ?? new MediaStream([e.track]);
 	document.body.append(el);
+	if (e.track.kind === 'video') els.set(e.transceiver.mid, el);
 	el.play().catch(() => {});
 }
 
@@ -137,6 +141,19 @@ async function start() {
 	pollTimer = setInterval(poll, 1000);
 }
 
+// Whose stream each mid carries now, from the SFU's last description. Chrome names a
+// receiver's track once, when its transceiver is made: a transceiver the SFU reuses for another
+// sender (one whose own stream was removed) keeps reporting the first sender's track name.
+function owners() {
+	const owner = new Map();
+	for (const section of (pc.remoteDescription?.sdp ?? '').split(/\r?\nm=/).slice(1)) {
+		const mid = /\na=mid:(\S+)/.exec(section)?.[1];
+		const track = /\na=msid:\S+ (\S+)/.exec(section)?.[1];
+		if (mid && track) owner.set(mid, track);
+	}
+	return owner;
+}
+
 // ---- what Chrome measures, once a second, written every fifth ----
 let seen = new Map();
 let ticks = 0;
@@ -149,15 +166,7 @@ async function poll() {
 			rtt = r.currentRoundTripTime * 1000;
 		}
 	});
-	// Whose stream each mid carries now, from the SFU's last description. Chrome names a
-	// receiver's track once, when its transceiver is made: a transceiver the SFU reuses for another
-	// sender (one whose own stream was removed) keeps reporting the first sender's track name.
-	const owner = new Map();
-	for (const section of (pc.remoteDescription?.sdp ?? '').split(/\r?\nm=/).slice(1)) {
-		const mid = /\na=mid:(\S+)/.exec(section)?.[1];
-		const track = /\na=msid:\S+ (\S+)/.exec(section)?.[1];
-		if (mid && track) owner.set(mid, track);
-	}
+	const owner = owners();
 	report.forEach((r) => {
 		if (r.type !== 'inbound-rtp') return;
 		const [kind, session] = String(owner.get(r.mid) ?? r.trackIdentifier ?? '').split('_');
@@ -215,6 +224,120 @@ async function poll() {
 	}
 }
 
+// ---- the picture score: the teacher's camera as received against the clip it was made from ----
+// The lesson server's copy of that clip is decoded here (WebCodecs), so that what the browser's own
+// decoder made of the stream is compared with what an undamaged stream decodes to. Twice a second
+// the frame on screen is drawn small and scored (quality.js); every fifth second the scores since
+// the last row go out as one `quality` line: their mean and worst PSNR and SSIM, and the height of
+// the picture (360 is the large layer, 180 the small one).
+const grab = (() => {
+	const canvas = document.createElement('canvas');
+	canvas.width = quality.W;
+	canvas.height = quality.H;
+	const ctx = canvas.getContext('2d', { willReadFrequently: true });
+	ctx.imageSmoothingQuality = 'high';
+	const y = new Uint8Array(quality.W * quality.H);
+	return (source) => {
+		ctx.drawImage(source, 0, 0, quality.W, quality.H);
+		return quality.luma(ctx.getImageData(0, 0, quality.W, quality.H).data, y);
+	};
+})();
+
+async function decodeReference(url) {
+	const res = await fetch(url);
+	if (!res.ok) throw new Error(`${url}: ${res.status}`);
+	const buf = await res.arrayBuffer();
+	const view = new DataView(buf);
+	const chunks = [];
+	for (let at = view.getUint16(6, true); at + 12 <= buf.byteLength; ) {
+		const n = view.getUint32(at, true);
+		chunks.push(new Uint8Array(buf, at + 12, n));
+		at += 12 + n;
+	}
+	const frames = new Array(chunks.length);
+	const decoder = new VideoDecoder({
+		output: (f) => {
+			frames[f.timestamp] = grab(f).slice();
+			f.close();
+		},
+		error: (e) => console.log(`reference decoder: ${e.message}`),
+	});
+	// Chrome shows a WebRTC VP8 picture as limited range BT.601; left unsaid, WebCodecs makes
+	// something else of the same frames (full range: the contrast is off by a sixth, 24 dB at best).
+	decoder.configure({
+		codec: 'vp8',
+		colorSpace: { fullRange: false, matrix: 'smpte170m', primaries: 'smpte170m', transfer: 'smpte170m' },
+	});
+	chunks.forEach((data, i) => decoder.decode(new EncodedVideoChunk({ type: data[0] & 1 ? 'delta' : 'key', timestamp: i, data })));
+	await decoder.flush();
+	if (frames.some((f) => !f)) throw new Error('some frames of the reference did not decode');
+	return { ...quality.prepare(frames), height: view.getUint16(14, true) };
+}
+
+async function scorePicture() {
+	// One clip per layer the teacher sends (the small layer is a render of the test pattern of its
+	// own, not the large layer's picture made small).
+	const clips = [];
+	try {
+		const count = Number(await (await fetch('reference/count')).text());
+		for (let n = 0; n < count; n++) clips.push(await decodeReference(`reference/${n}.ivf`));
+	} catch (e) {
+		console.log(`no picture score: ${e.message}`);
+		return;
+	}
+	console.log(`picture score on: ${clips.map((c) => `${c.height}p ${c.frames.length} frames`).join(', ')}`);
+	let scores = [];
+	// Frames each element has shown, counted by requestVideoFrameCallback, and how many were
+	// there when it was last scored.
+	const shown = new WeakMap();
+	setInterval(() => {
+		if (!pc) return;
+		// A track is named `kind_session_random`.
+		const mine = [...owners()].find(([, track]) => track.startsWith(`video_${teacher}_`))?.[0];
+		const el = els.get(mine);
+		if (!el || !el.videoWidth) return;
+		let seen = shown.get(el);
+		if (!seen) {
+			seen = { count: 0, scored: 0 };
+			shown.set(el, seen);
+			const tick = () => {
+				seen.count++;
+				el.requestVideoFrameCallback(tick);
+			};
+			el.requestVideoFrameCallback(tick);
+			console.log(`picture score: the teacher's camera is ${el.videoWidth}x${el.videoHeight}`);
+		}
+		// A frame is scored once: a frozen picture is the freeze counters' business.
+		if (seen.count === seen.scored) return;
+		seen.scored = seen.count;
+		// The size on the element can already be the next layer's while the frame is still the last one's,
+		// so the frame is scored against every layer's clip and the best match is its.
+		const y = grab(el);
+		const best = clips.map((c) => quality.score(y, c)).reduce((a, s) => (s.psnr > a.psnr ? s : a));
+		scores.push({ ...best, height: el.videoHeight });
+	}, 500);
+	setInterval(() => {
+		if (!scores.length) return;
+		const mean = (k) => scores.reduce((a, s) => a + s[k], 0) / scores.length;
+		const round = (v) => Math.round(v * 1000) / 1000;
+		send({
+			t: 'quality',
+			id: `chrome-${group}${epoch ? `#${epoch}` : ''}/video:teacher`,
+			fields: {
+				media: 'video',
+				group,
+				samples: scores.length,
+				psnr_db: round(mean('psnr')),
+				psnr_min_db: round(Math.min(...scores.map((s) => s.psnr))),
+				ssim: round(mean('ssim')),
+				ssim_min: round(Math.min(...scores.map((s) => s.ssim))),
+				height: scores[scores.length - 1].height,
+			},
+		});
+		scores = [];
+	}, 5000);
+}
+
 function connect() {
 	const mine = new WebSocket(`ws://${location.hostname}:${q.get('ws')}/`);
 	ws = mine;
@@ -225,6 +348,7 @@ function connect() {
 		clearTimeout(failTimer);
 		try { pc.close(); } catch {}
 		seen = new Map();
+		els = new Map();
 		ticks = 0;
 		if (joinedOnce) {
 			lostAt = Date.now();
@@ -249,5 +373,6 @@ function connect() {
 	};
 }
 connect();
+scorePicture();
 </script>
 </body>
