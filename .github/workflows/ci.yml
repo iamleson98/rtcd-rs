@@ -95,7 +95,7 @@ jobs:
       - name: Python (calibration, picture scores)
         run: python3 -m unittest discover -s scripts/lesson-soak -p 'test_*.py'
       - name: Node (the picture score's matching)
-        run: node --test scripts/lesson-soak/chrome
+        run: node --test scripts/lesson-soak/chrome/quality.test.mjs
 
   image:
     name: Docker image (${{ matrix.os }})
