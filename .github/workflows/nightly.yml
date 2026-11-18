@@ -18,6 +18,9 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
   RUST_BACKTRACE: 1
 
+permissions:
+  contents: read
+
 jobs:
   targets:
     name: List the fuzz targets
@@ -26,6 +29,8 @@ jobs:
       names: ${{ steps.list.outputs.names }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - id: list
         run: |
           names=$(awk '/^\[\[bin\]\]/ { bin = 1; next } bin && /^name = / { gsub(/"/, "", $3); print $3; bin = 0 }' fuzz/Cargo.toml | jq -R . | jq -sc .)
@@ -44,6 +49,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6a52aad76a94a5fbc50d567bb5be24419801c1fb # nightly
         with:
           toolchain: nightly
@@ -58,8 +64,9 @@ jobs:
         working-directory: fuzz
         env:
           SECONDS_PER_TARGET: ${{ inputs.fuzz_seconds || '600' }}
+          TARGET: ${{ matrix.target }}
         run: |
-          $GITHUB_WORKSPACE/scripts/ci-run.sh cargo +nightly fuzz run "${{ matrix.target }}" -- \
+          "$GITHUB_WORKSPACE/scripts/ci-run.sh" cargo +nightly fuzz run "$TARGET" -- \
             -max_total_time="$SECONDS_PER_TARGET" -max_len=4096 -rss_limit_mb=4096 -timeout=20
       - name: Upload the crashes
         if: failure()
