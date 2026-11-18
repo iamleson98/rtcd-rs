@@ -113,7 +113,7 @@ jobs:
       # One seed for every service and architecture of this run (not the date: a run can span midnight).
       SEED: ${{ github.run_id }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Kernel modules for the network shaping
@@ -151,7 +151,7 @@ jobs:
       RAMP_CLASSES_PER_STEP: ${{ needs.plan.outputs.ramp_per_step }}
       RAMP_MAX_CLASSES: ${{ needs.plan.outputs.ramp_max }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Ramp rtcd-rs
@@ -198,7 +198,7 @@ jobs:
       # One seed for every service and architecture of this run, so that all meet the same attacks.
       SEED: ${{ github.run_id }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Kernel modules for the network shaping
@@ -239,7 +239,7 @@ jobs:
         profile: [lesson, abuse]
         arch: [x64, arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: actions/download-artifact@v4

@@ -25,7 +25,7 @@ jobs:
     outputs:
       names: ${{ steps.list.outputs.names }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: list
         run: |
           names=$(awk '/^\[\[bin\]\]/ { bin = 1; next } bin && /^name = / { gsub(/"/, "", $3); print $3; bin = 0 }' fuzz/Cargo.toml | jq -R . | jq -sc .)
@@ -41,7 +41,7 @@ jobs:
       matrix:
         target: ${{ fromJSON(needs.targets.outputs.names) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@nightly
