@@ -11,14 +11,13 @@
 # there is no entrypoint script.
 
 # ────────────────────────────── Builder ──────────────────────────────
-# The latest stable Rust when this was written; raise it with --build-arg RUST_VERSION=...
-ARG RUST_VERSION=1.99.1
+# The latest stable Rust when this was written, pinned by digest (dependabot moves tag and digest
+# together).
 # The builder runs on the machine's own platform and cross-compiles for the one the image is for
 # (BuildKit sets TARGETARCH from --platform): an arm64 laptop building the amd64 image needs no
 # emulation, and on an amd64 runner nothing is cross-compiled.
-FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-bookworm AS builder
+FROM --platform=$BUILDPLATFORM rust:1.99.1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS builder
 ARG TARGETARCH
-ARG RUST_VERSION
 # What GET /version reports: image.yml passes the tag, the date and the commit.
 ARG BUILD_NUMBER=dev
 ARG BUILD_DATE=unknown
@@ -45,7 +44,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
       export "CARGO_TARGET_${upper}_LINKER=${gcc_bin}" "CC_$(echo "${triple}" | tr '-' '_')=${gcc_bin}"; \
     fi; \
     RTCD_BUILD_VERSION="${BUILD_NUMBER}" RTCD_BUILD_DATE="${BUILD_DATE}" RTCD_BUILD_HASH="${BUILD_HASH}" \
-    RTCD_RUSTC_VERSION="${RUST_VERSION}" \
+    RTCD_RUSTC_VERSION="$(rustc --version | cut -d' ' -f2)" \
     cargo build --release --locked -p rtcd --target "${triple}"; \
     cp "target/${triple}/release/rtcd" /rtcd
 

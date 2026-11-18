@@ -85,6 +85,9 @@ jobs:
           submodules: recursive
           persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        with:
+          # The BuildKit daemon is pinned (tag and index digest), not whatever the action defaults to.
+          driver-opts: image=moby/buildkit:v0.35.0@sha256:aa632b921ef07411d2cb77292cd34213d4f7b384001d6fceef1e1f25bf9752bb
       - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
@@ -121,8 +124,8 @@ jobs:
             org.opencontainers.image.version=${{ steps.meta.outputs.version }}
             org.opencontainers.image.created=${{ steps.meta.outputs.created }}
             org.opencontainers.image.title=rtcd-rust
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # No build cache: a release is built from scratch, so a poisoned default-branch cache
+          # cannot reach the signed image.
           sbom: true
           provenance: mode=max
           # What GET /version reports.
@@ -195,7 +198,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Create or update the release
+      - name: Create the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IMAGE: ${{ needs.publish.outputs.image }}
@@ -221,7 +224,14 @@ jobs:
             echo '```'
           } > "${notes}"
           if gh release view "${TAG}" --repo "${REPO}" > /dev/null 2>&1; then
-            gh release edit "${TAG}" --repo "${REPO}" --title "${TAG}" --notes-file "${notes}"
+            # A published tag is never rebuilt: an existing release may only be re-run when it names this digest.
+            body="$(gh release view "${TAG}" --repo "${REPO}" --json body -q .body)"
+            if [[ "${body}" == *"${DIGEST}"* ]]; then
+              echo "Release ${TAG} already names ${DIGEST}; nothing to do."
+            else
+              echo "::error::The release ${TAG} names another digest; a published tag is never rebuilt, cut a new version."
+              exit 1
+            fi
           else
             gh release create "${TAG}" --repo "${REPO}" --verify-tag --title "${TAG}" --notes-file "${notes}" --latest
           fi
