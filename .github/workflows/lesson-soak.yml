@@ -126,7 +126,7 @@ jobs:
           scripts/ci-run.sh
           scripts/lesson-soak/run.sh
           ${{ matrix.impl }} ${{ needs.plan.outputs.minutes }} ${{ needs.plan.outputs.cycle }} out
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: lesson-soak-lesson-${{ matrix.impl }}-${{ matrix.arch }}
@@ -171,7 +171,7 @@ jobs:
             echo "### Ceilings (${{ matrix.arch }})"
             cat out/ceiling-*.json out/hold.txt 2>/dev/null || echo "none"
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: lesson-soak-calibrate-${{ matrix.arch }}
@@ -221,7 +221,7 @@ jobs:
           scripts/ci-run.sh
           scripts/lesson-soak/run.sh
           ${{ matrix.impl }} ${{ needs.plan.outputs.minutes }} ${{ needs.plan.outputs.cycle }} out
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: lesson-soak-abuse-${{ matrix.impl }}-${{ matrix.arch }}
@@ -284,7 +284,7 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
           exit 0
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: lesson-soak-report-${{ matrix.profile }}-${{ matrix.arch }}
