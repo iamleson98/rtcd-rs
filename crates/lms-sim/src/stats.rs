@@ -80,7 +80,7 @@ pub fn unix_ms() -> u64 {
 #[derive(Debug, Clone)]
 pub struct Probe {
     pub sink: Arc<Sink>,
-    /// The `impl` of its lines: `rtcd-rs`, `rtcd-go`, with `/chrome` for a browser.
+    /// The `impl` of its lines: `rtcd-rs`, `rtcd-go`, with `/chrome` for a browser (`/chrome-remote` for one across the internet).
     pub imp: String,
     /// `clean` or `impaired`: the network the participant is on.
     pub group: &'static str,
@@ -118,6 +118,12 @@ impl Probe {
 
     pub fn recv(&self, id: &str, fields: Value) {
         self.sink.write(&self.imp, "recv", id, fields);
+    }
+
+    /// How good a browser's picture of a camera looked over the last seconds (PSNR and SSIM against
+    /// the clip it was sent from).
+    pub fn quality(&self, id: &str, fields: Value) {
+        self.sink.write(&self.imp, "quality", id, fields);
     }
 }
 

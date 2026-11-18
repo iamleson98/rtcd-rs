@@ -23,7 +23,9 @@ ARCH=$(uname -m)
 [ "$ARCH" = arm64 ] && ARCH=aarch64
 NET=soak-net
 SFU_IP=172.31.0.2 CLEAN_IP=172.31.0.3 IMPAIRED_IP=172.31.0.4 ABUSE_IP=172.31.0.5
-CHROME_IMPAIRED_IP=172.31.0.6 LOAD_IP=172.31.0.7
+CHROME_IMPAIRED_IP=172.31.0.6 LOAD_IP=172.31.0.7 REMOTE_IP=172.31.0.8
+# The docker options that publish the SFU's media port on the host (run.sh, for REMOTE_CLIENTS=1).
+SFU_PUBLISH=()
 # A class of the background load and of the calibration ramp (`lms-sim load` and `ramp`).
 LOAD_STUDENTS=${LOAD_STUDENTS:-30}
 LOAD_CAMERAS=${LOAD_CAMERAS:-4}
@@ -92,7 +94,8 @@ start_sfu() {
     -e RTCD_LOGGER_CONSOLELEVEL=INFO
   )
   docker run -d --name soak-sfu --network "$NET" --ip "$SFU_IP" "${sfu_cpu[@]}" \
-    --memory=4g --memory-swap=4g --ulimit nofile=65536:65536 "${envs[@]}" ${1+"$@"} "$SFU_IMAGE" >/dev/null
+    --memory=4g --memory-swap=4g --ulimit nofile=65536:65536 ${SFU_PUBLISH[@]+"${SFU_PUBLISH[@]}"} \
+    "${envs[@]}" ${1+"$@"} "$SFU_IMAGE" >/dev/null
   segment_in_software
   for _ in $(seq 60); do
     docker run --rm --network "$NET" "$LESSON_IMAGE" curl -sf "http://$SFU_IP:8045/version" >/dev/null 2>&1 && break

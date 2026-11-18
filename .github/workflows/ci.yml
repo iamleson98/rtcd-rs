@@ -72,6 +72,16 @@ jobs:
       - run: cargo install cargo-audit --locked --version 0.22.2
       - run: $GITHUB_WORKSPACE/scripts/ci-run.sh cargo audit --deny warnings
 
+  soak-scripts:
+    name: Lesson soak scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python (calibration, picture scores)
+        run: python3 -m unittest discover -s scripts/lesson-soak -p 'test_*.py'
+      - name: Node (the picture score's matching)
+        run: node --test scripts/lesson-soak/chrome
+
   image:
     name: Docker image (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

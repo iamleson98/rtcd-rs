@@ -280,6 +280,7 @@ jobs:
             {
               echo "## ${{ matrix.profile }}, ${{ matrix.arch }}"
               cat report/summary.md
+              python3 scripts/lesson-soak/quality.py soak/*/rtcd-*.jsonl
             } >> "$GITHUB_STEP_SUMMARY"
           fi
           exit 0

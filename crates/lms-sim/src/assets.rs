@@ -49,6 +49,28 @@ impl Clip {
             frames,
         })
     }
+
+    /// The clip as an IVF file (what a browser's decoder reads back in the lesson's picture score).
+    pub fn to_ivf(&self) -> Vec<u8> {
+        let mut out =
+            Vec::with_capacity(32 + self.frames.iter().map(|f| 12 + f.0.len()).sum::<usize>());
+        out.extend_from_slice(b"DKIF");
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&32u16.to_le_bytes());
+        out.extend_from_slice(b"VP80");
+        out.extend_from_slice(&(self.width as u16).to_le_bytes());
+        out.extend_from_slice(&(self.height as u16).to_le_bytes());
+        out.extend_from_slice(&self.fps.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&(self.frames.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        for (n, (frame, _)) in self.frames.iter().enumerate() {
+            out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(n as u64).to_le_bytes());
+            out.extend_from_slice(frame);
+        }
+        out
+    }
 }
 
 /// Opus packets, 20 ms each.
@@ -292,6 +314,26 @@ impl Assets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clip_survives_its_own_ivf() {
+        let clip = Clip {
+            width: 640,
+            height: 360,
+            fps: 24,
+            frames: vec![
+                (vec![0, 1, 2], true),
+                (vec![1, 9], false),
+                (vec![3; 40], false),
+            ],
+        };
+        let path = std::env::temp_dir().join(format!("lms-sim-ivf-{}.ivf", std::process::id()));
+        std::fs::write(&path, clip.to_ivf()).unwrap();
+        let back = Clip::read(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!((back.width, back.height, back.fps), (640, 360, 24));
+        assert_eq!(back.frames, clip.frames);
+    }
 
     #[test]
     fn the_clips_are_real_media() {

@@ -16,6 +16,9 @@ const browser = await chromium.launch({
 	args: [
 		// Host candidates carry the address, not an mDNS name: the SFU cannot resolve those.
 		'--disable-features=WebRtcHideLocalIpsWithMdns',
+		// The page is served over plain http from the lesson's address, which is not a secure
+		// context, and the picture score needs WebCodecs to decode its reference.
+		`--unsafely-treat-insecure-origin-as-secure=${new URL(url).origin}`,
 		'--autoplay-policy=no-user-gesture-required',
 		'--mute-audio',
 		'--disable-background-timer-throttling',
