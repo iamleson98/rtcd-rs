@@ -1,75 +1,227 @@
-# Publish the image (ghcr.io/<owner>/rtcd-rust): on a version tag, or by hand from the Actions tab.
-# It is signed keyless with this workflow's identity and carries an SBOM and build provenance.
+# Release pipeline for rtcd-rust: pushing a git tag vMAJOR.MINOR.PATCH on a commit of master builds, tests,
+# publishes and signs ghcr.io/<owner>/rtcd-rust and creates the GitHub Release that names the image digest.
+#
+#   ancestry  the tag's commit must be on master
+#   gate      the repository's own checks (ci.yml, reused)
+#   publish   linux/amd64 + linux/arm64 image, tags vX.Y.Z and sha-<short>, SBOM and provenance
+#             attestations, a keyless cosign signature on the index and on each platform image,
+#             then `cosign verify` against the identity below
+#   release   the GitHub Release of the tag: body = image, digest and the verify command
+#
+# Consumers verify with:
+#   cosign verify ghcr.io/<owner>/rtcd-rust@<digest> \
+#     --certificate-identity https://github.com/<owner>/rtcd-rs/.github/workflows/image.yml@refs/tags/<vX.Y.Z> \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+#
+# Only a tag starts it: there is no manual run.
 name: image
 
 on:
   push:
-    tags: [ 'v*.*.*' ]
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "An extra tag besides sha-<commit> (for example canary-1)"
-        required: false
-        default: ""
+    tags: [ 'v[0-9]+.[0-9]+.[0-9]+' ]
 
 permissions:
   contents: read
 
+concurrency:
+  # Named apart from ci.yml's group (ci-<ref>), which the gate job joins.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
+  IMAGE_NAME: rtcd-rust
+  # sigstore/cosign release, pinned by checksum (the same version and checksum the private deploy workflow uses).
+  COSIGN_VERSION: v3.1.3
+  COSIGN_SHA256: 4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71
 
 jobs:
-  image:
-    name: Build, push and sign
+  ancestry:
+    name: Tag is on master
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the ref
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          semver='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          [[ "${REF_TYPE}" = tag && "${REF_NAME}" =~ ${semver} ]] || fail "${REF_NAME} is not a vMAJOR.MINOR.PATCH tag"
+          git fetch --no-tags origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${DEFAULT_BRANCH}" \
+            || fail "${REF_NAME} (${GITHUB_SHA}) is not on ${DEFAULT_BRANCH}; tag a commit of ${DEFAULT_BRANCH}"
+
+  gate:
+    name: Checks
+    needs: ancestry
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  publish:
+    name: Build, push and sign
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
+      # The OIDC token cosign signs with (keyless: there is no key to leak).
       id-token: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Docker meta
+      - name: Image name and tags
         id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/rtcd-rust
-          tags: |
-            type=sha,prefix=sha-,format=short
-            type=semver,pattern={{raw}}
-            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
-      - name: Build & push
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}"
+          short="$(printf '%s' "${GITHUB_SHA}" | cut -c1-7)"
+          version="${GITHUB_REF_NAME}"
+          tags="${image}:${version}"$'\n'"${image}:sha-${short}"
+          {
+            echo "image=${image}"
+            echo "version=${version}"
+            echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "tags<<TAGS_END"
+            echo "${tags}"
+            echo "TAGS_END"
+          } >> "${GITHUB_OUTPUT}"
+      - name: Build and push
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           # The builder cross-compiles (see the Dockerfile): no emulation, one runner.
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.created }}
+            org.opencontainers.image.title=rtcd-rust
           cache-from: type=gha
           cache-to: type=gha,mode=max
           sbom: true
           provenance: mode=max
-      - uses: sigstore/cosign-installer@v3
-      - name: Sign the image
-        env:
-          IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/rtcd-rust
-          DIGEST: ${{ steps.build.outputs.digest }}
+          # What GET /version reports.
+          build-args: |
+            BUILD_NUMBER=${{ steps.meta.outputs.version }}
+            BUILD_DATE=${{ steps.meta.outputs.created }}
+            BUILD_HASH=${{ github.sha }}
+      - name: Install cosign
         run: |
-          cosign sign --yes "${IMAGE}@${DIGEST}"
+          set -euo pipefail
+          curl -fsSL -o "${RUNNER_TEMP}/cosign" \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          echo "${COSIGN_SHA256}  ${RUNNER_TEMP}/cosign" | sha256sum --check --strict
+          sudo install -m 0755 "${RUNNER_TEMP}/cosign" /usr/local/bin/cosign
+      # The tag names a multi-architecture index: the index and the image of each platform are
+      # signed (a node pulls the platform image through the index, but a scanner or a person may
+      # name either), and an index that lacks one of the two architectures stops the release here.
+      # The attestation entries (SBOM, provenance) stay unsigned: they are evidence stored beside
+      # the images, not something a node runs.
+      - name: Sign the image
+        id: sign
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          INDEX: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          platforms="$(docker buildx imagetools inspect "${IMAGE}@${INDEX}" --raw \
+            | jq -r '.manifests[] | select(.platform.os == "linux") | "\(.platform.architecture) \(.digest)"')"
+          for arch in amd64 arm64; do
+            grep -q "^${arch} " <<<"${platforms}" || { echo "::error::${IMAGE}@${INDEX} has no linux/${arch} image"; exit 1; }
+          done
+          digests="${INDEX} $(awk '{print $2}' <<<"${platforms}" | tr '\n' ' ')"
+          for digest in ${digests}; do
+            cosign sign --yes "${IMAGE}@${digest}"
+          done
+          echo "digests=${digests}" >> "${GITHUB_OUTPUT}"
+      # The consumer's check, run here with the identity it will use: this workflow's file at the
+      # ref that ran it (refs/tags/vX.Y.Z for a release).
+      - name: Verify the signatures
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGESTS: ${{ steps.sign.outputs.digests }}
+        run: |
+          set -euo pipefail
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/image.yml@${GITHUB_REF}"
+          for digest in ${DIGESTS}; do
+            cosign verify "${IMAGE}@${digest}" \
+              --certificate-identity "${identity}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+            echo "verified ${IMAGE}@${digest} as ${identity}"
+          done
+      - name: Summary
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
           {
             echo "### rtcd-rust"
             echo
             echo "- image: \`${IMAGE}@${DIGEST}\`"
-            echo "- tags: \`$(echo "${{ steps.meta.outputs.tags }}" | tr '\n' ' ')\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo "- tags: \`$(echo "${TAGS}" | tr '\n' ' ')\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  release:
+    name: GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ needs.publish.outputs.image }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          notes="$(mktemp)"
+          {
+            echo "Image: \`${IMAGE}@${DIGEST}\`"
+            echo
+            echo "- digest (multi-architecture index: linux/amd64, linux/arm64): \`${DIGEST}\`"
+            echo "- tags: \`${TAG}\`, \`sha-${GITHUB_SHA:0:7}\`"
+            echo "- SBOM and build provenance are attached to the image in the registry."
+            echo
+            echo "Verify the signature:"
+            echo
+            echo '```'
+            echo "cosign verify ${IMAGE}@${DIGEST} \\"
+            echo "  --certificate-identity https://github.com/${REPO}/.github/workflows/image.yml@refs/tags/${TAG} \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo '```'
+          } > "${notes}"
+          if gh release view "${TAG}" --repo "${REPO}" > /dev/null 2>&1; then
+            gh release edit "${TAG}" --repo "${REPO}" --title "${TAG}" --notes-file "${notes}"
+          else
+            gh release create "${TAG}" --repo "${REPO}" --verify-tag --title "${TAG}" --notes-file "${notes}" --latest
+          fi
