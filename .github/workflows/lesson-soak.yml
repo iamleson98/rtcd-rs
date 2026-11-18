@@ -113,7 +113,7 @@ jobs:
       # One seed for every service and architecture of this run (not the date: a run can span midnight).
       SEED: ${{ github.run_id }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
       - name: Kernel modules for the network shaping
@@ -126,7 +126,7 @@ jobs:
           scripts/ci-run.sh
           scripts/lesson-soak/run.sh
           ${{ matrix.impl }} ${{ needs.plan.outputs.minutes }} ${{ needs.plan.outputs.cycle }} out
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: lesson-soak-lesson-${{ matrix.impl }}-${{ matrix.arch }}
@@ -151,7 +151,7 @@ jobs:
       RAMP_CLASSES_PER_STEP: ${{ needs.plan.outputs.ramp_per_step }}
       RAMP_MAX_CLASSES: ${{ needs.plan.outputs.ramp_max }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
       - name: Ramp rtcd-rs
@@ -171,7 +171,7 @@ jobs:
             echo "### Ceilings (${{ matrix.arch }})"
             cat out/ceiling-*.json out/hold.txt 2>/dev/null || echo "none"
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: lesson-soak-calibrate-${{ matrix.arch }}
@@ -198,7 +198,7 @@ jobs:
       # One seed for every service and architecture of this run, so that all meet the same attacks.
       SEED: ${{ github.run_id }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
       - name: Kernel modules for the network shaping
@@ -206,7 +206,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)" || true
           sudo modprobe ifb sch_netem sch_htb act_mirred cls_u32 || true
           lsmod | grep -E '^(ifb|sch_netem|sch_htb|act_mirred|cls_u32) ' || true
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: lesson-soak-calibrate-${{ matrix.arch }}
           path: calibrate
@@ -221,7 +221,7 @@ jobs:
           scripts/ci-run.sh
           scripts/lesson-soak/run.sh
           ${{ matrix.impl }} ${{ needs.plan.outputs.minutes }} ${{ needs.plan.outputs.cycle }} out
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: lesson-soak-abuse-${{ matrix.impl }}-${{ matrix.arch }}
@@ -239,10 +239,10 @@ jobs:
         profile: [lesson, abuse]
         arch: [x64, arm64]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: lesson-soak-${{ matrix.profile }}-*-${{ matrix.arch }}
           path: soak
@@ -284,7 +284,7 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
           exit 0
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: lesson-soak-report-${{ matrix.profile }}-${{ matrix.arch }}
