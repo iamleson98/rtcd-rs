@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # A new release of the WebRTC library (vendor/rtc, a submodule) arrives as a pull request.
+  - package-ecosystem: gitsubmodule
+    directory: /
+    schedule:
+      interval: daily
+  # The actions in .github/workflows are pinned to a commit; this moves the pins (the version
+  # stays in the comment).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+  # The base images of the Dockerfile, pinned by digest.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly

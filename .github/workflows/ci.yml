@@ -8,9 +8,16 @@ on:
     branches: [ master ]
   pull_request:
     branches: [ master ]
+  # image.yml runs the whole suite as the gate of a release.
+  workflow_call:
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Not ${{ github.workflow }}: called from image.yml that is the caller's name, which is also
+  # the start of the caller's own concurrency group.
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -22,14 +29,14 @@ jobs:
     name: Format and lints
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - run: $GITHUB_WORKSPACE/scripts/ci-run.sh cargo fmt --all --check
-      - run: $GITHUB_WORKSPACE/scripts/ci-run.sh cargo clippy --workspace --all-targets --locked -- -D warnings
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - run: ./scripts/ci-run.sh cargo fmt --all --check
+      - run: ./scripts/ci-run.sh cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -39,44 +46,52 @@ jobs:
       matrix:
         os: [ ubuntu-latest, ubuntu-24.04-arm, macos-latest ]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - run: $GITHUB_WORKSPACE/scripts/ci-run.sh cargo test --workspace --locked --no-fail-fast
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal
+      - run: ./scripts/ci-run.sh cargo test --workspace --locked --no-fail-fast
 
   fuzz:
     name: Fuzz targets (a short run each)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@nightly
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup toolchain install nightly --profile minimal
       - run: cargo install cargo-fuzz --locked --version 0.13.2
       - name: Run every target for a minute
         working-directory: fuzz
         run: |
           for t in $(cargo +nightly fuzz list); do
-            $GITHUB_WORKSPACE/scripts/ci-run.sh cargo +nightly fuzz run "$t" -- -max_total_time=60 -max_len=4096
+            "${GITHUB_WORKSPACE}"/scripts/ci-run.sh cargo +nightly fuzz run "$t" -- -max_total_time=60 -max_len=4096
           done
 
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal
       - run: cargo install cargo-audit --locked --version 0.22.2
-      - run: $GITHUB_WORKSPACE/scripts/ci-run.sh cargo audit --deny warnings
+      - run: ./scripts/ci-run.sh cargo audit --deny warnings
 
   soak-scripts:
     name: Lesson soak scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Python (calibration, picture scores)
         run: python3 -m unittest discover -s scripts/lesson-soak -p 'test_*.py'
       - name: Node (the picture score's matching)
@@ -90,15 +105,20 @@ jobs:
       matrix:
         os: [ ubuntu-latest, ubuntu-24.04-arm ]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
+          persist-credentials: false
       - name: Build
-        run: docker build -t rtcd-rust .
-      - name: Start through the entrypoint and ask for the version
+        run: docker build --build-arg BUILD_NUMBER=ci-test --build-arg BUILD_HASH="${GITHUB_SHA}" -t rtcd-rust .
+      - name: Start with the reference config and ask for the version
         run: |
-          $GITHUB_WORKSPACE/scripts/ci-run.sh bash -c '
-            docker run -d --name rtcd -p 8045:8045 -e RTCD_ICE_HOST_OVERRIDE=127.0.0.1 rtcd-rust
+          # shellcheck disable=SC2016  # the inner bash expands GITHUB_WORKSPACE
+          ./scripts/ci-run.sh bash -c '
+            docker run -d --name rtcd -p 8045:8045 \
+              -v "${GITHUB_WORKSPACE}/deploy/rtcd.toml:/etc/rtcd/rtcd.toml:ro" \
+              -e RTCD_API_SECURITY_ALLOWSELFREGISTRATION=true -e RTCD_RTC_ICEHOSTOVERRIDE=127.0.0.1 rtcd-rust
             curl --fail --retry 20 --retry-delay 1 --retry-connrefused --retry-all-errors http://127.0.0.1:8045/version \
+              | tee /dev/stderr | grep -q "ci-test" \
               || { docker ps -a; docker logs rtcd; exit 1; }
             docker logs rtcd'

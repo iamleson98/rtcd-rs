@@ -11,7 +11,7 @@ changing the LMS server or the web client.
 |---|---|
 | Control plane | the same HTTP API (`/version`, `/register`, `/login`, `/unregister`, `/system`, `/calls/...`, `/metrics`) and the same msgpack websocket messages. Checked against golden vectors produced by the Go code (`crates/rtcd-proto/tests/golden`) and by the original Go service client |
 | Configuration | the same `config.toml` keys and the same `RTCD_*` environment variables, including `:8045`-style addresses, `ice_host_override` NAT maps, STUN discovery, TURN credential generation, TLS |
-| Container | the `Dockerfile` uses the LMS image's entrypoint and config template, so environment, ports (8045, 8443), user (2001) and the `/data` volume are unchanged |
+| Container | the `Dockerfile` runs `rtcd --config /etc/rtcd/rtcd.toml` as the Go image's service does; the `RTCD_*` environment, ports (8045, 8443), user (2001) and the `/data` volume are unchanged, and the config file is mounted (`deploy/rtcd.toml` is the reference) |
 | Data | a data directory the Go rtcd used is opened as is: its registered clients are taken over on the first start (`crates/rtcd/src/legacy.rs`) |
 | Extension | a data channel frame of type 10 (`SharpScreen(true)`) asks for a shared screen at its large layer whatever the bandwidth estimate says, until the receiver's link is starved. Only the standalone session recorder, since removed, sent it; the Go service never sees it from a browser |
 | Media | ICE-lite over UDP and ICE-TCP, DTLS-SRTP, the `calls-dc` data channel (lock protocol, zlib SDP, media map), Opus voice with VAD events, VP8 camera and screen share with simulcast layer switching that needs no renegotiation, `video_subscribe`, keyframe relay, bandwidth-driven screen layer choice |
@@ -466,10 +466,10 @@ packet, so it is right whatever the packet time is.
 
 - Bring it in as a submodule: `git submodule add https://github.com/iamleson98/rtcd-rs.git rtcd-rust`
   and `git submodule update --init --recursive` (the `rtc` submodule comes with it).
-- The image takes the environment, ports (8045, 8443), user (2001) and `/data` volume of `lms-rtcd`,
-  and the entrypoint and config template are the ones that image uses: the Kubernetes manifests change
-  only in the image name. Clients registered with the Go rtcd in `/data` are taken over on the first
-  start.
+- The image takes the environment, ports (8045, 8443), user (2001) and `/data` volume of `lms-rtcd`.
+  It carries no config file: mount one at `/etc/rtcd/rtcd.toml` (`deploy/rtcd.toml` is the reference;
+  the `RTCD_*` variables override it). Clients registered with the Go rtcd in `/data` are taken over
+  on the first start.
 - Its instances are found by the server's DNS discovery like the Go ones, and `GET /system` lets the
   server put new calls on the lighter instance.
 - The web client and the server's `custom_calls_*` actions need no change (tested in Chrome, Firefox and Safari). rtcd records calls itself (below).
@@ -486,7 +486,7 @@ crates/recorder     the files of a session recording (WebM from a call's streams
 crates/lms-sim      a stand-in LMS around a real rtcd with synthetic participants, to test and measure its recording
 vendor/rtc          the WebRTC stack, pinned (git submodule)
 compat/golden       regenerates the golden vectors from the Go sources
-deploy/             the entrypoint and config template the image uses
+deploy/             the reference rtcd.toml the image's container mounts; the entrypoint and config template the overload lab's image uses
 ```
 
 ## Build, test, run
@@ -499,9 +499,10 @@ cargo test --workspace
 ```
 
 ```bash
-docker build -t rtcd-rust .                     # the Rust version is a build argument (RUST_VERSION)
+docker build -t rtcd-rust .                     # build arguments: RUST_VERSION, BUILD_NUMBER, BUILD_DATE, BUILD_HASH
 docker run --rm -p 8045:8045 -p 8443:8443/udp -p 8443:8443 \
-  -e RTCD_ICE_HOST_OVERRIDE=<public ip> rtcd-rust
+  -v "$PWD/deploy/rtcd.toml:/etc/rtcd/rtcd.toml:ro" \
+  -e RTCD_API_SECURITY_ALLOWSELFREGISTRATION=true -e RTCD_RTC_ICEHOSTOVERRIDE=<public ip> rtcd-rust
 ```
 
 ### What the engine costs per packet
@@ -519,8 +520,10 @@ profiling.
 ## Continuous integration
 
 `ci.yml` runs rustfmt, clippy (warnings are errors), the whole test suite on Linux and macOS, a
-dependency audit, and the Docker image started through its entrypoint. `image.yml` publishes
-`ghcr.io/<owner>/rtcd-rust` on a version tag. The Go-versus-Rust comparison runs in the webrtc
+dependency audit, and the Docker image started with the reference config. `image.yml` runs on a
+version tag `vX.Y.Z` on `master` (nothing else starts it): it runs `ci.yml`, then publishes
+`ghcr.io/<owner>/rtcd-rust` (amd64 and arm64, signed with cosign, with an SBOM and provenance) and
+creates the GitHub Release that names the digest. The Go-versus-Rust comparison runs in the webrtc
 repository.
 
 ## Recording inside rtcd

@@ -1,0 +1,31 @@
+# rtcd settings that are the same everywhere: the reference for /etc/rtcd/rtcd.toml, which the
+# container reads. The image does not bake it in: mount it (a Kubernetes ConfigMap in production).
+# Anything that differs per environment is an RTCD_* environment variable on the container and
+# wins over this file; the variable is the setting's path in upper case (ice_host_override under
+# [rtc] is RTCD_RTC_ICEHOSTOVERRIDE).
+#
+# Every setting and its default: crates/rtcd/src/config.rs.
+
+[api.http]
+# The control API (HTTP + WebSocket) and /metrics. Reachable only inside the
+# cluster network: no ingress route exposes it.
+listen_address = ":8045"
+
+[rtc]
+# Media ports. They must match the ports the pod publishes on the node.
+ice_port_udp = 8443
+ice_port_tcp = 8443
+# Public STUN servers, used to discover the node's address and handed to
+# callers as the default STUN.
+ice_servers = [{ urls = ["stun:stun.l.google.com:19302"] }]
+
+[store]
+# Registered client credentials persist here: keep /data on a volume so a
+# restarted SFU does not orphan the server's registration.
+data_source = "/data/rtcd_db"
+
+[logger]
+enable_console = true
+console_level = "INFO"
+# Containers log to stdout only.
+enable_file = false
