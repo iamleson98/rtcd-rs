@@ -72,7 +72,9 @@ pub struct EngineConfig {
     pub max_bitrate: u64,
     /// Whether the SFU is an ICE-lite agent (it answers checks, never sends them).
     pub ice_lite: bool,
-    /// Whether to pace video sends to each participant's estimated rate. Off matches the Go rtcd.
+    /// Whether to pace video sends: a frame leaves at about twice the rate the participant was sent
+    /// video over the last second, so that it does not arrive as one burst that holds back their
+    /// voices, which are never paced. Off sends each frame at once, as the Go rtcd does.
     pub pacing: bool,
     /// How many voices of one call are forwarded when more microphones are open than that: the
     /// loudest (see `loudest`). 0 forwards every voice, as the Go rtcd does.
@@ -117,7 +119,7 @@ impl Default for EngineConfig {
             min_bitrate: 250_000,
             max_bitrate: 6_000_000,
             ice_lite: true,
-            pacing: false,
+            pacing: true,
             audio_loudest: 0,
             camera_budget: true,
             audio_ptime_ms: 0,
