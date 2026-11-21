@@ -3,7 +3,7 @@
 //! for loss recovery, reports and send-side congestion control.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rtc::interceptor::{
     CongestionControlBuilder, KeyframeRequestForwarderBuilder, NackGeneratorBuilder,
@@ -110,6 +110,21 @@ fn media_engine() -> Result<MediaEngine> {
 
 /// Packets an SRTP receiver remembers, to refuse a replay and to accept a late arrival.
 const SRTP_REPLAY_WINDOW: usize = 2048;
+/// The pacer sends video at this many times what it sent over the last second: room for a
+/// keyframe and a rising layer, and a burst that leaves in about half the time it would take the
+/// link, so [`crate::bwe`] still reads the link's rate from it.
+const PACE_RATE_MULTIPLIER: f64 = 2.0;
+/// The pace before anything was sent and its floor, in bits per second. A burst measures what the
+/// link carries only if it leaves faster than the link takes it (see `TRAIN_MAX_DEPARTURE_SHARE` in
+/// [`crate::bwe`]); a pacer slower than that never lets the estimate see the link, and the layer
+/// choice, finding nothing known of it, tries the large layer again every few seconds. At 3 Mb/s, a
+/// link of up to about 2.4 Mb/s is read from its bursts; a faster one is not held by the floor.
+/// A floor below about 2.4 Mb/s would put each 1500 byte packet more than [`crate::bwe`]'s
+/// 5 ms burst gap after the one before, so a frame would never form a burst and the link would not
+/// be measured.
+const PACE_MIN_BITRATE: f64 = 3_000_000.0;
+/// What one burst covers at the pace rate: a few packets, so a voice packet waits for at most one.
+const PACE_BURST_WINDOW: Duration = Duration::from_millis(5);
 
 /// A new peer connection for a session, and the handle to its bandwidth estimate.
 pub(crate) fn new_peer(
@@ -130,6 +145,9 @@ pub(crate) fn new_peer(
             LimitedNackResponder::new(
                 NackResponderBuilder::new()
                     .with_size(cfg.nack_buffer_size)
+                    // A receiver that lost packets in an outage asks for all of them when the path
+                    // is back; after a second a frame they belonged to has been given up on.
+                    .with_max_packet_age(Duration::from_secs(1))
                     .build(),
                 cfg.egress.clone(),
             ),
@@ -154,7 +172,14 @@ pub(crate) fn new_peer(
                 .build(),
         );
     if cfg.pacing {
-        registry = registry.with(Slot::Pacer, PacerBuilder::new().build());
+        registry = registry.with(
+            Slot::Pacer,
+            PacerBuilder::new()
+                .with_send_rate_multiplier(PACE_RATE_MULTIPLIER)
+                .with_min_bitrate(PACE_MIN_BITRATE)
+                .with_burst_window(PACE_BURST_WINDOW)
+                .build(),
+        );
     }
     // Only video takes part in the bandwidth estimate (it picks the screen share layer). Numbering
     // audio too would add 8 bytes to every voice packet, which is about 65 bytes, in both

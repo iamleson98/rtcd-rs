@@ -1,8 +1,13 @@
 <!doctype html>
 <meta charset="utf-8">
 <title>lesson receiver</title>
-<style>video { width: 160px; height: 90px; background: #222; }</style>
+<style>
+video { width: 160px; height: 90px; background: #222; }
+#tap { position: fixed; inset: 0; z-index: 1; border: 0; font: 600 24px sans-serif; background: #123; color: #fff; }
+</style>
 <body>
+<!-- Safari plays no sound before a tap; a tap starts every element that was refused. -->
+<button id="tap">Tap to start</button>
 <script src="quality.js"></script>
 <script>
 // A browser in the lesson, as lms-web's call client is: it joins the SFU through the signaling
@@ -100,6 +105,11 @@ function show(e) {
 	if (e.track.kind === 'video') els.set(e.transceiver.mid, el);
 	el.play().catch(() => {});
 }
+
+document.getElementById('tap').onclick = (e) => {
+	for (const el of document.querySelectorAll('video, audio')) el.play().catch(() => {});
+	e.currentTarget.hidden = true;
+};
 
 async function start() {
 	pc = new RTCPeerConnection({ iceServers: [], bundlePolicy: 'max-bundle' });
@@ -218,6 +228,10 @@ async function poll() {
 				rtt_ms: rtt,
 				// Samples the browser made up for the ones that did not come, at 48 kHz.
 				audio_gap_ms: audio ? Math.round((r.concealedSamples ?? 0) / 48) : 0,
+				// How long Chrome held a voice packet before playing it, on average since the start.
+				playout_delay_ms: audio && r.jitterBufferEmittedCount > 0
+					? Math.round((r.jitterBufferDelay / r.jitterBufferEmittedCount) * 10000) / 10
+					: null,
 				stalled: now - changed > 2000,
 			},
 		});

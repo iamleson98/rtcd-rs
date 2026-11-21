@@ -40,6 +40,7 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for LimitedNackResponder {
     type Time = Instant;
 
     fn handle_read(&mut self, mut msg: TaggedPacket) -> Result<(), Self::Error> {
+        let mut charged = 0;
         if let Packet::Rtcp(packets) = &mut msg.message.packet {
             let (node, now) = (&self.node, msg.now);
             // What is left of the compound packet is still handed on: the report in it is read
@@ -47,10 +48,23 @@ impl Protocol<TaggedPacket, TaggedPacket, ()> for LimitedNackResponder {
             packets.retain(|p| {
                 p.as_any()
                     .downcast_ref::<TransportLayerNack>()
-                    .is_none_or(|nack| node.allow_retransmits(requested(nack), now))
+                    .is_none_or(|nack| {
+                        let asked = requested(nack);
+                        let allowed = node.allow_retransmits(asked, now);
+                        if allowed {
+                            charged += asked;
+                        }
+                        allowed
+                    })
             });
         }
-        self.inner.handle_read(msg)
+        // The request was charged whole; the responder may skip part of it (too old to help, over
+        // its own budget), and what it did not send is given back.
+        let before = self.inner.stats().retransmitted_packets;
+        let result = self.inner.handle_read(msg);
+        let sent = self.inner.stats().retransmitted_packets - before;
+        self.node.refund_retransmits(charged.saturating_sub(sent));
+        result
     }
 
     fn poll_read(&mut self) -> Option<Self::Rout> {
@@ -153,6 +167,20 @@ mod tests {
         let mut r = LimitedNackResponder::new(NackResponderBuilder::new().build(), gauge.clone());
         r.handle_read(feedback(now)).unwrap();
         assert_eq!(left(r), (1, 1));
+        assert_eq!(gauge.retransmits_limited(), 0);
+    }
+
+    #[test]
+    fn what_the_responder_does_not_resend_is_not_charged() {
+        let gauge = Arc::new(Gauge::default());
+        let now = Instant::now();
+        // Nothing was sent, so the responder has nothing to answer a request with.
+        let mut r = LimitedNackResponder::new(NackResponderBuilder::new().build(), gauge.clone());
+        // The bucket holds 500 packets: 29 requests of 17 fit, a 30th would find it empty, if each
+        // were charged whole and not given back.
+        for _ in 0..100 {
+            r.handle_read(feedback(now)).unwrap();
+        }
         assert_eq!(gauge.retransmits_limited(), 0);
     }
 

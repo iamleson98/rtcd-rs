@@ -54,11 +54,14 @@ const TREND_SPAN: Duration = Duration::from_millis(500);
 /// a few megabits a second, a kilobyte every millisecond or two, and frames are tens of
 /// milliseconds apart.
 const BURST_GAP: Duration = Duration::from_millis(5);
-/// A burst says what the link carries only if it left together: over less than this, or a quarter
-/// of the time it took to arrive. One that left spread out (a sharer's pacer sending frames a
-/// kilobyte at a time) arrives at the rate it left at, however much more the link carries.
+/// A burst says what the link carries only if it left together: over less than this, or four
+/// fifths of the time it took to arrive. One that left spread out (a sharer's pacer sending frames
+/// a kilobyte at a time) arrives at the rate it left at, however much more the link carries. The
+/// share has room for the SFU's own pacer, which sends a frame at about twice the rate it sent
+/// the second before: on a link that carries 1.7 times that, a burst leaves over 0.6 of the time
+/// it takes to arrive and still shows the link's rate.
 const TRAIN_MAX_DEPARTURE: Duration = Duration::from_millis(1);
-const TRAIN_MAX_DEPARTURE_SHARE: f64 = 0.25;
+const TRAIN_MAX_DEPARTURE_SHARE: f64 = 0.8;
 /// A burst of fewer packets than this, or that arrived over less than [`TRAIN_MIN_SPREAD`] (the
 /// feedback's clock counts quarter milliseconds), says nothing of the link; the median of the last
 /// [`TRAINS`] that do, less than [`TRAIN_AGE`] old, is its rate.
@@ -759,6 +762,23 @@ mod tests {
         assert_eq!(snapshot.capacity, None, "not the link's rate");
         let link = snapshot.link.expect("but what the path carried at least");
         assert!((1_900_000.0..2_100_000.0).contains(&link), "{link}");
+    }
+
+    #[test]
+    fn a_burst_that_left_in_half_the_time_it_took_to_arrive_still_gives_the_link_rate() {
+        let (mut gcc, estimate) = SharedGcc::new(300_000.0, 100_000.0, 4_000_000.0);
+        let t0 = Instant::now();
+        // Frames of 10 packets that the SFU's pacer sends 2 ms apart (4 Mbit/s) over a link that
+        // takes 5 ms a packet: each leaves over 18 ms and arrives over 45 ms, 0.4 of it.
+        for frame in 0..20u64 {
+            let at = frame * 100;
+            let reports: Vec<_> = (0..10)
+                .map(|n| timed(t0, at + n * 2, 115 + n * 3))
+                .collect();
+            gcc.on_reports(t0 + Duration::from_millis(at + 115 + 100), &reports);
+        }
+        let c = estimate.snapshot().capacity.expect("a sample");
+        assert!((1_550_000.0..1_650_000.0).contains(&c), "{c}");
     }
 
     #[test]

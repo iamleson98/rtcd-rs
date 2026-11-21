@@ -582,6 +582,36 @@ fn assert_nothing_paused(c: &mut Class, kept: usize) {
 }
 
 #[test]
+fn with_pacing_on_a_good_link_pauses_no_camera_and_sends_each_what_it_sends() {
+    // The pacer spreads each frame out, which the link's estimate must not mistake for a narrow
+    // link: nothing is paused and every camera gets what it sends.
+    assert_nothing_paused(&mut Class::new(limited(50_000_000)), 10);
+}
+
+#[test]
+fn with_pacing_on_a_fast_link_with_jitter_pauses_no_camera_and_keeps_the_large_layer() {
+    // Jitter spreads what leaves together out over 20 ms: the bursts must not read as a narrow
+    // link, so no camera is paused and the host stays on its large layer.
+    let mut path = limited(20_000_000);
+    path.jitter = Duration::from_millis(20);
+    let mut c = Class::production(path);
+    c.run(40);
+    let from = c.w.browsers[c.viewer].rtp.len();
+    let line = c.timeline(30);
+    let paused: Vec<usize> = (0..c.senders.len())
+        .map(|k| c.longest_pause(&line, k))
+        .collect();
+    assert!(paused.iter().all(|&n| n == 0), "cameras paused: {paused:?}");
+    let teacher = c.teacher_packets(from);
+    let large = teacher.iter().filter(|&&(l, _)| l == Layer::High).count();
+    assert!(
+        large * 10 >= teacher.len() * 9,
+        "{large} of {} teacher packets were the large layer",
+        teacher.len()
+    );
+}
+
+#[test]
 fn a_wide_link_that_loses_a_fifth_of_the_packets_pauses_no_camera() {
     // Random loss does not fall as the rate does: cutting the cameras for it only pauses them.
     let mut path = limited(50_000_000);
@@ -742,7 +772,8 @@ fn with_the_camera_budget_off_every_camera_is_sent_whole_whatever_the_link_drops
     let seen = c.measure(30);
     seen.print("budget off", 30);
     assert_eq!(seen.packets.len(), STUDENTS + 1);
-    assert!(seen.drops > 5_000, "{} dropped", seen.drops);
+    // (Frames sent spread out and retransmissions held back leave the link fewer to drop.)
+    assert!(seen.drops > 4_000, "{} dropped", seen.drops);
 }
 
 /// A link that carries the host's small layer and a student or two, but not its large layer

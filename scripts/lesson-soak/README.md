@@ -59,7 +59,7 @@ Everything is JSONL, one object per line with `ts` (unix ms), `impl`, `arch` (`x
 `kind` and `id`; the shared report tool (`vendor/rtc/benchmarks/soak/report.py`) reads it.
 
 * `recv`, every 5 s per received track, counters since the start: `frames`, `freezes`, `freeze_ms`,
-  `packets`, `bytes`, `duplicates`, `lost`, `nack`, `pli`, `jitter_ms`, `rtt_ms`, `audio_gap_ms`, `stalled`.
+  `packets`, `bytes`, `duplicates`, `lost`, `nack`, `pli`, `jitter_ms`, `rtt_ms`, `audio_gap_ms`, `stalled`; Chromium rows of voices also carry `playout_delay_ms` (its mean jitter buffer delay).
   `packets` counts every arrival; `lost` is what the sequence numbers say never came, after the
   retransmissions and without the duplicates, so a copy never hides a loss.
   `impl` is `rtcd-rs` or `rtcd-go` for the synthetic receivers (`lms_sim::stats`) and `rtcd-rs/chrome` or

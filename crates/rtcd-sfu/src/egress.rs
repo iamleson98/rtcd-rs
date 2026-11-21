@@ -427,6 +427,14 @@ impl Gauge {
         true
     }
 
+    /// Gives back `packets` of what [`Gauge::allow_retransmits`] charged for a request that was
+    /// answered in part: the responder skipped them (too old to help, or over its own budget), and
+    /// they never reached the wire.
+    pub fn refund_retransmits(&self, packets: u64) {
+        let mut b = self.rtx.lock().unwrap_or_else(|e| e.into_inner());
+        b.level += packets as f64;
+    }
+
     /// Retransmissions asked for and not answered since the node started (see
     /// [`Gauge::allow_retransmits`]).
     pub fn retransmits_limited(&self) -> u64 {
@@ -1562,6 +1570,19 @@ Udp6InCsumErrors                \t0\n";
             );
         }
         assert_eq!(g.retransmits_limited(), 0);
+    }
+
+    #[test]
+    fn what_the_responder_did_not_resend_is_given_back() {
+        let g = Gauge::default();
+        let now = Instant::now();
+        // The bucket holds 500 packets (the floor) on a quiet node.
+        assert!(g.allow_retransmits(500, now));
+        assert!(!g.allow_retransmits(1, now), "used up");
+        g.refund_retransmits(300);
+        assert!(g.allow_retransmits(200, now), "300 were given back");
+        assert!(g.allow_retransmits(100, now));
+        assert!(!g.allow_retransmits(1, now));
     }
 
     #[test]
