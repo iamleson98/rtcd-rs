@@ -27,8 +27,8 @@ use rtc::peer_connection::{RTCPeerConnection, RTCPeerConnectionBuilder};
 use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtp_transceiver::rtp_sender::{
-    RTCRtpCodec, RTCRtpCodingParameters, RTCRtpEncodingParameters, RTCRtpHeaderExtensionCapability,
-    RtpCodecKind,
+    RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
+    RTCRtpHeaderExtensionCapability, RtpCodecKind,
 };
 use rtc::rtp_transceiver::{
     RTCRtpReceiverId, RTCRtpSenderId, RTCRtpTransceiverDirection, RTCRtpTransceiverInit,
@@ -38,6 +38,7 @@ use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use rtc::statistics::StatsSelector;
 use rtcd_proto::dc::DcMessage;
 use rtcd_proto::{ClientMessage, JoinRequest, Message, MessageType, SessionRef};
+use rtcd_sfu::red::{self, MIME_TYPE_RED, RED_FMTP, RED_PAYLOAD_TYPE};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -90,6 +91,8 @@ pub struct Spec {
     pub udp_base: Option<u16>,
     /// Sends datagrams of MTU size and over at intervals (see [`Ctl::Mtu`]) from the start.
     pub mtu: bool,
+    /// Negotiates redundant audio (RFC 2198) and counts the voice packets it recovers.
+    pub red: bool,
     /// Seeds what the participant does at random (the hostile behaviours, the sizes of the MTU
     /// datagrams).
     pub seed: u64,
@@ -365,6 +368,7 @@ struct Env {
     udp_base: Option<u16>,
     seed: u64,
     tally: Option<Arc<AtomicU64>>,
+    red: bool,
 }
 
 /// What a participant has been told to do, which a new try picks up where the last left off.
@@ -466,6 +470,7 @@ pub async fn join(
         udp_base: spec.udp_base,
         seed: spec.seed,
         tally: spec.tally.clone(),
+        red: spec.red,
     };
     let mut persist = Persist {
         voice: spec.voice,
@@ -558,6 +563,22 @@ async fn build(
     rtcd.exempt(addr);
     let mut me = MediaEngine::default();
     me.register_default_codecs().expect("codecs");
+    if spec.red {
+        me.register_codec(
+            RTCRtpCodecParameters {
+                rtp_codec: RTCRtpCodec {
+                    mime_type: MIME_TYPE_RED.into(),
+                    clock_rate: 48000,
+                    channels: 2,
+                    sdp_fmtp_line: RED_FMTP.into(),
+                    rtcp_feedback: vec![],
+                },
+                payload_type: RED_PAYLOAD_TYPE,
+            },
+            RtpCodecKind::Audio,
+        )
+        .expect("red");
+    }
     me.register_header_extension(
         RTCRtpHeaderExtensionCapability {
             uri: AUDIO_LEVEL_URI.into(),
@@ -798,6 +819,18 @@ async fn drive(
                     RTCMessage::RtpPacket(track, packet) => {
                         if let (Some(rx), Some(p)) = (rx.as_mut(), probe) {
                             let size = packet.payload.len() + 12;
+                            // The voice packets the redundant payload carries along: the numbers
+                            // before this one, as many as it has blocks.
+                            if env.red
+                                && packet.header.payload_type == RED_PAYLOAD_TYPE
+                                && let Some(d) = red::decode(&packet.payload)
+                            {
+                                let n = d.redundant.len() as u16;
+                                let carried: Vec<u16> = (1..=n)
+                                    .map(|back| packet.header.sequence_number.wrapping_sub(back))
+                                    .collect();
+                                rx.carry(&track, &carried);
+                            }
                             if let Some((what, w)) = rx.on_rtp(
                                 p,
                                 arrived,

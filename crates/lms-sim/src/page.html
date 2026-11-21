@@ -120,14 +120,16 @@ function show(e) {
 	el.play().catch(() => {});
 }
 
-// The audio codecs the SFU's description offers, once per try: the formats a loss can be concealed or
-// recovered by (red, opus's in-band FEC) show in what was negotiated.
+// The audio codecs the SFU's description offers, once per try, and the ones this browser can receive:
+// the formats a loss can be concealed or recovered by (red, opus's in-band FEC) show in what was
+// negotiated, and whether the browser has red at all in what it can receive.
 function logCodecs() {
 	if (codecsLogged) return;
 	codecsLogged = true;
 	const audio = (pc.remoteDescription?.sdp ?? '').split(/\r?\nm=/).slice(1).find((m) => m.startsWith('audio'));
 	const lines = (audio ?? '').split(/\r?\n/).filter((l) => l.startsWith('a=rtpmap:'));
-	event('sdp_codecs', lines.join('; '));
+	const capable = (RTCRtpReceiver.getCapabilities('audio')?.codecs ?? []).map((c) => c.mimeType);
+	event('sdp_codecs', `${lines.join('; ')} | receiver capabilities: ${capable.join(', ')}`);
 }
 
 // Our own offer (the first, and an ICE restart's) goes out by the websocket, and is sent again once

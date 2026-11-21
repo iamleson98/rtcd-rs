@@ -29,6 +29,10 @@
 //! student of an impaired group changes its UDP source port now and then) and `--mtu` (an impaired
 //! group sends datagrams of MTU size and over).
 //!
+//! `--red` makes every second student of the process (the first, the third, ...) negotiate redundant
+//! audio (`red/48000/2`) and decode it: the packets it recovers are counted in its `recv` lines
+//! (`recovered`), and a silence that they fill is not an audio gap. The others take plain Opus.
+//!
 //! `--chrome-recovery` makes the browser recover as lms-web's does (see `lms_sim::chrome`): the page
 //! is loaded with `recovery=1` (`scripts/lesson-soak/run.sh` does both, for the profiles that restart
 //! the SFU or sweep the loss).
@@ -81,6 +85,7 @@ struct Args {
     teacher_reconnect_mins: Option<u64>,
     nat_rebind_secs: Option<u64>,
     mtu: bool,
+    red: bool,
     camera_layers: CameraLayers,
     call: String,
     out: PathBuf,
@@ -110,6 +115,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
         teacher_reconnect_mins: None,
         nat_rebind_secs: None,
         mtu: false,
+        red: false,
         camera_layers: CameraLayers::default(),
         call: "channel-lesson".into(),
         out: PathBuf::new(),
@@ -126,6 +132,10 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
         }
         if k == "--mtu" {
             a.mtu = true;
+            continue;
+        }
+        if k == "--red" {
+            a.red = true;
             continue;
         }
         let v = it.next().ok_or_else(|| format!("{k} needs a value"))?;
@@ -310,6 +320,7 @@ pub async fn run(args: impl Iterator<Item = String>, assets: PathBuf) {
             probe: Some(probe(&a.imp, i - a.first < a.measure, i == a.first)),
             udp_base: a.udp_base.map(|b| b + 4 * (i - a.first) as u16),
             mtu: a.mtu && a.group == "impaired",
+            red: a.red && (i - a.first) % 2 == 0,
             seed: seed ^ u64::from(i),
             ..Default::default()
         };
