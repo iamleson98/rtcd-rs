@@ -333,6 +333,7 @@ pub async fn try_open_session(
         dc_signaling: true,
         host: name == "teacher",
         observer: false,
+        receiver_budget_kbps: 0,
     }));
     Some((conn, session_id, user_id))
 }

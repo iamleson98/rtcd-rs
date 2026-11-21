@@ -37,10 +37,10 @@ use std::time::{Duration, Instant};
 
 use crate::bwe::OUTAGE_GAP;
 use crate::layers::{
-    CAPACITY_SHARE, CLEAR_FOR, DRAIN_SECONDS, GROWTH_CEILING, GROWTH_PER_SECOND, HEADROOM, HOLD,
-    KEYFRAME_DRAIN, KEYFRAME_GRACE, LEAST_SHARE, LOSS_ROOM, Layer, LayerRates,
-    NOMINAL_KEYFRAME_SECONDS, QUEUE_CRITICAL, QUEUE_HIGH, QUEUE_PERSISTS, QUEUE_SHRINKING,
-    QUEUE_SURGING, Rung, ScreenInputs, Steps, TRIAL,
+    BUDGET_RAISE_SHARE, CAPACITY_SHARE, CLEAR_FOR, DRAIN_SECONDS, GROWTH_CEILING,
+    GROWTH_PER_SECOND, HEADROOM, HOLD, KEYFRAME_DRAIN, KEYFRAME_GRACE, LEAST_SHARE, LOSS_ROOM,
+    Layer, LayerRates, NOMINAL_KEYFRAME_SECONDS, QUEUE_CRITICAL, QUEUE_HIGH, QUEUE_PERSISTS,
+    QUEUE_SHRINKING, QUEUE_SURGING, Rung, ScreenInputs, Steps, TRIAL,
 };
 
 /// What a camera costs until it has been measured.
@@ -136,6 +136,8 @@ pub struct CameraSteps {
     /// Bits of the keyframe the receiver is sent when it moves from the small layer onto the large
     /// one: it arrives at once, on top of what flows.
     switch_bits: f64,
+    /// Whether the rates of the steps were measured: a camera not measured yet costs a guess.
+    measured: bool,
 }
 
 impl CameraSteps {
@@ -145,6 +147,8 @@ impl CameraSteps {
     /// camera not measured yet does.
     pub fn of(low: Option<LayerRates>, high: Option<LayerRates>) -> Self {
         let steps = |rates| Steps::of(rates, NOMINAL_CAMERA_RATE);
+        let measured = [low, high].iter().flatten().count() > 0
+            && [low, high].iter().flatten().all(|r| r.total.is_some());
         let mut out = Self {
             steps: [(
                 Rung {
@@ -155,6 +159,7 @@ impl CameraSteps {
             ); MAX_STEPS],
             len: 0,
             switch_bits: 0.0,
+            measured,
         };
         match (low.map(steps), high.map(steps)) {
             (Some(small), Some(large)) if small.whole() < large.whole() => {
@@ -169,6 +174,12 @@ impl CameraSteps {
             (None, None) => out.extend(Layer::Low, &steps(LayerRates::default())),
         }
         out
+    }
+
+    /// Whether what the camera costs was measured, not guessed: a receiver's budget is not held
+    /// to a guess, which would pause cameras for want of a reading.
+    pub fn measured(&self) -> bool {
+        self.measured
     }
 
     fn push(&mut self, layer: Layer, tid: Option<u8>, rate: f64) {
@@ -195,6 +206,16 @@ impl CameraSteps {
     /// the host's.
     pub fn lowest(&self) -> f64 {
         self.steps[0].1
+    }
+
+    /// Bits per second the camera costs whole on its small layer: where a receiver's budget leaves
+    /// it before it is thinned or paused. A camera with no small layer has none to go down to, and
+    /// costs what it does at its top.
+    pub fn small_whole(&self) -> f64 {
+        self.rungs()
+            .iter()
+            .rfind(|(r, _)| r.layer == Layer::Low)
+            .map_or_else(|| self.rungs()[self.len - 1].1, |&(_, rate)| rate)
     }
 
     /// Whether the large layer is among the steps.
@@ -284,6 +305,11 @@ impl Camera {
         level > 0 && self.rung(level).layer == Layer::Low && self.steps.reaches_high()
     }
 
+    /// Whether `level` is a step onto the large layer, from a small one the camera also has.
+    fn on_large(&self, level: usize) -> bool {
+        level > 1 && self.rung(1).layer == Layer::Low && self.rung(level).layer == Layer::High
+    }
+
     /// Bits per second `level` costs.
     fn cost(&self, level: usize) -> f64 {
         level
@@ -304,6 +330,17 @@ impl Camera {
     fn top(&self) -> usize {
         self.steps.count()
     }
+}
+
+/// What the cameras cost whole on their small layers, for splitting a receiver's budget. A camera
+/// not measured yet is left out: its cost is a guess, and counting it would take the screen
+/// share's room for a call's first seconds.
+pub fn small_total<'a>(steps: impl IntoIterator<Item = &'a CameraSteps>) -> f64 {
+    steps
+        .into_iter()
+        .filter(|s| s.measured())
+        .map(CameraSteps::small_whole)
+        .sum()
 }
 
 /// What a set of cameras costs.
@@ -362,12 +399,22 @@ impl Load {
 /// that a link which flaps never leaves clear, and a step up after it is taken by none of the
 /// others. Where that is not known, one at a time (the first, by rank, of those that fit): what
 /// they send on starting would be the flood of all of them at once.
+///
+/// `cap` is the most the cameras may cost under the receiver's budget (`Some`), a hard limit on
+/// every level that nothing bypasses, the trial included. Taking a camera up needs what is sent
+/// after the step to stay within [`BUDGET_RAISE_SHARE`] of it, and under a cap one step up is taken
+/// at most, the path having stayed clear or not. Under a cap the large layers are the first to go:
+/// a camera is given its large layer only where every camera after it that flows keeps its whole
+/// small layer, so that no camera is thinned for the sake of another's large layer.
 pub fn allocate(
     limit: Option<f64>,
     mut raise: Option<f64>,
     trial: Option<f64>,
+    cap: Option<f64>,
     cameras: &mut [Camera],
 ) {
+    let raise_cap = cap.map(|c| c * BUDGET_RAISE_SHARE);
+    let cap = cap.unwrap_or(f64::INFINITY);
     let unlimited = limit.is_none();
     let limit = limit.unwrap_or(f64::INFINITY);
     let mut order: Vec<usize> = (0..cameras.len()).collect();
@@ -384,16 +431,19 @@ pub fn allocate(
             if cameras[i].long_paused()
                 && after <= reach
                 && (known || after * RAISE_MARGIN <= limit)
+                && raise_cap.is_none_or(|most| after <= most)
             {
                 total = after;
                 tried[i] = true;
                 raise = None;
-                if !known {
+                if !known || raise_cap.is_some() {
                     break;
                 }
             }
         }
     }
+    // With a cap, one step up at most is taken, and a trial is one.
+    let mut stepped = raise_cap.is_some() && tried.contains(&true);
     // What the cameras after each in `order` that flow now need at the least: a step beyond its
     // lowest is not given to a camera at the price of pausing one of them.
     let mut keep = vec![0.0; cameras.len() + 1];
@@ -402,6 +452,17 @@ pub fn allocate(
         keep[n] = keep[n + 1]
             + if c.level > 0 && !tried[i] {
                 c.cost(1)
+            } else {
+                0.0
+            };
+    }
+    // The same, at the whole small layer of each, which a camera's large layer must leave them.
+    let mut keep_small = vec![0.0; cameras.len() + 1];
+    for (n, &i) in order.iter().enumerate().rev() {
+        let c = &cameras[i];
+        keep_small[n] = keep_small[n + 1]
+            + if c.level > 0 && !tried[i] {
+                c.steps.small_whole()
             } else {
                 0.0
             };
@@ -415,24 +476,34 @@ pub fn allocate(
             c.level = 1;
             continue;
         }
-        let reserve = keep[n + 1];
         let mut level = c.top();
         while level > 0 {
             // The lowest step is given whatever the cameras after it need.
-            let needed = given + c.cost(level) + if level > 1 { reserve } else { 0.0 };
-            let fits = if level > before {
-                // Taking a camera up adds to everything sent now, whatever its rank: it never
-                // displaces a camera that flows.
-                let total = sent + c.cost(level) - c.cost(before);
-                unlimited
-                    || raise.is_some_and(|most| {
-                        total <= most
-                            && c.switch_cost(before, level) <= (most - total) * KEYFRAME_DRAIN
-                    }) && total * RAISE_MARGIN <= limit
-                        && needed <= limit
-            } else {
-                needed <= limit
+            let reserve = match (level > 1, raise_cap.is_some() && c.on_large(level)) {
+                (false, _) => 0.0,
+                (true, false) => keep[n + 1],
+                (true, true) => keep_small[n + 1].max(keep[n + 1]),
             };
+            let needed = given + c.cost(level) + reserve;
+            let under_cap = needed <= cap
+                && (level <= before
+                    || raise_cap.is_none_or(|most| {
+                        !stepped && sent + c.cost(level) - c.cost(before) <= most
+                    }));
+            let fits = under_cap
+                && if level > before {
+                    // Taking a camera up adds to everything sent now, whatever its rank: it never
+                    // displaces a camera that flows.
+                    let total = sent + c.cost(level) - c.cost(before);
+                    unlimited
+                        || raise.is_some_and(|most| {
+                            total <= most
+                                && c.switch_cost(before, level) <= (most - total) * KEYFRAME_DRAIN
+                        }) && total * RAISE_MARGIN <= limit
+                            && needed <= limit
+                } else {
+                    needed <= limit
+                };
             if fits {
                 break;
             }
@@ -442,6 +513,7 @@ pub fn allocate(
         c.level = level;
         if level > before {
             raise = None;
+            stepped = true;
         }
     }
 }
@@ -797,7 +869,7 @@ mod tests {
     #[test]
     fn without_a_limit_every_camera_is_sent_whole() {
         let mut cameras = class(7, plain());
-        allocate(None, None, None, &mut cameras);
+        allocate(None, None, None, None, &mut cameras);
         assert!(cameras.iter().all(|c| c.level == c.top()));
     }
 
@@ -805,7 +877,7 @@ mod tests {
     fn the_host_keeps_its_camera_and_the_last_students_wait() {
         let mut cameras = class(7, plain());
         // Room for three of eight cameras.
-        allocate(Some(3.0 * CAMERA as f64), None, None, &mut cameras);
+        allocate(Some(3.0 * CAMERA as f64), None, None, None, &mut cameras);
         assert_eq!(levels(&cameras), vec![1, 1, 0, 0, 0, 0, 0, 1]);
         assert!(Load::of(&cameras).sent <= 3.0 * CAMERA as f64);
     }
@@ -817,15 +889,15 @@ mod tests {
         // fits, so none is paused; the host has what is above its lowest step first (all of it),
         // then the first student (its base and second layers, three fifths of its bits), and
         // what is left goes to the next.
-        allocate(Some(1_040_000.0), None, None, &mut cameras);
+        allocate(Some(1_040_000.0), None, None, None, &mut cameras);
         assert_eq!(levels(&cameras), vec![2, 2, 1, 3]);
         assert_eq!(cameras[0].rung(2).tid, Some(1));
         // A little less, and the first student gives up its second layer for the others.
-        allocate(Some(960_000.0), None, None, &mut cameras);
+        allocate(Some(960_000.0), None, None, None, &mut cameras);
         assert_eq!(levels(&cameras), vec![2, 1, 1, 3]);
         assert_eq!(cameras[1].rung(1).tid, Some(0));
         // A camera is paused only where not even its lowest step fits.
-        allocate(Some(560_000.0), None, None, &mut cameras);
+        allocate(Some(560_000.0), None, None, None, &mut cameras);
         assert_eq!(levels(&cameras), vec![1, 1, 0, 1]);
     }
 
@@ -834,14 +906,20 @@ mod tests {
         // The host's camera could be sent whole, which leaves the students too little for their
         // lowest steps: it is held to its lowest too, and none is paused.
         let mut cameras = class(7, simulcast());
-        allocate(Some(1_700_000.0), None, None, &mut cameras);
+        allocate(Some(1_700_000.0), None, None, None, &mut cameras);
         assert!(
             cameras.iter().all(|c| c.level == 1),
             "{:?}",
             levels(&cameras)
         );
         // With room for all the lowest steps and more, the host has the more first.
-        allocate(Some(3_200_000.0), Some(f64::INFINITY), None, &mut cameras);
+        allocate(
+            Some(3_200_000.0),
+            Some(f64::INFINITY),
+            None,
+            None,
+            &mut cameras,
+        );
         assert_eq!(levels(&cameras).iter().filter(|&&l| l == 0).count(), 0);
         assert_eq!(
             cameras.iter().find(|c| c.rank == RANK_HOST).unwrap().level,
@@ -852,15 +930,16 @@ mod tests {
     #[test]
     fn what_goes_down_does_not_come_back_without_room_and_a_clear_path() {
         let mut cameras = class(3, plain());
-        allocate(Some(2.0 * CAMERA as f64), None, None, &mut cameras);
+        allocate(Some(2.0 * CAMERA as f64), None, None, None, &mut cameras);
         assert_eq!(levels(&cameras), vec![1, 0, 0, 1]);
         // Room for all, but the path has not been clear long enough: nothing is taken up.
-        allocate(Some(8.0 * CAMERA as f64), None, None, &mut cameras);
+        allocate(Some(8.0 * CAMERA as f64), None, None, None, &mut cameras);
         assert_eq!(levels(&cameras), vec![1, 0, 0, 1]);
         // Clear: one is taken up, where it and the two sent fit a quarter over.
         allocate(
             Some(4.0 * CAMERA as f64),
             Some(f64::INFINITY),
+            None,
             None,
             &mut cameras,
         );
@@ -870,11 +949,12 @@ mod tests {
     #[test]
     fn a_camera_is_not_taken_up_past_what_the_narrowest_link_carries() {
         let mut cameras = class(3, plain());
-        allocate(Some(2.0 * CAMERA as f64), None, None, &mut cameras);
+        allocate(Some(2.0 * CAMERA as f64), None, None, None, &mut cameras);
         // Room in the limit for all four, but the link carries three of them.
         allocate(
             Some(8.0 * CAMERA as f64),
             Some(3.0 * CAMERA as f64),
+            None,
             None,
             &mut cameras,
         );
@@ -882,6 +962,7 @@ mod tests {
         allocate(
             Some(8.0 * CAMERA as f64),
             Some(3.0 * CAMERA as f64),
+            None,
             None,
             &mut cameras,
         );
@@ -891,10 +972,11 @@ mod tests {
     #[test]
     fn one_camera_at_most_is_taken_up_at_a_time() {
         let mut cameras = class(7, plain());
-        allocate(Some(1.0 * CAMERA as f64), None, None, &mut cameras);
+        allocate(Some(1.0 * CAMERA as f64), None, None, None, &mut cameras);
         allocate(
             Some(80.0 * CAMERA as f64),
             Some(f64::INFINITY),
+            None,
             None,
             &mut cameras,
         );
@@ -917,6 +999,7 @@ mod tests {
                     allocate(
                         Some(middle * swing),
                         Some(f64::INFINITY),
+                        None,
                         None,
                         &mut cameras,
                     );
@@ -1267,6 +1350,7 @@ mod tests {
                 self.budget.limit(),
                 self.budget.raise_ceiling(self.t),
                 None,
+                None,
                 &mut self.cameras,
             );
             if levels(&self.cameras)
@@ -1331,7 +1415,7 @@ mod tests {
                 ..Default::default()
             };
             sim.budget.review(sim.t, &path, load);
-            allocate(sim.budget.limit(), None, None, &mut sim.cameras);
+            allocate(sim.budget.limit(), None, None, None, &mut sim.cameras);
             sim.t += Duration::from_secs(1);
             let host = sim.cameras.iter().find(|c| c.rank == RANK_HOST).unwrap();
             assert!(host.level >= 1, "the host's camera was paused");
@@ -1358,7 +1442,7 @@ mod tests {
         }
         let load = Load::of(&sim.cameras);
         sim.budget.review(sim.t, &clear(load.sent), load);
-        allocate(sim.budget.limit(), None, None, &mut sim.cameras);
+        allocate(sim.budget.limit(), None, None, None, &mut sim.cameras);
         assert_eq!(levels(&sim.cameras), held);
     }
 
@@ -1385,7 +1469,7 @@ mod tests {
     fn speakers_taking_turns_do_not_swap_the_cameras_that_flow() {
         // Room for four of the eight cameras; the host and three students flow.
         let mut cameras = class(6, plain());
-        allocate(Some(1_700_000.0), None, None, &mut cameras);
+        allocate(Some(1_700_000.0), None, None, None, &mut cameras);
         let flowing = levels(&cameras);
         assert_eq!(flowing.iter().filter(|&&l| l > 0).count(), 4);
         // Two of the students that are paused speak in turn, each for a second and a half.
@@ -1401,7 +1485,13 @@ mod tests {
                     };
                 }
             }
-            allocate(Some(1_700_000.0), Some(f64::INFINITY), None, &mut cameras);
+            allocate(
+                Some(1_700_000.0),
+                Some(f64::INFINITY),
+                None,
+                None,
+                &mut cameras,
+            );
             assert_eq!(levels(&cameras), flowing, "turn {turn}");
         }
     }
@@ -1414,11 +1504,12 @@ mod tests {
             Camera::new(RANK_LOUD, plain(), None, WHOLE),
             Camera::new(RANK_HOST, plain(), None, WHOLE),
         ];
-        allocate(Some(2.0 * CAMERA as f64), None, None, &mut cameras);
+        allocate(Some(2.0 * CAMERA as f64), None, None, None, &mut cameras);
         assert_eq!(levels(&cameras), vec![0, 0, 1, 1]);
         allocate(
             Some(4.0 * CAMERA as f64),
             Some(f64::INFINITY),
+            None,
             None,
             &mut cameras,
         );
@@ -1530,12 +1621,18 @@ mod tests {
         };
         let steps = CameraSteps::of(Some(small_layer()), Some(large));
         let mut cameras = [host(steps, HIGH_WHOLE)];
-        allocate(Some(600_000.0), None, None, &mut cameras);
+        allocate(Some(600_000.0), None, None, None, &mut cameras);
         let level = cameras[0].level;
         assert_eq!(cameras[0].rung(level), WHOLE);
         assert!(cameras[0].held_small(level));
         // Room for the large one whole: it is no longer held.
-        allocate(Some(5_000_000.0), Some(f64::INFINITY), None, &mut cameras);
+        allocate(
+            Some(5_000_000.0),
+            Some(f64::INFINITY),
+            None,
+            None,
+            &mut cameras,
+        );
         let level = cameras[0].level;
         assert_eq!(cameras[0].rung(level), HIGH_WHOLE);
         assert!(!cameras[0].held_small(level));
@@ -1572,20 +1669,38 @@ mod tests {
         let level = cameras[0].level;
         // Room in the limit, and in the narrowest link for the large layer whole (1 Mb/s) but not
         // for its keyframe (100 kbit would take longer than the drain allows to leave in 20 kb/s).
-        allocate(Some(5_000_000.0), Some(1_020_000.0), None, &mut cameras);
+        allocate(
+            Some(5_000_000.0),
+            Some(1_020_000.0),
+            None,
+            None,
+            &mut cameras,
+        );
         assert_eq!(cameras[0].level, level, "the keyframe would queue");
-        allocate(Some(5_000_000.0), Some(1_100_000.0), None, &mut cameras);
+        allocate(
+            Some(5_000_000.0),
+            Some(1_100_000.0),
+            None,
+            None,
+            &mut cameras,
+        );
         assert_eq!(cameras[0].level, 2);
         // And where the link is not known, nothing is held back.
         let mut cameras = [host(simulcast(), WHOLE)];
-        allocate(Some(5_000_000.0), Some(f64::INFINITY), None, &mut cameras);
+        allocate(
+            Some(5_000_000.0),
+            Some(f64::INFINITY),
+            None,
+            None,
+            &mut cameras,
+        );
         assert_eq!(cameras[0].level, 2);
     }
 
     #[test]
     fn a_move_down_from_the_large_layer_needs_no_room_for_a_keyframe() {
         let mut cameras = [host(simulcast(), HIGH_WHOLE)];
-        allocate(Some(400_000.0), None, None, &mut cameras);
+        allocate(Some(400_000.0), None, None, None, &mut cameras);
         assert_eq!(cameras[0].level, 1);
     }
 
@@ -1762,6 +1877,7 @@ mod tests {
             Some(CAMERA as f64),
             None,
             Some(3.0 * CAMERA as f64),
+            None,
             &mut cameras,
         );
         assert_eq!(levels(&cameras), vec![1, 0, 1]);
@@ -1774,11 +1890,12 @@ mod tests {
             Some(CAMERA as f64),
             None,
             Some(1.5 * CAMERA as f64),
+            None,
             &mut cameras,
         );
         assert_eq!(levels(&cameras), vec![1, 0]);
         // ...nor where the trial is not allowed.
-        allocate(Some(CAMERA as f64), None, None, &mut cameras);
+        allocate(Some(CAMERA as f64), None, None, None, &mut cameras);
         assert_eq!(levels(&cameras), vec![1, 0]);
     }
 
@@ -1792,7 +1909,7 @@ mod tests {
         let room = 10.0 * CAMERA as f64;
         let mut cameras = paused();
         for returned in 1..=4 {
-            allocate(Some(room), None, Some(f64::INFINITY), &mut cameras);
+            allocate(Some(room), None, Some(f64::INFINITY), None, &mut cameras);
             assert_eq!(
                 cameras.iter().filter(|c| c.level > 0).count(),
                 1 + returned,
@@ -1806,7 +1923,13 @@ mod tests {
         }
         // Where the link is read, as many as it carries come back together.
         let mut cameras = paused();
-        allocate(Some(room), None, Some(3.0 * CAMERA as f64), &mut cameras);
+        allocate(
+            Some(room),
+            None,
+            Some(3.0 * CAMERA as f64),
+            None,
+            &mut cameras,
+        );
         assert_eq!(levels(&cameras), vec![1, 1, 1, 0, 0]);
         // Where the link is not read, the camera must fit in what the limit allows too.
         let mut cameras = paused();
@@ -1814,6 +1937,7 @@ mod tests {
             Some(1.5 * CAMERA as f64),
             None,
             Some(f64::INFINITY),
+            None,
             &mut cameras,
         );
         assert_eq!(levels(&cameras), vec![1, 0, 0, 0, 0]);
@@ -1848,7 +1972,13 @@ mod tests {
             Camera::new(RANK_HOST, plain(), None, WHOLE),
             paused_for(RANK_WATCHED, 10),
         ];
-        allocate(b.limit(), b.raise_ceiling(t), Some(reach), &mut cameras);
+        allocate(
+            b.limit(),
+            b.raise_ceiling(t),
+            Some(reach),
+            None,
+            &mut cameras,
+        );
         assert_eq!(levels(&cameras), vec![1, 1]);
         // A screen that takes the whole link leaves nothing to try with.
         let mut b = CameraBudget::default();
@@ -1873,7 +2003,7 @@ mod tests {
             Camera::new(RANK_HOST, plain(), None, WHOLE),
             paused_for(RANK_WATCHED, 10),
         ];
-        allocate(b.limit(), None, Some(reach), &mut cameras);
+        allocate(b.limit(), None, Some(reach), None, &mut cameras);
         assert_eq!(levels(&cameras), vec![1, 0]);
     }
 
@@ -1903,6 +2033,7 @@ mod tests {
                 b.limit(),
                 b.raise_ceiling(t),
                 b.pause_trial(t),
+                None,
                 &mut cameras,
             );
             if back.is_none() && cameras.iter().any(|c| c.level > 0) {
@@ -1960,5 +2091,289 @@ mod tests {
         b.review(t, &calm, load(1_500_000.0, 2_000_000.0));
         let reach = b.pause_trial(t).expect("allowed");
         assert!((reach - 2_000_000.0 * REACH_SHARE).abs() < 1.0, "{reach}");
+    }
+
+    /// A camera that sends both layers: `small` and `large` bits per second, one step each.
+    fn two_layers(small: u64, large: u64) -> CameraSteps {
+        let rates = |total| LayerRates {
+            total: Some(total),
+            ..Default::default()
+        };
+        CameraSteps::of(Some(rates(small)), Some(rates(large)))
+    }
+
+    const ON_SMALL: Rung = Rung {
+        layer: Layer::Low,
+        tid: None,
+    };
+    const ON_LARGE: Rung = Rung {
+        layer: Layer::High,
+        tid: None,
+    };
+
+    /// A class as a paid plan sees it: a speaker whose large layer is 1.2 Mbit/s and three
+    /// thumbnails of 150 kbit/s, each at `at`.
+    fn speaker_and_thumbnails(speaker: Rung, thumbs: Rung) -> Vec<Camera> {
+        let thumb = two_layers(50_000, 150_000);
+        let mut cameras = vec![Camera::new(
+            RANK_HOST,
+            two_layers(300_000, 1_200_000),
+            None,
+            speaker,
+        )];
+        cameras.extend((0..3).map(|_| Camera::new(RANK_SMALL, thumb, None, thumbs)));
+        cameras
+    }
+
+    fn sent(cameras: &[Camera]) -> f64 {
+        Load::of(cameras).sent
+    }
+
+    #[test]
+    fn a_cap_holds_the_cameras_where_the_path_would_carry_more() {
+        let mut cameras = class(7, plain());
+        allocate(
+            Some(10_000_000.0),
+            None,
+            None,
+            Some(1_250_000.0),
+            &mut cameras,
+        );
+        assert!(sent(&cameras) <= 1_250_000.0, "{}", sent(&cameras));
+        let host = cameras.last().unwrap();
+        assert_eq!(host.level, host.top(), "the host first");
+        assert!(cameras.iter().any(|c| c.level == 0), "the last wait");
+    }
+
+    #[test]
+    fn a_cap_pauses_by_rank_and_the_host_last() {
+        let mut cameras = class(3, plain());
+        // Room for two cameras of the four.
+        allocate(None, None, None, Some(850_000.0), &mut cameras);
+        assert_eq!(levels(&cameras), vec![1, 0, 0, 1]);
+        allocate(None, None, None, Some(450_000.0), &mut cameras);
+        assert_eq!(
+            levels(&cameras),
+            vec![0, 0, 0, 1],
+            "the host is the last left"
+        );
+    }
+
+    #[test]
+    fn without_a_cap_nothing_changes() {
+        let mut a = class(7, layered());
+        let mut b = a.clone();
+        allocate(Some(2_000_000.0), None, None, None, &mut a);
+        allocate(Some(2_000_000.0), None, None, Some(f64::INFINITY), &mut b);
+        assert_eq!(levels(&a), levels(&b));
+    }
+
+    #[test]
+    fn the_trial_of_a_camera_paused_too_long_does_not_pass_the_cap() {
+        let paused = || vec![Camera::new(RANK_HOST, plain(), Some(MAX_PAUSE * 2), WHOLE)];
+        let mut cameras = paused();
+        allocate(
+            Some(10_000_000.0),
+            None,
+            Some(f64::INFINITY),
+            None,
+            &mut cameras,
+        );
+        assert_eq!(cameras[0].level, 1, "without a cap it is tried");
+        let mut cameras = paused();
+        allocate(
+            Some(10_000_000.0),
+            None,
+            Some(f64::INFINITY),
+            Some(CAMERA as f64 - 1.0),
+            &mut cameras,
+        );
+        assert_eq!(cameras[0].level, 0, "its lowest step does not fit the cap");
+        let mut cameras = paused();
+        allocate(
+            Some(10_000_000.0),
+            None,
+            Some(f64::INFINITY),
+            Some(430_000.0),
+            &mut cameras,
+        );
+        assert_eq!(cameras[0].level, 0, "nor within a tenth of it");
+        let mut cameras = paused();
+        allocate(
+            Some(10_000_000.0),
+            None,
+            Some(f64::INFINITY),
+            Some(450_000.0),
+            &mut cameras,
+        );
+        assert_eq!(cameras[0].level, 1);
+    }
+
+    #[test]
+    fn the_paid_example_keeps_the_speakers_large_layer_with_three_thumbnails() {
+        // 2.0 Mbit/s less the voices' 100: 1.9 of video. 1.2 + 3 x 0.15 is 1.65.
+        let cap = 2_000_000.0 - crate::layers::VOICE_RESERVE;
+        let mut cameras = speaker_and_thumbnails(ON_LARGE, ON_LARGE);
+        allocate(None, None, None, Some(cap), &mut cameras);
+        assert_eq!(
+            levels(&cameras),
+            vec![2, 2, 2, 2],
+            "stays on the large layer"
+        );
+        // From the small layer it is taken up: 1.65 is inside nine tenths of 1.9 (1.71), where
+        // the paths' margin of a quarter would have kept it down.
+        let mut cameras = speaker_and_thumbnails(ON_SMALL, ON_LARGE);
+        allocate(None, None, None, Some(cap), &mut cameras);
+        assert_eq!(cameras[0].level, 2);
+    }
+
+    #[test]
+    fn on_free_the_thumbnails_go_small_before_the_speaker_does() {
+        let cap = 1_500_000.0 - crate::layers::VOICE_RESERVE;
+        let mut cameras = speaker_and_thumbnails(ON_LARGE, ON_LARGE);
+        allocate(None, None, None, Some(cap), &mut cameras);
+        assert_eq!(levels(&cameras), vec![2, 1, 1, 1]);
+        assert!(sent(&cameras) <= cap);
+    }
+
+    #[test]
+    fn a_step_up_needs_nine_tenths_of_the_cap_and_one_is_taken_at_a_time() {
+        // At the small layer the class costs 0.3 + 3 x 0.05 = 0.45; the speaker's large layer
+        // brings it to 1.35, and a thumbnail's to 0.55.
+        let mut cameras = speaker_and_thumbnails(ON_SMALL, ON_SMALL);
+        allocate(None, None, None, Some(1_450_000.0), &mut cameras);
+        assert_eq!(
+            cameras[0].level, 1,
+            "1.35 is past nine tenths of 1.45 (1.305)"
+        );
+        assert_eq!(levels(&cameras)[1..], [2, 1, 1], "one step up, by rank");
+        // Two steps up are given one at a time.
+        let mut cameras = speaker_and_thumbnails(ON_SMALL, ON_SMALL);
+        allocate(None, None, None, Some(5_000_000.0), &mut cameras);
+        assert_eq!(levels(&cameras), vec![2, 1, 1, 1]);
+        allocate(None, None, None, Some(5_000_000.0), &mut cameras);
+        assert_eq!(levels(&cameras), vec![2, 2, 1, 1]);
+    }
+
+    #[test]
+    fn small_whole_is_what_a_camera_costs_on_its_small_layer() {
+        assert_eq!(two_layers(50_000, 150_000).small_whole(), 50_000.0);
+        assert_eq!(layered().small_whole(), CAMERA as f64);
+        let large_only = CameraSteps::of(
+            None,
+            Some(LayerRates {
+                total: Some(900_000),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(
+            large_only.small_whole(),
+            900_000.0,
+            "no small layer to go down to"
+        );
+    }
+
+    #[test]
+    fn under_a_cap_no_camera_is_thinned_for_the_sake_of_anothers_large_layer() {
+        let host = CameraSteps::of(
+            Some(LayerRates {
+                total: Some(300_000),
+                temporal: Some([Some(120_000), Some(60_000)]),
+                keyframe_bits: None,
+            }),
+            Some(LayerRates {
+                total: Some(1_200_000),
+                ..Default::default()
+            }),
+        );
+        let class = || {
+            vec![
+                Camera::new(RANK_HOST, host, None, ON_LARGE),
+                Camera::new(RANK_WATCHED, layered(), None, WHOLE),
+                Camera::new(RANK_WATCHED, layered(), None, WHOLE),
+            ]
+        };
+        // The host's large layer and the students' lowest steps fit 1.6 Mbit/s, and the students
+        // would be thinned to make room for it; their whole small layers do not fit beside it.
+        let mut cameras = class();
+        allocate(None, None, None, Some(1_600_000.0), &mut cameras);
+        assert_eq!(
+            levels(&cameras),
+            vec![3, 3, 3],
+            "the host is held small, the rest whole"
+        );
+        // With room for all of them at their small layers, the host has its large one again.
+        let mut cameras = class();
+        allocate(None, None, None, Some(2_100_000.0), &mut cameras);
+        assert_eq!(levels(&cameras), vec![4, 3, 3]);
+    }
+
+    #[test]
+    fn a_camera_costs_a_guess_until_it_has_been_measured() {
+        assert!(!CameraSteps::default().measured());
+        assert!(!CameraSteps::of(Some(LayerRates::default()), None).measured());
+        assert!(plain().measured());
+        assert!(two_layers(50_000, 150_000).measured());
+        let half = CameraSteps::of(
+            Some(LayerRates {
+                total: Some(50_000),
+                ..Default::default()
+            }),
+            Some(LayerRates::default()),
+        );
+        assert!(!half.measured());
+    }
+
+    #[test]
+    fn cameras_not_measured_yet_are_left_out_of_what_the_small_layers_cost() {
+        let guessed = CameraSteps::default();
+        assert_eq!(small_total([&guessed, &guessed]), 0.0);
+        let measured = two_layers(50_000, 150_000);
+        assert_eq!(small_total([&measured, &guessed, &measured]), 100_000.0);
+        assert_eq!(small_total([]), 0.0);
+    }
+
+    /// Splits a budget between a screen share whose rate swings between nothing and 0.4 Mbit/s every
+    /// second and a speaker with three thumbnails, a second at a time as a receiver's reviews do,
+    /// and counts how many times a camera's level changed.
+    fn switches_with_a_swinging_screen(smoothed: bool) -> usize {
+        use crate::layers::{BudgetHold, RecentPeak, split_budget};
+        let t0 = Instant::now();
+        let mut hold = BudgetHold::default();
+        let mut peak = RecentPeak::default();
+        let mut cameras = speaker_and_thumbnails(ON_LARGE, ON_LARGE);
+        let small = small_total(cameras.iter().map(|c| &c.steps));
+        let mut switches = 0;
+        for second in 0..120u64 {
+            let now = t0 + Duration::from_secs(second);
+            let screen = if second % 2 == 0 { 0.0 } else { 400_000.0 };
+            let seen = peak.record(now, screen);
+            let cap =
+                split_budget(2_000_000.0, small, if smoothed { seen } else { screen }).cameras;
+            let before = levels(&cameras);
+            allocate(None, None, None, Some(cap), &mut cameras);
+            if !hold.may_raise(now) {
+                for (c, was) in cameras.iter_mut().zip(&before) {
+                    c.level = c.level.min(*was);
+                }
+            }
+            let after = levels(&cameras);
+            if after.iter().zip(&before).any(|(a, b)| a < b) {
+                hold.cut(now);
+            }
+            // The first seconds settle onto the peak.
+            if second >= 15 {
+                switches += after.iter().zip(&before).filter(|(a, b)| a != b).count();
+            }
+        }
+        switches
+    }
+
+    #[test]
+    fn a_screen_share_swinging_in_rate_does_not_move_the_cameras_up_and_down() {
+        let smoothed = switches_with_a_swinging_screen(true);
+        let raw = switches_with_a_swinging_screen(false);
+        assert!(smoothed <= 2, "{smoothed} switches once settled");
+        assert!(raw > smoothed * 3, "{raw} switches without it");
     }
 }

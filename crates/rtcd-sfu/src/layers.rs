@@ -8,6 +8,7 @@
 //! builds on it, what it delivers, what it loses); for a camera what the receiver asked for and
 //! whether the sender still sends the large layer.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// One of the two sizes a video is sent at.
@@ -112,6 +113,83 @@ pub(crate) const DELIVERED_ALL: f64 = 0.97;
 /// ...when what it was sent was this share of the rung's rate or more (a picture that is still
 /// sends little), and a verdict of congestion then costs the one rung, not what that was acked.
 pub(crate) const SENT_RUNG: f64 = 0.8;
+
+/// What a receiver's plan lets it be sent in all, the voices included, is held to in bits per
+/// second, and what the voices take of it is kept back for them: video gets the budget less this.
+pub const VOICE_RESERVE: f64 = 100_000.0;
+/// A step up under a receiver's budget is taken only where everything sent after it stays within
+/// this share of what is allowed: a rate that sits at the edge of its allowance is not given
+/// more, and a measurement that swings a tenth either way moves nothing twice. (The paths'
+/// `RAISE_MARGIN` is not used for this: it would keep a speaker's large layer off a budget that
+/// carries it.)
+pub const BUDGET_RAISE_SHARE: f64 = 0.9;
+/// After the budget cut anything, nothing is taken up for this long.
+pub const BUDGET_HOLD: Duration = Duration::from_secs(10);
+
+/// What the video part of a receiver's budget leaves for the cameras and for the screen share.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Split {
+    /// Most the screen share may cost: what is left after the cameras at their small layer.
+    pub screen: f64,
+    /// Most the cameras may cost: what is left after the screen share as it is sent.
+    pub cameras: f64,
+}
+
+/// Splits a receiver's `budget` (bits per second, voices included) between its cameras and its
+/// screen share, given what the cameras cost whole on their small layers (`cameras_small`) and
+/// what the screen share costs as it is sent (`screen_sent`).
+///
+/// The cameras are held to what the screen share leaves and the screen share to what the cameras
+/// at their small layers leave, which orders the cuts: the cameras give up their large layers
+/// first, then the screen share gives up temporal layers and its large layer, and only then do
+/// the cameras thin and pause, by rank. The voices are never touched.
+pub fn split_budget(budget: f64, cameras_small: f64, screen_sent: f64) -> Split {
+    let video = (budget - VOICE_RESERVE).max(0.0);
+    Split {
+        screen: (video - cameras_small).max(0.0),
+        cameras: (video - screen_sent).max(0.0),
+    }
+}
+
+/// The highest of what was recorded over the last [`BUDGET_HOLD`]: a screen share whose rate swings
+/// from one second to the next would otherwise move the cameras' room with it, and they would
+/// follow it up and down.
+#[derive(Debug, Default)]
+pub struct RecentPeak {
+    samples: VecDeque<(Instant, f64)>,
+}
+
+impl RecentPeak {
+    /// Records `value` at `now` and returns the highest recorded within [`BUDGET_HOLD`].
+    pub fn record(&mut self, now: Instant, value: f64) -> f64 {
+        while self
+            .samples
+            .front()
+            .is_some_and(|&(t, _)| now.saturating_duration_since(t) > BUDGET_HOLD)
+        {
+            self.samples.pop_front();
+        }
+        self.samples.push_back((now, value));
+        self.samples.iter().map(|&(_, v)| v).fold(0.0, f64::max)
+    }
+}
+
+/// When a receiver's budget last cut something: nothing is taken up for [`BUDGET_HOLD`] after.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BudgetHold {
+    cut_at: Option<Instant>,
+}
+
+impl BudgetHold {
+    pub fn may_raise(&self, now: Instant) -> bool {
+        self.cut_at
+            .is_none_or(|t| now.saturating_duration_since(t) >= BUDGET_HOLD)
+    }
+
+    pub fn cut(&mut self, now: Instant) {
+        self.cut_at = Some(now);
+    }
+}
 
 /// One step of what a receiver can be sent of a screen share: a simulcast layer, and the highest
 /// of its temporal layers sent (`None`: every frame of the layer).
@@ -258,6 +336,19 @@ impl Ladder {
             && (keyframe == 0.0 || keyframe <= (capacity - load) * KEYFRAME_DRAIN)
     }
 
+    /// Whether rung `i` may be sent under `ceiling`: the lowest rung always may.
+    fn allowed(&self, i: usize, ceiling: Option<f64>) -> bool {
+        i == 0 || ceiling.is_none_or(|c| self.rate(i) <= c)
+    }
+
+    /// The highest rung at or below `i` that may be sent under `ceiling`.
+    fn clamp(&self, mut i: usize, ceiling: Option<f64>) -> usize {
+        while !self.allowed(i, ceiling) {
+            i -= 1;
+        }
+        i
+    }
+
     /// The whole of the small layer: where a receiver starts.
     fn start(&self) -> usize {
         self.rungs
@@ -286,6 +377,11 @@ pub struct ScreenInputs {
     /// Bits per second of the other video the receiver is sent (the cameras, for a screen; the
     /// screen, for the cameras): it shares the path.
     pub other: f64,
+    /// Bits per second the receiver's budget lets the screen share cost, if it has one: no rung
+    /// above it is sent, tried, or blamed on the path (the lowest rung is sent whatever it
+    /// costs), whatever the receiver pinned, and a rung is taken up only where it costs at most
+    /// [`BUDGET_RAISE_SHARE`] of it.
+    pub ceiling: Option<f64>,
 }
 
 impl ScreenInputs {
@@ -483,6 +579,7 @@ impl ScreenLevel {
                 } else {
                     ladder.start()
                 };
+                let i = ladder.clamp(i, inputs.ceiling);
                 self.budget = self.budget.max(ladder.rate(i));
                 i
             }
@@ -521,7 +618,8 @@ impl ScreenLevel {
             while target > 0 && ladder.rate(target) > self.budget {
                 target -= 1;
             }
-            if target < current {
+            // A rung the budget holds the receiver off is not one the path failed at.
+            if target < current && ladder.allowed(current, inputs.ceiling) {
                 self.failed(ladder.rungs[current].0, now);
             }
         } else if inputs.clear() {
@@ -546,6 +644,9 @@ impl ScreenLevel {
                 && held
                 && now.saturating_duration_since(since) >= CLEAR_FOR
                 && self.budget >= ladder.rate(next)
+                && inputs
+                    .ceiling
+                    .is_none_or(|c| ladder.rate(next) <= c * BUDGET_RAISE_SHARE)
                 && ladder.fits(current, next, &inputs)
                 && self.may_try(ladder.rungs[next].0, now)
             {
@@ -555,6 +656,7 @@ impl ScreenLevel {
             self.decay_backoff(now, elapsed);
             self.clear_since = None;
         }
+        let target = ladder.clamp(target, inputs.ceiling);
         if target == current {
             let calm = *self.calm_since.get_or_insert(now);
             if now.saturating_duration_since(calm) >= FORGET_AFTER {
@@ -706,6 +808,7 @@ mod tests {
             link: None,
             delivery: Some(1.0),
             other: 0.0,
+            ceiling: None,
         }
     }
 
@@ -1443,5 +1546,146 @@ mod tests {
             !w.update(t, None, Some(t), STALL_AFTER),
             "a camera of one layer has no large one to stall"
         );
+    }
+
+    fn under(ceiling: f64, inputs: ScreenInputs) -> ScreenInputs {
+        ScreenInputs {
+            ceiling: Some(ceiling),
+            ..inputs
+        }
+    }
+
+    #[test]
+    fn the_budget_is_split_so_that_the_cameras_give_up_their_large_layers_first() {
+        // 2 Mbit/s: 1.9 of video. Cameras whole on their small layers cost 0.6; a screen share
+        // sent at 1.0.
+        let split = split_budget(2_000_000.0, 600_000.0, 1_000_000.0);
+        assert_eq!(split.screen, 1_300_000.0, "what the small cameras leave");
+        assert_eq!(split.cameras, 900_000.0, "what the screen share leaves");
+        // The screen share is cut before the cameras are thinned: its ceiling never goes below
+        // what is left of the cameras on their small layers, so the cameras' ceiling never goes
+        // below the small layers while the screen share still has rungs to give up.
+        let tight = split_budget(1_500_000.0, 600_000.0, 800_000.0);
+        assert_eq!(tight.screen, 800_000.0);
+        assert!(tight.cameras >= 600_000.0);
+        // Nothing is left for the screen share beyond the cameras and the voices: it gets 0 and
+        // stays on its lowest rung.
+        let none = split_budget(1_000_000.0, 1_200_000.0, 200_000.0);
+        assert_eq!(none.screen, 0.0);
+        assert_eq!(none.cameras, 700_000.0);
+        assert_eq!(
+            split_budget(50_000.0, 0.0, 0.0).cameras,
+            0.0,
+            "under the reserve"
+        );
+    }
+
+    #[test]
+    fn the_hold_lets_nothing_up_for_ten_seconds_after_a_cut() {
+        let t = Instant::now();
+        let mut h = BudgetHold::default();
+        assert!(h.may_raise(t), "nothing was ever cut");
+        h.cut(t);
+        assert!(!h.may_raise(t + Duration::from_secs(9)));
+        assert!(h.may_raise(t + BUDGET_HOLD));
+        h.cut(t + Duration::from_secs(9));
+        assert!(
+            !h.may_raise(t + Duration::from_secs(12)),
+            "a cut starts it again"
+        );
+    }
+
+    #[test]
+    fn the_ceiling_clamps_the_rung_and_is_not_blamed_on_the_path() {
+        let mut s = ScreenLevel::new();
+        let mut t = Instant::now();
+        hold(&mut s, &mut t, 120, clear(4_000_000.0));
+        assert_eq!(s.rung(), Some(rung(Layer::High, None)));
+        // 1.2 Mbit/s: the base of the large layer (1 Mbit/s) is the highest that fits.
+        let rung_under = |s: &mut ScreenLevel, t: Instant, ceiling| {
+            s.decide(t, under(ceiling, clear(4_000_000.0)), &ladder())
+        };
+        t += Duration::from_secs(1);
+        assert_eq!(
+            rung_under(&mut s, t, 1_200_000.0),
+            rung(Layer::High, Some(0))
+        );
+        t += Duration::from_secs(1);
+        assert_eq!(rung_under(&mut s, t, 450_000.0), rung(Layer::Low, Some(1)));
+        assert!(
+            s.backoff.is_empty(),
+            "the path did not fail: {:?}",
+            s.backoff
+        );
+    }
+
+    #[test]
+    fn the_lowest_rung_is_sent_whatever_the_ceiling_says() {
+        let mut s = ScreenLevel::new();
+        let mut t = Instant::now();
+        hold(&mut s, &mut t, 120, clear(4_000_000.0));
+        t += Duration::from_secs(1);
+        assert_eq!(
+            s.decide(t, under(0.0, clear(4_000_000.0)), &ladder()),
+            rung(Layer::Low, Some(0)),
+            "the screen share is never paused"
+        );
+    }
+
+    #[test]
+    fn the_ceiling_beats_the_pin() {
+        let mut s = ScreenLevel::new();
+        let t = Instant::now();
+        s.pin_high(true);
+        assert_eq!(
+            s.decide(t, under(600_000.0, clear(500_000.0)), &ladder()),
+            rung(Layer::Low, None)
+        );
+    }
+
+    #[test]
+    fn a_rung_is_taken_up_only_within_nine_tenths_of_the_ceiling() {
+        // The base of the large layer costs 1 Mbit/s: it needs a ceiling of 1.12 Mbit/s or more.
+        let run = |ceiling| {
+            let mut s = ScreenLevel::new();
+            let mut t = Instant::now();
+            hold(&mut s, &mut t, 120, under(ceiling, clear(4_000_000.0)));
+            s.rung()
+        };
+        assert_eq!(
+            run(1_050_000.0),
+            Some(rung(Layer::Low, None)),
+            "inside the band"
+        );
+        assert_eq!(run(1_200_000.0), Some(rung(Layer::High, Some(0))));
+    }
+
+    #[test]
+    fn a_rung_inside_the_band_is_kept_not_cut() {
+        let mut s = ScreenLevel::new();
+        let mut t = Instant::now();
+        hold(&mut s, &mut t, 120, under(1_200_000.0, clear(4_000_000.0)));
+        assert_eq!(s.rung(), Some(rung(Layer::High, Some(0))));
+        // The ceiling falls to 1.05 Mbit/s: the rung (1 Mbit/s) still fits it, though it would
+        // not be taken up under it.
+        assert_eq!(
+            hold(&mut s, &mut t, 30, under(1_050_000.0, clear(4_000_000.0))),
+            rung(Layer::High, Some(0))
+        );
+    }
+
+    #[test]
+    fn the_peak_is_the_highest_of_the_last_ten_seconds() {
+        let t = Instant::now();
+        let mut p = RecentPeak::default();
+        let at = |s| t + Duration::from_secs(s);
+        assert_eq!(p.record(at(0), 900.0), 900.0);
+        assert_eq!(p.record(at(1), 100.0), 900.0);
+        assert_eq!(
+            p.record(at(10), 100.0),
+            900.0,
+            "ten seconds on, still in it"
+        );
+        assert_eq!(p.record(at(11), 200.0), 200.0, "and then it is gone");
     }
 }

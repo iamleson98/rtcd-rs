@@ -23,7 +23,7 @@ use crate::camera_budget::{
 use crate::ids::TrackType;
 use crate::layers::{
     Ladder, Layer, LayerRates, Rung, SCREEN_STALL_AFTER, STALL_AFTER, ScreenInputs, WATCH_EVERY,
-    limit_for_pace,
+    limit_for_pace, split_budget,
 };
 
 /// The most cameras one receiver may name.
@@ -456,6 +456,7 @@ impl Engine {
             link: e.link,
             delivery: e.delivery,
             other: 0.0,
+            ceiling: None,
         };
         if !path.congested() {
             return;
@@ -507,13 +508,31 @@ impl Engine {
             link: estimate.link,
             delivery: estimate.delivery,
             other: self.other_video_rate(key, now),
+            ceiling: self.screen_ceiling(key, now),
         };
         let before = s.down.screen_level.level();
+        let before_rung = s.down.screen_level.rung();
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
         s.down.screen_review = Some(now);
         let rung = s.down.screen_level.decide(now, inputs, &ladder);
+        if let (Some(old), Some(ceiling)) = (before_rung, inputs.ceiling) {
+            let (was, now_rate) = (ladder.rate_of(old), ladder.rate_of(rung));
+            if let Some((was, is)) = was.zip(now_rate)
+                && was > ceiling
+                && is < was
+            {
+                s.down.budget_hold.cut(now);
+                self.metrics.receiver_budget_limited(if is > ceiling {
+                    "floor"
+                } else if rung.layer != old.layer {
+                    "screen_small"
+                } else {
+                    "screen_temporal"
+                });
+            }
+        }
         // While the receiver waits for the keyframe of a smaller layer, it gets only the base of
         // the larger: what it was sent is what congested its path.
         let limit = match serving {
@@ -579,12 +598,39 @@ impl Engine {
             .unwrap_or(0.0)
     }
 
+    /// Bits per second the cameras a receiver is sent cost whole on their small layers: what its
+    /// budget leaves the screen share is what is left after them.
+    fn cameras_small_rate(&self, key: SessionKey) -> f64 {
+        let Some(s) = self.sessions.get(key) else {
+            return 0.0;
+        };
+        camera_budget::small_total(
+            s.down
+                .iter()
+                .filter(|(_, d)| d.ty == TrackType::Video && d.phase == DownPhase::Active)
+                .filter_map(|(_, d)| self.sessions.get(d.publisher))
+                .map(|p| &p.up.camera_steps),
+        )
+    }
+
+    /// The most the screen share may cost a receiver under its plan budget (`None`: it has none).
+    /// While the budget has just cut something the screen share is not taken up (see
+    /// `BudgetHold`).
+    fn screen_ceiling(&self, key: SessionKey, now: Instant) -> Option<f64> {
+        let s = self.sessions.get(key)?;
+        let budget = s.cfg.props.receiver_budget_bps()?;
+        let sent = self.screen_rate(key, now);
+        let ceiling = split_budget(budget, self.cameras_small_rate(key), sent).screen;
+        Some(if s.down.budget_hold.may_raise(now) || sent == 0.0 {
+            ceiling
+        } else {
+            ceiling.min(sent)
+        })
+    }
+
     /// Measures what a session's camera costs a receiver at each of its steps, once for all its
     /// receivers (`review_cameras` reads it).
     fn measure_cameras(&mut self, key: SessionKey, now: Instant) {
-        if !self.cfg.camera_budget {
-            return;
-        }
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
@@ -595,7 +641,17 @@ impl Engine {
     /// is sent whole, or as much of its temporal layers as fits, or paused until a keyframe finds
     /// it room again. Looked at once a second, and sooner while the path says it is congested.
     pub(super) fn review_cameras(&mut self, key: SessionKey, now: Instant) {
-        if !self.cfg.camera_budget {
+        // A receiver with a plan budget is looked at every time, the path-held cameras being off
+        // or not: the budget holds whatever the path says.
+        let Some(budget) = self
+            .sessions
+            .get(key)
+            .map(|s| s.cfg.props.receiver_budget_bps())
+        else {
+            return;
+        };
+        let by_path_on = self.cfg.camera_budget;
+        if !by_path_on && budget.is_none() {
             return;
         }
         if let Some(s) = self.sessions.get_mut(key) {
@@ -617,8 +673,9 @@ impl Engine {
             link: e.link,
             delivery: e.delivery,
             other: 0.0,
+            ceiling: None,
         };
-        if s.down.cameras.limit().is_none() && !path.congested() {
+        if budget.is_none() && s.down.cameras.limit().is_none() && !path.congested() {
             return;
         }
         let voices = self.calls.get(&s.call).map(|c| &c.voices);
@@ -696,17 +753,62 @@ impl Engine {
             }
         };
         let before: Vec<usize> = cameras.iter().map(|c| c.level).collect();
+        let small = self.cameras_small_rate(key);
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
-        s.down
-            .cameras
-            .review(now, &path, camera_budget::Load::of(&cameras));
-        let raise = s.down.cameras.raise_ceiling(now);
-        let limit = s.down.cameras.limit();
-        let cause = s.down.cameras.cause();
-        let trial = s.down.cameras.pause_trial(now);
-        camera_budget::allocate(limit, raise, trial, &mut cameras);
+        // The cameras' room is what the screen share leaves at its highest of late, so that a
+        // share whose rate swings does not move the cameras up and down with it.
+        let peak = s.down.screen_peak.record(now, screen);
+        let cap = budget.map(|b| split_budget(b, small, peak).cameras);
+        let (mut raise, mut limit, mut trial, mut cause) = (None, None, None, None);
+        if by_path_on {
+            s.down
+                .cameras
+                .review(now, &path, camera_budget::Load::of(&cameras));
+            raise = s.down.cameras.raise_ceiling(now);
+            limit = s.down.cameras.limit();
+            cause = s.down.cameras.cause();
+            trial = s.down.cameras.pause_trial(now);
+        }
+        camera_budget::allocate(limit, raise, trial, cap, &mut cameras);
+        if cap.is_some() && !s.down.budget_hold.may_raise(now) {
+            // The budget has just cut something: nothing is taken up for a while.
+            for (camera, was) in cameras.iter_mut().zip(&before) {
+                camera.level = camera.level.min(*was);
+            }
+        }
+        if cap.is_some() && cameras.iter().zip(&before).any(|(c, was)| c.level < *was) {
+            // What the path alone would give, to tell what the budget cut from what the path did.
+            let mut free = cameras.clone();
+            for (camera, was) in free.iter_mut().zip(&before) {
+                camera.level = *was;
+            }
+            camera_budget::allocate(limit, raise, trial, None, &mut free);
+            let cut = |c: &Camera, f: &Camera, was: usize| c.level < was && c.level < f.level;
+            let steps: Vec<&'static str> = cameras
+                .iter()
+                .zip(&free)
+                .zip(&before)
+                .filter(|((c, f), was)| cut(c, f, **was))
+                .map(|((c, _), _)| {
+                    if c.level == 0 {
+                        "camera_paused"
+                    } else {
+                        "camera_small"
+                    }
+                })
+                .collect();
+            if !steps.is_empty() {
+                s.down.budget_hold.cut(now);
+                for step in steps {
+                    self.metrics.receiver_budget_limited(step);
+                }
+                if cameras.iter().all(|c| c.level == 0) {
+                    self.metrics.receiver_budget_limited("floor");
+                }
+            }
+        }
         let (mut raised, mut changed) = (false, false);
         let (mut paused, mut thinned) = (0, 0);
         for ((id, camera), was) in streams.into_iter().zip(&cameras).zip(before) {
@@ -741,7 +843,8 @@ impl Engine {
                 "cameras held to the path"
             );
         }
-        if limit.is_none() {
+        // Cameras the budget holds small are not let go of by a path that holds nothing.
+        if limit.is_none() && !(cap.is_some() && cameras.iter().any(|c| c.held_small(c.level))) {
             self.release_small_cameras(key, now);
         }
     }

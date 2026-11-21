@@ -20,7 +20,7 @@ use super::types::Proto;
 use crate::bwe::Estimate;
 use crate::camera_budget::{CameraBudget, CameraSteps};
 use crate::ids::TrackType;
-use crate::layers::{Layer, ScreenLevel, StallWatch};
+use crate::layers::{BudgetHold, Layer, RecentPeak, ScreenLevel, StallWatch};
 use crate::rate::RateMonitor;
 use crate::rewrite::Rewriter;
 use crate::temporal::TemporalFilter;
@@ -243,6 +243,10 @@ pub(crate) struct Downlink {
     /// What the receiver's path carries of its cameras, and when that was last looked at.
     pub cameras: CameraBudget,
     pub camera_review: Option<Instant>,
+    /// When the receiver's plan budget last cut something (see `layers::BudgetHold`).
+    pub budget_hold: BudgetHold,
+    /// The highest rate the screen share was sent at lately: what the cameras' room is split by.
+    pub screen_peak: RecentPeak,
 }
 
 impl Downlink {
