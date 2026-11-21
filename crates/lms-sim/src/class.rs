@@ -1384,8 +1384,14 @@ mod tests {
     fn every_vp8_stream_sends_a_15_bit_picture_id() {
         // A plain stream (a screen, or a single-layer camera): X and I set, M set, no wrap at 127.
         assert_eq!(vp8_descriptor(true, 127, None), vec![0x90, 0x80, 0x80, 127]);
-        assert_eq!(vp8_descriptor(false, 128, None), vec![0x80, 0x80, 0x80, 128]);
-        assert_eq!(vp8_descriptor(true, 0x7fff, None), vec![0x90, 0x80, 0xff, 0xff]);
+        assert_eq!(
+            vp8_descriptor(false, 128, None),
+            vec![0x80, 0x80, 0x80, 128]
+        );
+        assert_eq!(
+            vp8_descriptor(true, 0x7fff, None),
+            vec![0x90, 0x80, 0xff, 0xff]
+        );
         // With temporal layers: I, L and T set, then TL0PICIDX and TID/Y.
         assert_eq!(
             vp8_descriptor(false, 300, Some((7, 2, true))),
