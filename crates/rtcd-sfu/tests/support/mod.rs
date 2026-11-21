@@ -350,12 +350,22 @@ impl World {
 
     /// Starts a browser named `name` that is `user`'s: two of the same user make two sessions.
     pub fn start_as(&mut self, name: &str, user: &str, call: &str, camera: bool) -> usize {
-        self.start_session(name, user, call, camera, false)
+        self.start_session(name, user, call, camera, false, 0)
     }
 
     /// Like [`join_with_camera`](Self::join_with_camera), for the call's host (a class's teacher).
     pub fn join_host_with_camera(&mut self, name: &str, call: &str) -> usize {
-        let i = self.start_session(name, &format!("user-{name}"), call, true, true);
+        let i = self.start_session(name, &format!("user-{name}"), call, true, true, 0);
+        let ok = self.run_until(Duration::from_secs(20), |w| {
+            w.browsers[i].connected && w.browsers[i].dc.is_some()
+        });
+        assert!(ok, "{name} did not connect");
+        i
+    }
+
+    /// Like [`join`](Self::join), for a viewer whose plan lets it be sent `kbps` kbit/s in all.
+    pub fn join_with_budget(&mut self, name: &str, call: &str, kbps: u32) -> usize {
+        let i = self.start_session(name, &format!("user-{name}"), call, false, false, kbps);
         let ok = self.run_until(Duration::from_secs(20), |w| {
             w.browsers[i].connected && w.browsers[i].dc.is_some()
         });
@@ -370,6 +380,7 @@ impl World {
         call: &str,
         camera: bool,
         host: bool,
+        budget_kbps: u32,
     ) -> usize {
         let session_id = format!("session-{name}");
         let cfg = SessionConfig {
@@ -388,6 +399,7 @@ impl World {
                     dc_signaling: true,
                     host,
                     observer: false,
+                    receiver_budget_kbps: budget_kbps,
                 },
             )
             .props,

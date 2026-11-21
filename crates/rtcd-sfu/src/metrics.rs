@@ -97,6 +97,13 @@ pub trait Metrics: Send + Sync + 'static {
     fn screen_layer_time(&self, large: bool, took: Duration) {
         let _ = (large, took);
     }
+    /// A receiver's budget, not its path, cut what it is sent: `step` is `camera_small` (a camera
+    /// held to its small layer or thinned), `camera_paused`, `screen_temporal` (a screen share
+    /// thinned), `screen_small` (moved to its small layer) or `floor` (everything is at its lowest
+    /// and the budget is still not met).
+    fn receiver_budget_limited(&self, step: &'static str) {
+        let _ = step;
+    }
     /// A keyframe was asked of a sender (`sent`), or held back because it was asked a moment ago.
     fn keyframe_request(&self, sent: bool) {
         let _ = sent;

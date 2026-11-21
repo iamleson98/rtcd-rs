@@ -884,6 +884,7 @@ fn join_message(call: &str, user: &str, session: &str) -> ClientMessage {
         dc_signaling: true,
         host: false,
         observer: false,
+        receiver_budget_kbps: 0,
     })
 }
 

@@ -32,6 +32,9 @@ pub struct JoinRequest {
     /// The participant only watches the call: the session recorder. A node with no room left
     /// still takes it, or the class would not be recorded.
     pub observer: bool,
+    /// What the participant may receive in all, in kbit/s: the plan's cap on each viewer's
+    /// downstream, for voice and video together. Zero, which an older server sends, is no budget.
+    pub receiver_budget_kbps: u32,
 }
 
 /// The `{"sessionID": ...}` payload of leave, reconnect and close.
@@ -177,7 +180,7 @@ impl ClientMessage {
                 &[("clientID", &h.client_id), ("connID", &h.conn_id)],
             ),
             Self::Join(j) => {
-                rmp::encode::write_map_len(&mut out, 8).expect("vec write");
+                rmp::encode::write_map_len(&mut out, 9).expect("vec write");
                 for (key, value) in [
                     ("callID", &j.call_id),
                     ("userID", &j.user_id),
@@ -196,6 +199,11 @@ impl ClientMessage {
                     rmp::encode::write_str(&mut out, key).expect("vec write");
                     rmp::encode::write_bool(&mut out, value).expect("vec write");
                 }
+                write_uint_entry(
+                    &mut out,
+                    "receiverBudgetKbps",
+                    j.receiver_budget_kbps.into(),
+                );
             }
             Self::Leave(s) | Self::Reconnect(s) | Self::Close(s) => {
                 write_str_map(&mut out, &[("sessionID", &s.session_id)])
@@ -262,6 +270,7 @@ impl ClientMessage {
                     dc_signaling: lookup_bool(map, "dcSignaling"),
                     host: lookup_bool(map, "host"),
                     observer: lookup_bool(map, "observer"),
+                    receiver_budget_kbps: lookup_u32(map, "receiverBudgetKbps"),
                 })
             }
             "leave" | "reconnect" | "close" => {
@@ -389,6 +398,7 @@ mod tests {
                 dc_signaling: false,
                 host: true,
                 observer: true,
+                receiver_budget_kbps: 2000,
             }),
             ClientMessage::Leave(SessionRef {
                 session_id: "s".into(),
@@ -467,6 +477,7 @@ mod tests {
         assert_eq!(join.call_id, "c1");
         assert_eq!(join.session_id, "");
         assert!(!join.dc_signaling);
+        assert_eq!(join.receiver_budget_kbps, 0, "an older server sends none");
     }
 
     #[test]

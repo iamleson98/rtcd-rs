@@ -15,6 +15,14 @@ use rtcd_sfu::metrics::{Direction, Metrics as SfuMetrics, NetTraffic, ReceiverQu
 use crate::info::SystemStatus;
 
 const NAMESPACE: &str = "rtcd";
+/// What a receiver's budget cuts (the `step` label of `receiver_budget_limited_total`).
+const BUDGET_STEPS: [&str; 5] = [
+    "camera_small",
+    "camera_paused",
+    "screen_temporal",
+    "screen_small",
+    "floor",
+];
 const LATENCY_BUCKETS: [f64; 14] = [
     0.001, 0.005, 0.0075, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.3, 0.4, 0.5, 0.75, 1.0,
 ];
@@ -344,6 +352,8 @@ pub struct Metrics {
     estimate: prometheus::Histogram,
     /// Seconds receivers spent on a shared screen's [small, large] layer.
     screen_layer_seconds: [Counter; 2],
+    /// What a receiver's budget cut, by step (see `rtcd_sfu::Metrics::receiver_budget_limited`).
+    receiver_budget_limited: CounterVec,
     /// Keyframe requests: [sent, held back].
     keyframe_requests: [Counter; 2],
     /// A camera's large layer: [stalled, resumed].
@@ -703,6 +713,19 @@ impl Metrics {
                 );
                 ["small", "large"].map(|l| family.with_label_values(&[l]))
             },
+            receiver_budget_limited: {
+                let family = counter(
+                    r,
+                    "receiver",
+                    "budget_limited_total",
+                    "Times a receiver's plan budget, not its path, cut what it is sent, by what was cut",
+                    &["step"],
+                );
+                for step in BUDGET_STEPS {
+                    family.with_label_values(&[step]);
+                }
+                family
+            },
             keyframe_requests: {
                 let family = counter(
                     r,
@@ -1002,6 +1025,12 @@ impl SfuMetrics for Metrics {
         self.screen_layer_seconds[usize::from(large)].inc_by(took.as_secs_f64());
     }
 
+    fn receiver_budget_limited(&self, step: &'static str) {
+        self.receiver_budget_limited
+            .with_label_values(&[step])
+            .inc();
+    }
+
     fn keyframe_request(&self, sent: bool) {
         self.keyframe_requests[usize::from(!sent)].inc();
     }
@@ -1059,6 +1088,7 @@ mod tests {
         });
         m.bandwidth_estimate(2.5e6);
         m.screen_layer_time(true, Duration::from_secs(1));
+        m.receiver_budget_limited("camera_small");
         m.keyframe_request(false);
         m.camera_large_layer(true);
         m.screen_large_layer(false);
@@ -1095,6 +1125,8 @@ mod tests {
             "rtcd_rtc_receiver_rtt_count 1",
             "rtcd_rtc_bandwidth_estimate_bps_count 1",
             "rtcd_rtc_screen_layer_seconds_total{layer=\"large\"} 1",
+            "rtcd_receiver_budget_limited_total{step=\"camera_small\"} 1",
+            "rtcd_receiver_budget_limited_total{step=\"floor\"} 0",
             "rtcd_rtc_keyframe_requests_total{result=\"held_back\"} 1",
             "rtcd_rtc_camera_large_layer_total{state=\"stalled\"} 1",
             "rtcd_rtc_screen_large_layer_total{state=\"resumed\"} 1",
