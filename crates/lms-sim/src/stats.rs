@@ -810,7 +810,8 @@ mod tests {
         let path = scratch("stats-shared");
         let sender = Sink::open(&path).unwrap();
         let receiver = Sink::open(&path.with_file_name("other.jsonl")).unwrap();
-        let sent = wall_ms_at(clock()) - 30.0;
+        let arrival = wall_ms_at(clock());
+        let sent = arrival - 30.0;
         // Two layers of one camera that start apart: the one that fits the timestamp is the clock.
         sender.set_clock(
             "video:s01",
@@ -832,8 +833,8 @@ mod tests {
         );
         let clocks = receiver.clocks_of("video:s01");
         assert_eq!(clocks.len(), 2);
-        let delay = delay_among(&clocks, 900_000, wall_ms_at(clock())).unwrap();
-        assert!((delay - 30.0).abs() < 5.0, "{delay}");
+        let delay = delay_among(&clocks, 900_000, arrival).unwrap();
+        assert!((delay - 30.0).abs() < 1e-6, "{delay}");
         assert!(receiver.clocks_of("video:nobody").is_empty());
     }
 
