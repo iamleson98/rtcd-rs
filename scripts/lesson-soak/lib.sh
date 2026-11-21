@@ -2,7 +2,7 @@
 # What run.sh (a lesson or an abuse soak) and calibrate.sh (the load ramp) share: the images, the
 # network and its addresses, the SFU in a container of two CPUs, its sampler, the lesson client
 # containers, the background load and the evidence of a crash. Sourced, never run. The caller sets
-# IMPL (rs|rs-budget|go), OUT (an existing absolute directory), here and root (this directory and the
+# IMPL (rs|rs-budget|rs-nopace|go), OUT (an existing absolute directory), here and root (this directory and the
 # repository) before it calls anything.
 
 SOAK_DIR=${SOAK_DIR:-$root/vendor/rtc/benchmarks/soak}
@@ -11,11 +11,13 @@ CHROME_IMAGE=${CHROME_IMAGE:-rtcd-lesson-chrome:soak}
 # The upstream Go service, the latest stable release when this was written (2026-06-29), by tag and
 # by the digest of its multi-arch index (linux/amd64 and linux/arm64).
 GO_IMAGE='mattermost/rtcd:v1.2.6@sha256:a8c3c1c3fa2937527d3a96351534fa116106b88aca777bed49d6a360fb2eacd3'
-# rs and rs-budget are the same image: they differ in the camera budget alone (RTCD_RTC_CAMERABUDGET),
-# set explicitly for each so that a change of the service's default moves neither.
+# rs, rs-budget and rs-nopace are the same image: they differ in the camera budget and in the pacing
+# of video sends (RTCD_RTC_CAMERABUDGET, RTCD_RTC_PACING), set explicitly for each so that a change
+# of the service's defaults moves none of them. rs-nopace is rs-budget with the pacing off.
 case "$IMPL" in
-  rs) SFU_IMAGE=${SFU_IMAGE:-rtcd-rs:soak} SFU_EXTRA_ENV=(-e RTCD_RTC_CAMERABUDGET=false) ;;
-  rs-budget) SFU_IMAGE=${SFU_IMAGE:-rtcd-rs:soak} SFU_EXTRA_ENV=(-e RTCD_RTC_CAMERABUDGET=true) ;;
+  rs) SFU_IMAGE=${SFU_IMAGE:-rtcd-rs:soak} SFU_EXTRA_ENV=(-e RTCD_RTC_CAMERABUDGET=false -e RTCD_RTC_PACING=true) ;;
+  rs-budget) SFU_IMAGE=${SFU_IMAGE:-rtcd-rs:soak} SFU_EXTRA_ENV=(-e RTCD_RTC_CAMERABUDGET=true -e RTCD_RTC_PACING=true) ;;
+  rs-nopace) SFU_IMAGE=${SFU_IMAGE:-rtcd-rs:soak} SFU_EXTRA_ENV=(-e RTCD_RTC_CAMERABUDGET=true -e RTCD_RTC_PACING=false) ;;
   *) SFU_IMAGE=${SFU_IMAGE:-$GO_IMAGE} SFU_EXTRA_ENV=() ;;
 esac
 # What the lines say (and `uname -m` on a Mac says arm64).
@@ -97,20 +99,66 @@ start_sfu() {
     --memory=4g --memory-swap=4g --ulimit nofile=65536:65536 ${SFU_PUBLISH[@]+"${SFU_PUBLISH[@]}"} \
     "${envs[@]}" ${1+"$@"} "$SFU_IMAGE" >/dev/null
   segment_in_software
-  for _ in $(seq 60); do
-    docker run --rm --network "$NET" "$LESSON_IMAGE" curl -sf "http://$SFU_IP:8045/version" >/dev/null 2>&1 && break
-    sleep 1
-  done
+  wait_sfu
   docker run --rm --network "$NET" "$LESSON_IMAGE" curl -sf "http://$SFU_IP:8045/version" | head -c 300
   echo
 }
 
-# The sampler of the SFU's process, into OUT/proc.jsonl, for $1 seconds.
+# Waits until the SFU answers (a minute at most).
+wait_sfu() {
+  for _ in $(seq 60); do
+    docker run --rm --network "$NET" "$LESSON_IMAGE" curl -sf "http://$SFU_IP:8045/version" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# Writes the SFU's process id where the sampler looks for it (OUT/sfu.pid).
+note_sfu_pid() {
+  docker inspect -f '{{.State.Pid}}' soak-sfu >"$OUT/sfu.pid.tmp"
+  mv "$OUT/sfu.pid.tmp" "$OUT/sfu.pid"
+}
+
+# Tells the sampler to measure the CPU of a client container ($1): OUT/pids/<name> holds the pid of
+# its main process, and the sampler writes `proc` rows with the id client:<name>.
+note_client() {
+  mkdir -p "$OUT/pids"
+  docker inspect -f '{{.State.Pid}}' "$1" >"$OUT/pids/$1"
+}
+
+# The sampler of the SFU's process (followed through a restart) and of the client containers, into
+# OUT/proc.jsonl, for $1 seconds. It reads the host's cgroups for the clients' CPU (--cgroupns=host).
 start_sampler() {
-  local pid
-  pid=$(docker inspect -f '{{.State.Pid}}' soak-sfu)
-  docker run -d --name soak-sample --privileged --pid=host -v "$OUT":/out "$LESSON_IMAGE" \
-    python3 /usr/local/bin/sample.py "$pid" "rtcd-$IMPL" /out/proc.jsonl 5 "$1" >/dev/null
+  rm -rf "$OUT/pids"
+  mkdir -p "$OUT/pids"
+  note_sfu_pid
+  docker run -d --name soak-sample --privileged --pid=host --cgroupns=host -v "$OUT":/out "$LESSON_IMAGE" \
+    python3 /usr/local/bin/sample.py @/out/sfu.pid "rtcd-$IMPL" /out/proc.jsonl 5 "$1" /out/pids >/dev/null
+}
+
+# One `event` row of the SFU's (id "sfu") appended to $1: file what detail.
+sfu_event() {
+  python3 - "$1" "rtcd-$IMPL" "$ARCH" "$2" "$3" <<'PY'
+import json, sys, time
+path, impl, arch, what, detail = sys.argv[1:6]
+with open(path, "a") as f:
+    f.write(json.dumps({"ts": int(time.time() * 1000), "impl": impl, "arch": arch, "kind": "event", "id": "sfu", "what": what, "detail": detail}) + "\n")
+PY
+}
+
+# Restarts the SFU's container on purpose, the way an operator does (the restart profile): logs an
+# `sfu_restart` event with the number $1 at that moment (OUT/restarts.jsonl), restarts it, and redoes
+# what the container's network needs again (its namespace is made anew: the segmentation offload),
+# waits until it answers and tells the sampler its new process. OUT/restarting exists meanwhile, so
+# that run.sh does not take the SFU's absence for a crash.
+restart_sfu() {
+  : >"$OUT/restarting"
+  sfu_event "$OUT/restarts.jsonl" sfu_restart "$1"
+  docker restart soak-sfu >/dev/null
+  segment_in_software
+  wait_sfu || echo "the SFU did not answer after restart $1" >&2
+  note_sfu_pid
+  rm -f "$OUT/restarting"
 }
 
 # A lesson client container: name ip group extra-docker-args...; the lesson's own options are in
@@ -124,6 +172,7 @@ lesson() {
     lms-sim lesson --http "http://$SFU_IP:8045" --media "$SFU_IP:8443" --minutes "$MINUTES" \
     --impl "rtcd-$IMPL" --group "$group" --total "$TOTAL" --measure "$MEASURE" --talk-secs "$TALK_SECS" \
     "${LESSON_CHROME[@]}" --out "/out/$group.jsonl" $EXTRA >/dev/null
+  note_client "$name"
 }
 joined() { # container: waits for its "joined" line
   for _ in $(seq 120); do
@@ -143,6 +192,7 @@ load_container() {
     lms-sim load --http "http://$SFU_IP:8045" --media "$SFU_IP:8443" --classes "$classes" \
     --students "$LOAD_STUDENTS" --cameras "$LOAD_CAMERAS" --watch "$LOAD_WATCH" \
     --per-second "$LOAD_PER_SECOND" --seconds "$seconds" >/dev/null
+  note_client "$name"
 }
 wait_load_joined() { # container classes
   local limit=$((($2 * (LOAD_STUDENTS + 1)) / LOAD_PER_SECOND + 120))
@@ -158,24 +208,21 @@ wait_load_joined() { # container classes
 # the caller has written): it stopped, was killed for memory, was restarted, or its log has a panic or
 # a fatal error. One `event` row per finding goes to OUT/sfu-events.jsonl (the report counts them and
 # its gate is zero), and the return status is 1 when there is any. The container never restarts by
-# itself (no restart policy), so a restart count is a finding too.
+# itself (no restart policy), so a restart count is a finding too, except for the restarts the restart
+# profile made on purpose (the `sfu_restart` rows of OUT/restarts.jsonl).
 sfu_check() {
-  local running exit oom restarts hits status=0
+  local running exit oom restarts hits planned status=0
   read -r running exit oom restarts < <(docker inspect -f '{{.State.Running}} {{.State.ExitCode}} {{.State.OOMKilled}} {{.RestartCount}}' soak-sfu)
   echo "SFU: running=$running exit=$exit oom=$oom restarts=$restarts"
   finding() {
-    python3 - "$OUT/sfu-events.jsonl" "rtcd-$IMPL" "$ARCH" "$1" <<'PY'
-import json, sys, time
-path, impl, arch, detail = sys.argv[1:5]
-with open(path, "a") as f:
-    f.write(json.dumps({"ts": int(time.time() * 1000), "impl": impl, "arch": arch, "kind": "event", "id": "sfu", "what": "error", "detail": detail}) + "\n")
-PY
+    sfu_event "$OUT/sfu-events.jsonl" error "$1"
     echo "SFU finding: $1" >&2
     status=1
   }
   [ "$running" = true ] || finding "the SFU container stopped (exit $exit)"
   [ "$oom" = false ] || finding "the SFU container was killed for memory (OOMKilled)"
-  [ "$restarts" = 0 ] || finding "the SFU container restarted $restarts times"
+  planned=$(grep -c '"sfu_restart"' "$OUT/restarts.jsonl" 2>/dev/null || true)
+  [ "$restarts" -le "${planned:-0}" ] || finding "the SFU container restarted $restarts times"
   hits=$(grep -ciE 'panic|panicked at|fatal error|SIGSEGV|SIGABRT' "$OUT/soak-sfu.log" 2>/dev/null || true)
   if [ "${hits:-0}" -gt 0 ]; then
     finding "$hits log lines with a panic or a fatal error, the first: $(grep -iE -m1 'panic|panicked at|fatal error|SIGSEGV|SIGABRT' "$OUT/soak-sfu.log" | cut -c1-300)"
