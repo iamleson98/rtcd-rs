@@ -45,7 +45,7 @@ use tokio::task::JoinHandle;
 use crate::assets::{Assets, CameraLayers, Clip};
 use crate::host::{Rtcd, RtcdConn};
 use crate::hostile::{self, Hostile, Hot, Rng};
-use crate::stats::{Probe, Receiver};
+use crate::stats::{Probe, Receiver, RtpClock, wall_ms_at};
 
 const AUDIO_LEVEL_URI: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
 const MID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
@@ -186,6 +186,9 @@ pub(crate) struct Video {
     /// bits either way, as a browser's is.
     pub(crate) temporal: bool,
     pub(crate) mid: Option<String>,
+    /// Whether the layers' timestamps are on one timeline anchored to the wall clock (see
+    /// [`Video::anchor`]); a try that is not connected has no schedule to anchor to.
+    anchored: bool,
 }
 
 impl Video {
@@ -216,11 +219,31 @@ impl Video {
             next: vec![now; n],
             step: clips
                 .iter()
-                .map(|c| Duration::from_micros(1_000_000 / u64::from(c.fps)))
+                .map(|c| Duration::from_nanos(1_000_000_000 / u64::from(c.fps)))
                 .collect(),
             clips,
             temporal,
             mid: None,
+            anchored: false,
+        }
+    }
+
+    /// Puts every layer on one timeline (the layers' frames are on the same clock, as one
+    /// encoder's are), the latest of the layers' timestamps, that starts at `at`; returns where
+    /// that clock stands on the wall clock.
+    fn anchor(&mut self, at: Instant) -> RtpClock {
+        let ts = self
+            .ts
+            .iter()
+            .copied()
+            .reduce(|a, b| if b.wrapping_sub(a) as i32 > 0 { b } else { a })
+            .unwrap_or_default();
+        self.ts.fill(ts);
+        self.anchored = true;
+        RtpClock {
+            ts,
+            wall_ms: wall_ms_at(at),
+            rate: 90_000.0,
         }
     }
 
@@ -703,6 +726,8 @@ async fn drive(
     let mut mic_seq = if wrap { WRAP_SEQ } else { 0u16 };
     let mut mic_ts = if wrap { WRAP_AUDIO_TS } else { 0u32 };
     let mut mic_pos = 0usize;
+    let mut mic_anchored = false;
+    let sender = sid.strip_prefix("session-").unwrap_or(sid);
     let mut next_audio = Instant::now();
     // What this participant measures of what it receives, and where to ask for a keyframe.
     let mut rx = probe
@@ -851,6 +876,37 @@ async fn drive(
             if let Some(data) = watch.take() {
                 conn.send(message(sid, call, MessageType::VideoSubscribe, data));
             }
+            // The senders say where their RTP clocks stand on the wall clock: the schedule starts
+            // at `next_audio` and at the first frame of each camera, and the timestamps go on at
+            // the rate of the schedule.
+            if let Some(p) = probe {
+                if !mic_anchored {
+                    mic_anchored = true;
+                    p.clock(
+                        "voice",
+                        sender,
+                        RtpClock {
+                            ts: mic_ts,
+                            wall_ms: wall_ms_at(next_audio),
+                            rate: 48_000.0,
+                        },
+                    );
+                }
+                for v in [camera.as_mut(), screen.as_mut()].into_iter().flatten() {
+                    if !v.anchored {
+                        let clock = v.anchor(v.next[0]);
+                        p.clock(
+                            if v.label == "screen" {
+                                "screen"
+                            } else {
+                                "video"
+                            },
+                            sender,
+                            clock,
+                        );
+                    }
+                }
+            }
             if persist.voice {
                 while next_audio <= now {
                     let seq = mic_seq;
@@ -957,8 +1013,10 @@ async fn drive(
             }
         } else {
             next_audio = now;
+            mic_anchored = false;
             for v in [camera.as_mut(), screen.as_mut()].into_iter().flatten() {
                 v.next.fill(now);
+                v.anchored = false;
             }
         }
 
@@ -1311,7 +1369,8 @@ fn send_frame(pc: &mut RTCPeerConnection, v: &mut Video, l: usize, on: bool) {
     let step = v.pos[l] % 4;
     let (frame, key) = clip.frames[v.pos[l] % clip.frames.len()].clone();
     v.pos[l] = (v.pos[l] + 1) % clip.frames.len();
-    v.ts[l] = v.ts[l].wrapping_add(90_000 / clip.fps);
+    let ts = v.ts[l];
+    v.ts[l] = ts.wrapping_add(90_000 / clip.fps);
     v.picture_id[l] = v.picture_id[l].wrapping_add(1) & 0x7fff;
     let tid = TEMPORAL_PATTERN[step];
     if v.temporal && tid == 0 {
@@ -1332,7 +1391,7 @@ fn send_frame(pc: &mut RTCPeerConnection, v: &mut Video, l: usize, on: bool) {
             marker: n == chunks.len() - 1,
             payload_type: pt,
             sequence_number: v.seq[l],
-            timestamp: v.ts[l],
+            timestamp: ts,
             ssrc: v.ssrcs[l],
             ..Default::default()
         };
@@ -1384,8 +1443,14 @@ mod tests {
     fn every_vp8_stream_sends_a_15_bit_picture_id() {
         // A plain stream (a screen, or a single-layer camera): X and I set, M set, no wrap at 127.
         assert_eq!(vp8_descriptor(true, 127, None), vec![0x90, 0x80, 0x80, 127]);
-        assert_eq!(vp8_descriptor(false, 128, None), vec![0x80, 0x80, 0x80, 128]);
-        assert_eq!(vp8_descriptor(true, 0x7fff, None), vec![0x90, 0x80, 0xff, 0xff]);
+        assert_eq!(
+            vp8_descriptor(false, 128, None),
+            vec![0x80, 0x80, 0x80, 128]
+        );
+        assert_eq!(
+            vp8_descriptor(true, 0x7fff, None),
+            vec![0x90, 0x80, 0xff, 0xff]
+        );
         // With temporal layers: I, L and T set, then TL0PICIDX and TID/Y.
         assert_eq!(
             vp8_descriptor(false, 300, Some((7, 2, true))),
@@ -1414,6 +1479,31 @@ mod tests {
         assert_eq!((v.ssrcs.len(), v.step.len(), v.clips.len()), (2, 2, 2));
         assert!(v.step[0] > v.step[1], "the small layer is the slower");
         assert_eq!(TEMPORAL_PATTERN, [0, 2, 1, 2]);
+    }
+
+    #[test]
+    fn the_layers_of_a_camera_share_one_timeline_that_is_anchored_to_the_wall_clock() {
+        let clip = |fps| Clip {
+            width: 16,
+            height: 16,
+            fps,
+            frames: vec![(vec![0], true)],
+        };
+        let at = Instant::now();
+        let mut v = Video::new(
+            RTCRtpSenderId::from(0usize),
+            "camera",
+            vec![1, 2],
+            vec![clip(15), clip(24)],
+            (true, false),
+            at,
+        );
+        assert_ne!(v.ts[0], v.ts[1], "a layer starts on its own");
+        let clock = v.anchor(at);
+        assert_eq!(v.ts[0], v.ts[1]);
+        assert_eq!(clock.ts, v.ts[0]);
+        assert_eq!(clock.rate, 90_000.0);
+        assert!((wall_ms_at(at) - clock.wall_ms).abs() < 50.0);
     }
 
     #[test]
