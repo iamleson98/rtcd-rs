@@ -500,12 +500,16 @@ impl Engine {
                     match s.pc.add_track(track) {
                         Ok(id) => {
                             // Redundant audio is offered ahead of Opus, which a receiver that takes
-                            // it answers in the same order.
-                            if red && slot.ty == TrackType::Voice {
-                                s.pc.rtp_transceiver(id.into())
-                                    .ok_or_else(|| "audio transceiver".to_owned())?
-                                    .set_codec_preferences(vec![red_codec(), opus_codec()])
-                                    .map_err(|err| format!("audio codecs: {err}"))?;
+                            // it answers in the same order. Once the connection has negotiated
+                            // audio its codecs are those the receiver accepted, in its order, which
+                            // already say whether redundant audio is offered: a list naming one it
+                            // refused is rejected, and is not needed.
+                            if red
+                                && slot.ty == TrackType::Voice
+                                && let Some(mut transceiver) = s.pc.rtp_transceiver(id.into())
+                            {
+                                let _ = transceiver
+                                    .set_codec_preferences(vec![red_codec(), opus_codec()]);
                             }
                             slot.sender = Some(id);
                             slot.phase = DownPhase::Adding;

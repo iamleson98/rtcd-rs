@@ -290,11 +290,11 @@ mod tests {
         e.encode(OPUS, 1, 0, &voice(1, 1_024), true);
         let d = decode(&e.encode(OPUS, 2, 960, &voice(2, 50), true)).unwrap();
         assert!(d.redundant.is_empty());
-        // One of 1,023 does.
-        let mut e = Encoder::default();
-        e.encode(OPUS, 1, 0, &voice(1, 1_023), true);
-        let d = decode(&e.encode(OPUS, 2, 960, &voice(2, 50), true)).unwrap();
+        // One of 1,023 does (the size cap would drop it from a payload, not the header).
+        let big = voice(1, 1_023);
+        let d = decode(&build(OPUS, &[(16_383, &big)], &voice(2, 50))).unwrap();
         assert_eq!(d.redundant[0].data.len(), 1_023);
+        assert_eq!(d.redundant[0].offset, 16_383);
         // Two packets of 4,000 ticks each are 8,000 apart: inside the 14 bits (16,383) and the step.
         let mut e = Encoder::default();
         e.encode(OPUS, 1, 0, &voice(1, 50), true);
