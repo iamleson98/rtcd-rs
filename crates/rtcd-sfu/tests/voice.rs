@@ -41,14 +41,25 @@ fn a_participant_joins_and_connects() {
 /// Alice speaks to Bob, who takes plain Opus, and to Carol, who can receive redundant audio; the
 /// node is configured with `red`. Returns the world and their indexes.
 fn a_voice_heard_by_a_plain_and_a_red_listener(red: bool) -> (World, usize, usize) {
+    heard_by(red, false)
+}
+
+/// The same, with the listener that takes redundant audio joining first when `red_first`.
+fn heard_by(red: bool, red_first: bool) -> (World, usize, usize) {
     let mut w = World::with_config(EngineConfig {
         red,
         ..engine_config()
     });
     let a = w.join("alice", "call1");
-    let b = w.join("bob", "call1");
-    w.red = true;
-    let c = w.join("carol", "call1");
+    w.red = red_first;
+    let first = w.join("first", "call1");
+    w.red = !red_first;
+    let second = w.join("second", "call1");
+    let (b, c) = if red_first {
+        (second, first)
+    } else {
+        (first, second)
+    };
     talk(&mut w, a);
     wait_tracks(&mut w, b, 1);
     wait_tracks(&mut w, c, 1);
@@ -108,6 +119,85 @@ fn a_listener_that_takes_redundant_audio_is_sent_it_and_the_others_plain_opus() 
         .collect();
     assert_eq!(before, vec![8, 9]);
     assert!(d.redundant.iter().all(|r| r.payload_type == 111));
+}
+
+#[test]
+fn a_listener_that_refused_redundant_audio_is_sent_plain_opus_after_one_that_took_it() {
+    let (w, plain, red_listener) = heard_by(true, true);
+    assert!(
+        voice_packets(&w, red_listener)
+            .iter()
+            .all(|(pt, _)| *pt == red::RED_PAYLOAD_TYPE)
+    );
+    let voice = voice_packets(&w, plain);
+    assert!(voice.len() >= 30);
+    assert!(voice.iter().all(|(pt, _)| *pt == 111));
+}
+
+/// What the packets of `track` that browser `i` received say of the voice frames: for each, the
+/// frame number of its primary and of the packets it carries along.
+fn numbered_blocks(w: &World, i: usize, track: &str) -> Vec<(u32, Vec<u32>)> {
+    w.browsers[i]
+        .rtp
+        .iter()
+        .filter(|(t, _)| t.starts_with(track))
+        .filter_map(|(_, p)| {
+            assert_eq!(p.header.payload_type, red::RED_PAYLOAD_TYPE);
+            let d = red::decode(&p.payload).expect("a RED payload, never a bare Opus packet");
+            assert_eq!(d.primary_payload_type, 111);
+            let n = support::voice_number(&d.primary)?;
+            let before = d
+                .redundant
+                .iter()
+                .map(|r| support::voice_number(&r.data).expect("a voice frame"))
+                .collect();
+            Some((n, before))
+        })
+        .collect()
+}
+
+#[test]
+fn a_voice_that_comes_back_after_a_gap_carries_only_what_the_listener_was_sent() {
+    // One voice at a time is forwarded: Alice, then Bob, then Alice again.
+    let mut w = World::with_config(EngineConfig {
+        audio_loudest: 1,
+        ..engine_config()
+    });
+    let a = w.join("alice", "call1");
+    let b = w.join("bob", "call1");
+    w.red = true;
+    let c = w.join("carol", "call1");
+    wait_tracks(&mut w, c, 0);
+    let mut n = 0;
+    for (alice, bob) in [(20, 90), (90, 20), (20, 90)] {
+        for _ in 0..150 {
+            w.send_voice_at(a, n, alice);
+            w.send_voice_at(b, n, bob);
+            n += 1;
+            w.run_for(Duration::from_millis(20));
+        }
+    }
+    w.run_for(Duration::from_millis(200));
+    for track in ["voice_session-alice", "voice_session-bob"] {
+        let packets = numbered_blocks(&w, c, track);
+        assert!(packets.len() > 100, "{track}: {}", packets.len());
+        let mut heard = std::collections::HashSet::new();
+        for (n, before) in packets {
+            for b in &before {
+                assert!(
+                    heard.contains(b),
+                    "{track}: frame {n} carries {b}, which was not sent"
+                );
+            }
+            heard.insert(n);
+        }
+    }
+    assert!(
+        numbered_blocks(&w, c, "voice_session-alice")
+            .iter()
+            .any(|(_, before)| before.len() == 2),
+        "and it carries two frames when it can"
+    );
 }
 
 #[test]

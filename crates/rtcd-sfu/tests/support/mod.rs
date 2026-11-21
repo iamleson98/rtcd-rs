@@ -614,10 +614,15 @@ impl World {
     /// Sends voice frame number `n` of browser `i`, a loud one of the size Opus gives speech at
     /// 32 kbit/s, numbered so the receiver can tell which arrived (see `voice_number`).
     pub fn send_voice(&mut self, i: usize, n: u32) {
+        self.send_voice_at(i, n, 20);
+    }
+
+    /// `send_voice` at audio level `level` (-dBov: the lower, the louder).
+    pub fn send_voice_at(&mut self, i: usize, n: u32, level: u8) {
         let mut payload = vec![0xfc, b'V'];
         payload.extend_from_slice(&n.to_le_bytes());
         payload.resize(80, 0x55);
-        self.send_audio_payload(i, 20, Bytes::from(payload));
+        self.send_audio_payload(i, level, Bytes::from(payload));
     }
 
     fn send_audio_payload(&mut self, i: usize, level: u8, payload: Bytes) {

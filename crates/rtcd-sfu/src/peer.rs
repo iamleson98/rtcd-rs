@@ -28,7 +28,7 @@ use crate::nack_limit::LimitedNackResponder;
 use crate::red::{MIME_TYPE_RED, RED_FMTP, RED_PAYLOAD_TYPE};
 
 pub const AUDIO_LEVEL_URI: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
-pub const OPUS_PAYLOAD_TYPE: u8 = 111;
+pub use crate::red::OPUS_PAYLOAD_TYPE;
 pub const VP8_PAYLOAD_TYPE: u8 = 96;
 pub const AV1_PAYLOAD_TYPE: u8 = 45;
 

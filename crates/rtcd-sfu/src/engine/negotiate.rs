@@ -20,9 +20,25 @@ use super::Engine;
 use super::session::{DownPhase, OfferTurn, SessionKey};
 use super::signaling::{Channel, Phase};
 use super::types::CloseReason;
-use crate::ids::parse_track_id;
+use crate::ids::{TrackType, parse_track_id};
 use crate::metrics::Direction;
 use crate::peer::{opus_codec, red_codec};
+use crate::red::RED_PAYLOAD_TYPE;
+
+/// Whether the media section of `mid` in the description `sdp` has redundant audio among its
+/// formats: what an answer that accepted it lists.
+fn answered_red(sdp: &str, mid: &str) -> bool {
+    let tag = format!("a=mid:{mid}");
+    sdp.split("\nm=")
+        .skip(1)
+        .find(|m| m.lines().any(|l| l.trim_end() == tag))
+        .and_then(|m| m.lines().next())
+        .is_some_and(|line| {
+            line.split_whitespace()
+                .skip(3)
+                .any(|pt| pt.parse() == Ok(RED_PAYLOAD_TYPE))
+        })
+}
 
 /// A hostile client can send unreadable descriptions by the thousand; one is logged per session
 /// per interval (all are counted in the signaling error metric).
@@ -174,6 +190,7 @@ impl Engine {
             debug!(session = %s.cfg.session_id, "answer without an offer, ignoring");
             return;
         }
+        let answered_sdp = answer.sdp.clone();
         if let Err(err) = s.pc.set_remote_description(now, answer) {
             self.negotiation_failed(
                 key,
@@ -192,6 +209,18 @@ impl Engine {
         let mut keyframes = Vec::new();
         for slot in s.down.streams.iter_mut() {
             let Some(ds) = slot else { continue };
+            // Redundant audio goes to a voice whose section the answer accepted it in, and to no
+            // other: a receiver that refused it is sent plain Opus.
+            if ds.ty == TrackType::Voice {
+                let mid = ds
+                    .sender
+                    .and_then(|id| s.pc.rtp_transceiver(id.into()))
+                    .and_then(|t| t.mid().clone());
+                ds.red_payload_type = mid
+                    .filter(|mid| answered_red(&answered_sdp, mid))
+                    .map(|_| RED_PAYLOAD_TYPE);
+                ds.payload_type_known = false;
+            }
             match ds.phase {
                 DownPhase::Adding => {
                     ds.phase = DownPhase::Active;
@@ -472,7 +501,7 @@ impl Engine {
                         Ok(id) => {
                             // Redundant audio is offered ahead of Opus, which a receiver that takes
                             // it answers in the same order.
-                            if red && matches!(kind, RtpCodecKind::Audio) {
+                            if red && slot.ty == TrackType::Voice {
                                 s.pc.rtp_transceiver(id.into())
                                     .ok_or_else(|| "audio transceiver".to_owned())?
                                     .set_codec_preferences(vec![red_codec(), opus_codec()])
@@ -668,5 +697,16 @@ mod tests {
         let sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=recvonly\r\na=ptime:20\r\n";
         assert_eq!(with_audio_ptime(sdp, 40), sdp);
         assert_eq!(with_audio_ptime(BROWSER_ANSWER, 0), BROWSER_ANSWER);
+    }
+
+    #[test]
+    fn redundant_audio_is_accepted_only_in_the_section_whose_answer_lists_it() {
+        let sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 63 111\r\na=mid:0\r\na=rtpmap:63 red/48000/2\r\n\
+                   m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:1\r\na=rtpmap:111 opus/48000/2\r\n\
+                   m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:2\r\n";
+        assert!(answered_red(sdp, "0"));
+        assert!(!answered_red(sdp, "1"), "its answer refused it");
+        assert!(!answered_red(sdp, "2"));
+        assert!(!answered_red(sdp, "9"), "no such section");
     }
 }

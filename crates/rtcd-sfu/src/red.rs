@@ -10,6 +10,8 @@ use std::collections::VecDeque;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
+/// The payload type the SFU gives Opus, which both blocks of a payload are.
+pub const OPUS_PAYLOAD_TYPE: u8 = 111;
 pub const MIME_TYPE_RED: &str = "audio/red";
 /// The payload type the SFU gives `red/48000/2`.
 pub const RED_PAYLOAD_TYPE: u8 = 63;
@@ -25,6 +27,9 @@ const MAX_BLOCK_LEN: usize = (1 << 10) - 1;
 /// Two packets further apart than this (100 ms) have a silence between them, which DTX leaves
 /// out: what came before it is not worth repeating.
 const MAX_STEP: u32 = 4_800;
+/// The most a payload may weigh (bytes): the oldest blocks go first, so that it stays a small
+/// packet (about 1,200 bytes with the headers, under the path's MTU).
+const MAX_PAYLOAD: usize = 1_000;
 /// An Opus packet of this many bytes or fewer carries no speech (a DTX packet is one or two).
 const MAX_SILENT_LEN: usize = 2;
 
@@ -83,9 +88,20 @@ pub fn decode(payload: &Bytes) -> Option<Decoded> {
     }
 }
 
-/// The packet a payload wraps, which is what a receiver that does not take RED is sent.
-pub fn primary(payload: &Bytes) -> Option<Bytes> {
-    decode(payload).map(|d| d.primary)
+/// The packet a payload wraps, which is what a receiver that does not take RED is sent; `None` if
+/// the payload is not RED of a single Opus packet at most (`opus` is the payload type of Opus).
+pub fn primary(payload: &Bytes, opus: u8) -> Option<Bytes> {
+    decode(payload)
+        .filter(|d| {
+            d.primary_payload_type == opus && d.redundant.iter().all(|r| r.payload_type == opus)
+        })
+        .map(|d| d.primary)
+}
+
+/// `primary` as a payload with no redundancy: what is sent under the RED payload type when the
+/// packets before it must not be carried (see [`Encoder::encode`]).
+pub fn wrap(opus: u8, primary: &Bytes) -> Bytes {
+    build(opus, &[], primary)
 }
 
 /// The packets before the current one of a source.
@@ -130,6 +146,10 @@ impl Encoder {
             (next_seq, next_ts) = (p.seq, p.ts);
         }
         blocks.reverse();
+        let mut size = 1 + primary.len() + blocks.iter().map(|p| 4 + p.data.len()).sum::<usize>();
+        while size > MAX_PAYLOAD && !blocks.is_empty() {
+            size -= 4 + blocks.remove(0).data.len();
+        }
         let out = build(
             opus,
             &blocks
@@ -217,7 +237,7 @@ mod tests {
         let p = voice(1, 60);
         let payload = e.encode(OPUS, 5, 0, &p, true);
         assert_eq!(payload.len(), 1 + 60);
-        assert_eq!(primary(&payload).unwrap(), p);
+        assert_eq!(primary(&payload, OPUS).unwrap(), p);
         assert!(decode(&payload).unwrap().redundant.is_empty());
     }
 
@@ -303,5 +323,34 @@ mod tests {
         assert!(decode(&payload.slice(..30)).is_none());
         assert!(decode(&Bytes::new()).is_none());
         assert!(decode(&payload.slice(..3)).is_none());
+    }
+
+    #[test]
+    fn the_payload_stays_under_the_size_cap_by_dropping_the_oldest_blocks() {
+        let mut e = Encoder::default();
+        e.encode(OPUS, 1, 0, &voice(1, 400), true);
+        e.encode(OPUS, 2, 960, &voice(2, 400), true);
+        // 1 + 300 + 4 + 400 + 4 + 400 would be 1,109 bytes: the oldest block goes.
+        let payload = e.encode(OPUS, 3, 1_920, &voice(3, 300), true);
+        assert_eq!(payload.len(), 1 + 300 + 4 + 400);
+        let d = decode(&payload).unwrap();
+        assert_eq!(d.redundant.len(), 1);
+        assert_eq!(d.redundant[0].data, voice(2, 400));
+        // A primary that is too big alone still goes, without blocks.
+        let big = e.encode(OPUS, 4, 2_880, &voice(4, 1_100), true);
+        assert!(decode(&big).unwrap().redundant.is_empty());
+    }
+
+    #[test]
+    fn a_wrapped_packet_has_no_blocks_and_only_an_opus_one_is_taken_out() {
+        let p = voice(7, 60);
+        let payload = wrap(OPUS, &p);
+        assert_eq!(payload.len(), 61);
+        assert_eq!(primary(&payload, OPUS).unwrap(), p);
+        assert!(
+            primary(&payload, 109).is_none(),
+            "its packet is not of that codec"
+        );
+        assert!(primary(&Bytes::from_static(&[0x80, 1]), OPUS).is_none());
     }
 }

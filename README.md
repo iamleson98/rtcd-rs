@@ -177,7 +177,9 @@ A voice packet lost on a receiver's downlink is lost audio. The node offers `red
 sent each voice packet together with the two before it, so the next packet that arrives repairs a
 loss (a gap of one or two packets). The payload is built once per packet of a speaker, not once per
 listener (`rtcd-sfu`'s `red` module), and keeps the speaker's sequence numbers, so reports, NACK and
-its retransmissions work as they do without it. A redundant copy is left out across a gap in the
+its retransmissions work as they do without it. Only microphones are sent so (not screen audio), a payload is kept under 1,000 bytes by dropping the
+oldest copies, and the first packets after a voice was left out of a call's loudest voices go alone.
+A redundant copy is left out across a gap in the
 sequence numbers, across the silence DTX leaves (more than 100 ms between packets) and when it
 would not fit the header (a 14-bit timestamp offset, a 10-bit length). A receiver that does not
 answer with it is sent plain Opus, and a speaker that wraps its own voice in RED is unwrapped first.
