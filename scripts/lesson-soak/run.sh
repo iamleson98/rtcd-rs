@@ -145,6 +145,7 @@ chrome soak-chrome-clean soak-clean clean
 EXTRA="--first $STUDENTS_CLEAN --students $STUDENTS_IMPAIRED $BIG_OPTS"
 EXTRA="$EXTRA --udp-base $UDP_BASE --chrome-bind 0.0.0.0"
 [ "$PROFILE" = abuse ] && EXTRA="$EXTRA --nat-rebind-every 30 --mtu --seed $SEED"
+[ "$PROFILE" = lossy ] && EXTRA="$EXTRA --red"
 lesson soak-impaired "$IMPAIRED_IP" impaired --cap-add NET_ADMIN -v "$SOAK_DIR":/soak:ro
 joined soak-impaired
 # The impaired Chromium has a network namespace of its own (so that it is shaped on its own, like each

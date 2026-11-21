@@ -25,9 +25,10 @@ use rtc::shared::error::Result;
 use crate::bwe::{Estimate, SharedGcc};
 use crate::config::EngineConfig;
 use crate::nack_limit::LimitedNackResponder;
+use crate::red::{MIME_TYPE_RED, RED_FMTP, RED_PAYLOAD_TYPE};
 
 pub const AUDIO_LEVEL_URI: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
-pub const OPUS_PAYLOAD_TYPE: u8 = 111;
+pub use crate::red::OPUS_PAYLOAD_TYPE;
 pub const VP8_PAYLOAD_TYPE: u8 = 96;
 pub const AV1_PAYLOAD_TYPE: u8 = 45;
 
@@ -66,21 +67,39 @@ fn video_codec(mime: &str, payload_type: u8) -> RTCRtpCodecParameters {
     }
 }
 
-fn media_engine() -> Result<MediaEngine> {
-    let mut m = MediaEngine::default();
-    m.register_codec(
-        RTCRtpCodecParameters {
-            rtp_codec: RTCRtpCodec {
-                mime_type: MIME_TYPE_OPUS.to_owned(),
-                clock_rate: 48_000,
-                channels: 2,
-                sdp_fmtp_line: OPUS_FMTP.to_owned(),
-                rtcp_feedback: vec![],
-            },
-            payload_type: OPUS_PAYLOAD_TYPE,
+pub(crate) fn opus_codec() -> RTCRtpCodecParameters {
+    RTCRtpCodecParameters {
+        rtp_codec: RTCRtpCodec {
+            mime_type: MIME_TYPE_OPUS.to_owned(),
+            clock_rate: 48_000,
+            channels: 2,
+            sdp_fmtp_line: OPUS_FMTP.to_owned(),
+            rtcp_feedback: vec![],
         },
-        RtpCodecKind::Audio,
-    )?;
+        payload_type: OPUS_PAYLOAD_TYPE,
+    }
+}
+
+/// Redundant audio: a payload of Opus packets (see [`crate::red`]).
+pub(crate) fn red_codec() -> RTCRtpCodecParameters {
+    RTCRtpCodecParameters {
+        rtp_codec: RTCRtpCodec {
+            mime_type: MIME_TYPE_RED.to_owned(),
+            clock_rate: 48_000,
+            channels: 2,
+            sdp_fmtp_line: RED_FMTP.to_owned(),
+            rtcp_feedback: vec![],
+        },
+        payload_type: RED_PAYLOAD_TYPE,
+    }
+}
+
+fn media_engine(red: bool) -> Result<MediaEngine> {
+    let mut m = MediaEngine::default();
+    if red {
+        m.register_codec(red_codec(), RtpCodecKind::Audio)?;
+    }
+    m.register_codec(opus_codec(), RtpCodecKind::Audio)?;
     m.register_codec(
         video_codec(MIME_TYPE_VP8, VP8_PAYLOAD_TYPE),
         RtpCodecKind::Video,
@@ -131,7 +150,7 @@ pub(crate) fn new_peer(
     cfg: &EngineConfig,
     now: Instant,
 ) -> Result<(RTCPeerConnection, Arc<Estimate>)> {
-    let mut media = media_engine()?;
+    let mut media = media_engine(cfg.red)?;
     let (estimator, estimate) = SharedGcc::new(
         cfg.min_bitrate as f64,
         cfg.min_bitrate as f64,

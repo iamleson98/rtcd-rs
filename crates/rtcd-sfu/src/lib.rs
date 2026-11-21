@@ -16,6 +16,7 @@ mod nack_limit;
 mod peer;
 pub mod rate;
 pub mod record;
+pub mod red;
 pub mod rewrite;
 pub mod runtime;
 pub mod temporal;

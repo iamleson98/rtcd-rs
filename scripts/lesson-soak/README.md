@@ -69,7 +69,10 @@ Everything is JSONL, one object per line with `ts` (unix ms), `impl`, `arch` (`x
   Chromium gives no timestamp), so it includes the jitter buffer. A group on another machine (`remote`)
   has no sender clock and writes null. Chromium rows of voices also carry `concealed_samples`,
   `concealment_events` and `fec_packets` (the interval's counts), and each page logs an `sdp_codecs`
-  event with the audio `rtpmap` lines it negotiated.
+  event with the audio `rtpmap` lines it negotiated and the audio codecs the browser can receive
+  (`receiver capabilities`, to see that it has `audio/red`). A synthetic receiver started with `--red` negotiates
+  redundant audio (`recovered` counts the voice packets it made up for, and a silence they fill is not an
+  audio gap); `PROFILE=lossy` gives it to every second impaired student, the others take plain Opus.
   `packets` counts every arrival; `lost` is what the sequence numbers say never came, after the
   retransmissions and without the duplicates, so a copy never hides a loss.
   `impl` is `rtcd-rs` or `rtcd-go` for the synthetic receivers (`lms_sim::stats`) and `rtcd-rs/chrome` or

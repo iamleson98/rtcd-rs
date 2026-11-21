@@ -362,6 +362,10 @@ pub struct RecvTrack {
     /// or the network's duplicate), and which of the last [`SEEN_BITS`] numbers have arrived.
     duplicates: u64,
     seen: [u64; (SEEN_BITS / 64) as usize],
+    /// How many packets that never arrived on their own a redundant payload made up for (they are
+    /// not in `packets`, which counts arrivals), and the ticks between two packets in a row.
+    recovered: u64,
+    step: Option<u32>,
     /// The one-way delays measured since the last line.
     delays: Vec<f64>,
 }
@@ -389,6 +393,8 @@ impl RecvTrack {
             bytes: 0,
             duplicates: 0,
             seen: [0; (SEEN_BITS / 64) as usize],
+            recovered: 0,
+            step: None,
             delays: Vec::new(),
         }
     }
@@ -433,7 +439,39 @@ impl RecvTrack {
 
     /// Takes a packet that arrived at `now`.
     pub fn on_packet(&mut self, now: Instant, seq: u16, ts: u32, marker: bool) -> Wrapped {
+        self.on_packet_carrying(now, seq, ts, marker, &[])
+    }
+
+    /// Takes a packet that arrived at `now` with the packets before it along (redundant audio). A
+    /// block recovers its number only if it is stamped as that packet would have been, a packet
+    /// time before the next: a block of any other time is not that packet.
+    pub fn on_packet_carrying(
+        &mut self,
+        now: Instant,
+        seq: u16,
+        ts: u32,
+        marker: bool,
+        carried: &[Carried],
+    ) -> Wrapped {
         let mut wrapped = Wrapped::default();
+        let carried: Vec<u16> = carried
+            .iter()
+            .filter(|c| {
+                let back = seq.wrapping_sub(c.seq);
+                back > 0
+                    && self
+                        .step
+                        .is_some_and(|step| c.ts == ts.wrapping_sub(step.wrapping_mul(back.into())))
+            })
+            .map(|c| c.seq)
+            .collect();
+        let consecutive = self.packets > 0 && seq == (self.max as u16).wrapping_add(1);
+        let ticks = ts.wrapping_sub(self.last_ts);
+        // Every number the packet skips is carried by it: nothing the listener hears is missing.
+        let covered = self.packets > 0 && {
+            let step = i64::from(seq.wrapping_sub(self.max as u16) as i16);
+            step > 1 && (1..step).all(|d| carried.contains(&((self.max + d) as u16)))
+        };
         let first = *self.first.get_or_insert(now);
         if self.packets == 0 {
             self.base = i64::from(seq);
@@ -474,6 +512,18 @@ impl RecvTrack {
             }
         }
         self.packets += 1;
+        if consecutive && ticks > 0 && ticks < 1 << 15 {
+            self.step = Some(ticks);
+        }
+        if self.max as u16 == seq {
+            for c in carried {
+                let at = self.max - i64::from(seq.wrapping_sub(c));
+                if at >= self.base && !self.seen(at) {
+                    self.mark(at);
+                    self.recovered += 1;
+                }
+            }
+        }
 
         // RFC 3550 interarrival jitter, in the stream's clock.
         let arrival = now.duration_since(first).as_secs_f64() * self.clock;
@@ -494,7 +544,7 @@ impl RecvTrack {
             && let Some(last) = self.last_packet
         {
             let gap = now.duration_since(last);
-            if gap > AUDIO_GAP {
+            if gap > AUDIO_GAP && !covered {
                 self.audio_gap_ms += gap.as_secs_f64() * 1000.0;
             }
         }
@@ -566,7 +616,7 @@ impl RecvTrack {
         let expected = self.max - self.base + 1;
         // Every number that never arrived, retransmissions that made it taken off; a number that
         // arrived twice counts once, and is reported as a duplicate.
-        let lost = expected - (self.packets - self.duplicates) as i64;
+        let lost = expected - (self.packets - self.duplicates + self.recovered) as i64;
         json!({
             "media": if self.video { "video" } else { "audio" },
             "group": group,
@@ -576,6 +626,7 @@ impl RecvTrack {
             "packets": self.packets,
             "bytes": self.bytes,
             "duplicates": self.duplicates,
+            "recovered": self.recovered,
             "lost": lost,
             "nack": self.nack,
             "pli": pli,
@@ -585,6 +636,13 @@ impl RecvTrack {
             "stalled": self.silent_for(now).is_some_and(|d| d > STALL),
         })
     }
+}
+
+/// A packet a redundant payload carries along: its number and the timestamp the block gives it.
+#[derive(Debug, Clone, Copy)]
+pub struct Carried {
+    pub seq: u16,
+    pub ts: u32,
 }
 
 /// A stream a receiver measures, and what it asked for.
@@ -617,6 +675,21 @@ impl Receiver {
         ts: u32,
         marker: bool,
     ) -> Option<(String, Wrapped)> {
+        self.on_rtp_carrying(probe, now, track, seq, ts, marker, &[])
+    }
+
+    /// [`on_rtp`](Self::on_rtp) for a packet that carries the ones before it along (redundant audio).
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_rtp_carrying(
+        &mut self,
+        probe: &Probe,
+        now: Instant,
+        track: &str,
+        seq: u16,
+        ts: u32,
+        marker: bool,
+        carried: &[Carried],
+    ) -> Option<(String, Wrapped)> {
         if !self.tracks.contains_key(track) {
             let mut fields = track.split('_');
             let (kind, session) = (fields.next()?, fields.next()?);
@@ -646,7 +719,7 @@ impl Receiver {
         }
         let t = self.tracks.get_mut(track)?;
         let duplicates = t.stats.duplicates;
-        let wrapped = t.stats.on_packet(now, seq, ts, marker);
+        let wrapped = t.stats.on_packet_carrying(now, seq, ts, marker, carried);
         // Of the video, the marker packet of a frame is the one that completes it.
         if t.stats.duplicates == duplicates
             && (marker || !t.stats.video)
@@ -735,6 +808,94 @@ mod tests {
         assert_eq!(f["packets"], 10);
         assert_eq!(f["lost"], 2);
         assert_eq!(f["nack"], 2);
+    }
+
+    fn carried(seqs_ts: &[(u16, u32)]) -> Vec<Carried> {
+        seqs_ts
+            .iter()
+            .map(|&(seq, ts)| Carried { seq, ts })
+            .collect()
+    }
+
+    #[test]
+    fn redundant_audio_makes_up_for_lost_packets_and_the_silence_they_leave() {
+        let t0 = clock();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let run = |with: &[Carried]| {
+            let mut t = RecvTrack::new(false);
+            t.on_packet(at(0), 1, 0, false);
+            t.on_packet(at(20), 2, 960, false);
+            // 3 never arrives; 4 does, 80 ms after 2, with 3 and 2 along.
+            t.on_packet_carrying(at(100), 4, 2_880, false, with);
+            t.fields(at(100), "impaired", 0, None)
+        };
+        let plain = run(&[]);
+        assert_eq!(plain["lost"], 1);
+        assert_eq!(plain["recovered"], 0);
+        assert_eq!(plain["audio_gap_ms"], 80);
+        let red = run(&carried(&[(2, 960), (3, 1_920)]));
+        assert_eq!(red["lost"], 0, "{red}");
+        assert_eq!(red["recovered"], 1, "2 had arrived: only 3 is recovered");
+        assert_eq!(red["packets"], 3, "packets counts what arrived");
+        assert_eq!(red["audio_gap_ms"], 0, "the silence is filled");
+    }
+
+    #[test]
+    fn redundant_audio_that_does_not_reach_back_far_enough_leaves_the_gap() {
+        let t0 = clock();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut t = RecvTrack::new(false);
+        t.on_packet(at(0), 1, 0, false);
+        t.on_packet(at(20), 2, 960, false);
+        // 3, 4 and 5 never arrive; 6 carries 5 and 4.
+        t.on_packet_carrying(
+            at(100),
+            6,
+            4_800,
+            false,
+            &carried(&[(4, 2_880), (5, 3_840)]),
+        );
+        let f = t.fields(at(100), "impaired", 0, None);
+        assert_eq!(f["recovered"], 2);
+        assert_eq!(f["lost"], 1);
+        assert_eq!(f["audio_gap_ms"], 80);
+        // A retransmission of a recovered number is a duplicate.
+        t.on_packet(at(110), 5, 3_840, false);
+        assert_eq!(t.fields(at(110), "impaired", 0, None)["duplicates"], 1);
+    }
+
+    #[test]
+    fn a_block_recovers_a_number_only_if_it_is_stamped_as_that_packet_would_be() {
+        let t0 = clock();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut t = RecvTrack::new(false);
+        t.on_packet(at(0), 1, 0, false);
+        t.on_packet(at(20), 2, 960, false);
+        // 3 is lost; the block for it is of another packet (another time), and a packet before
+        // any step is known cannot be checked at all.
+        t.on_packet_carrying(at(60), 4, 2_880, false, &carried(&[(3, 9_999)]));
+        let f = t.fields(at(60), "impaired", 0, None);
+        assert_eq!(f["recovered"], 0);
+        assert_eq!(f["lost"], 1);
+        let mut first = RecvTrack::new(false);
+        first.on_packet_carrying(at(0), 2, 960, false, &carried(&[(1, 0)]));
+        assert_eq!(first.fields(at(0), "impaired", 0, None)["recovered"], 0);
+    }
+
+    #[test]
+    fn what_a_packet_carries_is_for_that_packet_alone() {
+        let t0 = clock();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut t = RecvTrack::new(false);
+        t.on_packet(at(0), 1, 0, false);
+        t.on_packet(at(20), 2, 960, false);
+        t.on_packet_carrying(at(60), 4, 2_880, false, &carried(&[(3, 1_920)]));
+        // 6 follows 5, which was lost, with nothing along: the gap before it is not covered.
+        t.on_packet(at(130), 6, 4_800, false);
+        let f = t.fields(at(130), "impaired", 0, None);
+        assert_eq!(f["recovered"], 1);
+        assert_eq!(f["lost"], 1);
+        assert_eq!(f["audio_gap_ms"], 70);
     }
 
     #[test]

@@ -27,8 +27,8 @@ use rtc::peer_connection::{RTCPeerConnection, RTCPeerConnectionBuilder};
 use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtp_transceiver::rtp_sender::{
-    RTCRtpCodec, RTCRtpCodingParameters, RTCRtpEncodingParameters, RTCRtpHeaderExtensionCapability,
-    RtpCodecKind,
+    RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
+    RTCRtpHeaderExtensionCapability, RtpCodecKind,
 };
 use rtc::rtp_transceiver::{
     RTCRtpReceiverId, RTCRtpSenderId, RTCRtpTransceiverDirection, RTCRtpTransceiverInit,
@@ -38,6 +38,7 @@ use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use rtc::statistics::StatsSelector;
 use rtcd_proto::dc::DcMessage;
 use rtcd_proto::{ClientMessage, JoinRequest, Message, MessageType, SessionRef};
+use rtcd_sfu::red::{self, MIME_TYPE_RED, OPUS_PAYLOAD_TYPE, RED_FMTP, RED_PAYLOAD_TYPE};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -45,7 +46,7 @@ use tokio::task::JoinHandle;
 use crate::assets::{Assets, CameraLayers, Clip};
 use crate::host::{Rtcd, RtcdConn};
 use crate::hostile::{self, Hostile, Hot, Rng};
-use crate::stats::{Probe, Receiver, RtpClock, wall_ms_at};
+use crate::stats::{Carried, Probe, Receiver, RtpClock, wall_ms_at};
 
 const AUDIO_LEVEL_URI: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
 const MID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
@@ -90,6 +91,8 @@ pub struct Spec {
     pub udp_base: Option<u16>,
     /// Sends datagrams of MTU size and over at intervals (see [`Ctl::Mtu`]) from the start.
     pub mtu: bool,
+    /// Negotiates redundant audio (RFC 2198) and counts the voice packets it recovers.
+    pub red: bool,
     /// Seeds what the participant does at random (the hostile behaviours, the sizes of the MTU
     /// datagrams).
     pub seed: u64,
@@ -365,6 +368,7 @@ struct Env {
     udp_base: Option<u16>,
     seed: u64,
     tally: Option<Arc<AtomicU64>>,
+    red: bool,
 }
 
 /// What a participant has been told to do, which a new try picks up where the last left off.
@@ -466,6 +470,7 @@ pub async fn join(
         udp_base: spec.udp_base,
         seed: spec.seed,
         tally: spec.tally.clone(),
+        red: spec.red,
     };
     let mut persist = Persist {
         voice: spec.voice,
@@ -558,6 +563,22 @@ async fn build(
     rtcd.exempt(addr);
     let mut me = MediaEngine::default();
     me.register_default_codecs().expect("codecs");
+    if spec.red {
+        me.register_codec(
+            RTCRtpCodecParameters {
+                rtp_codec: RTCRtpCodec {
+                    mime_type: MIME_TYPE_RED.into(),
+                    clock_rate: 48000,
+                    channels: 2,
+                    sdp_fmtp_line: RED_FMTP.into(),
+                    rtcp_feedback: vec![],
+                },
+                payload_type: RED_PAYLOAD_TYPE,
+            },
+            RtpCodecKind::Audio,
+        )
+        .expect("red");
+    }
     me.register_header_extension(
         RTCRtpHeaderExtensionCapability {
             uri: AUDIO_LEVEL_URI.into(),
@@ -798,14 +819,43 @@ async fn drive(
                     RTCMessage::RtpPacket(track, packet) => {
                         if let (Some(rx), Some(p)) = (rx.as_mut(), probe) {
                             let size = packet.payload.len() + 12;
-                            if let Some((what, w)) = rx.on_rtp(
-                                p,
-                                arrived,
-                                &track,
-                                packet.header.sequence_number,
-                                packet.header.timestamp,
-                                packet.header.marker,
-                            ) && p.leader
+                            let seq = packet.header.sequence_number;
+                            let pt = packet.header.payload_type;
+                            // A voice counts only in a payload type it negotiated: a packet of
+                            // another one is not heard, so it shows as lost. Redundant audio
+                            // carries the packets before this one along, each stamped as its
+                            // block says.
+                            let mut carried = Vec::new();
+                            let heard = if !track.starts_with("voice") || pt == OPUS_PAYLOAD_TYPE {
+                                true
+                            } else if env.red && pt == RED_PAYLOAD_TYPE {
+                                red::decode(&packet.payload).is_some_and(|d| {
+                                    let n = d.redundant.len() as u16;
+                                    carried = d
+                                        .redundant
+                                        .iter()
+                                        .zip(1..)
+                                        .map(|(block, i)| Carried {
+                                            seq: seq.wrapping_sub(n - i + 1),
+                                            ts: packet.header.timestamp.wrapping_sub(block.offset),
+                                        })
+                                        .collect();
+                                    true
+                                })
+                            } else {
+                                false
+                            };
+                            if heard
+                                && let Some((what, w)) = rx.on_rtp_carrying(
+                                    p,
+                                    arrived,
+                                    &track,
+                                    seq,
+                                    packet.header.timestamp,
+                                    packet.header.marker,
+                                    &carried,
+                                )
+                                && p.leader
                             {
                                 for (on, name) in [(w.seq, "seq"), (w.ts, "timestamp")] {
                                     if on {

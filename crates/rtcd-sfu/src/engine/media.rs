@@ -23,8 +23,9 @@ use super::types::CloseReason;
 use crate::ids::{TrackType, track_id};
 use crate::layers::Layer;
 use crate::metrics::Direction;
-use crate::peer::AUDIO_LEVEL_URI;
+use crate::peer::{AUDIO_LEVEL_URI, OPUS_PAYLOAD_TYPE, opus_codec};
 use crate::rate::RateMonitor;
+use crate::red::{self, MIME_TYPE_RED};
 use crate::rewrite::Rewriter;
 use crate::vad::{Monitor, VadConfig};
 use crate::vp8;
@@ -46,6 +47,10 @@ pub(crate) struct Fan {
     pub newest: Option<u16>,
     /// Where a copy of every packet goes, if the stream is being recorded.
     pub tap: Option<Tap>,
+    /// The packets before the current one of a voice, for the redundant audio receivers are sent.
+    pub red: red::Encoder,
+    /// The payload type the sender's voice is wrapped in as redundant audio, if it negotiated it.
+    pub uplink_red: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -300,6 +305,20 @@ impl Engine {
             warn!(session = %s.cfg.session_id, ssrc = init.ssrc, "track without a codec");
             return;
         };
+        // A voice a sender wraps in redundant audio is Opus to everyone downstream: `forward`
+        // takes the packet out of it.
+        let codec = if codec.mime_type.eq_ignore_ascii_case(MIME_TYPE_RED) {
+            opus_codec().rtp_codec
+        } else {
+            codec
+        };
+        let uplink_red = receiver
+            .get_parameters()
+            .rtp_parameters
+            .codecs
+            .iter()
+            .find(|c| c.rtp_codec.mime_type.eq_ignore_ascii_case(MIME_TYPE_RED))
+            .map(|c| c.payload_type);
         let audio_level = receiver
             .get_parameters()
             .rtp_parameters
@@ -388,6 +407,8 @@ impl Engine {
                 resume: false,
                 newest: None,
                 tap: None,
+                red: red::Encoder::default(),
+                uplink_red,
             },
         );
 
@@ -572,6 +593,9 @@ impl Engine {
             phase: DownPhase::PendingAdd,
             sender: None,
             payload_type_known: false,
+            red_payload_type: None,
+            // The packets before the first it is sent are not the receiver's.
+            red_hold: red::MAX_REDUNDANT,
             // Video starts at a keyframe; audio at once.
             source: (!video).then_some(source),
             target: video.then_some(source),
@@ -644,11 +668,32 @@ impl Engine {
                 continue;
             };
             let resume = std::mem::take(&mut fan.resume);
+            // Whatever the sender wrapped its voice in, the recording and the receivers that do not
+            // take redundant audio get the Opus packet itself.
+            if fan.uplink_red == Some(packet.header.payload_type) {
+                let Some(opus) = red::primary(&packet.payload, OPUS_PAYLOAD_TYPE) else {
+                    continue;
+                };
+                packet.payload = opus;
+                packet.header.payload_type = OPUS_PAYLOAD_TYPE;
+            }
             let seq = packet.header.sequence_number;
             let newest = is_newer(fan.newest, seq);
             if newest {
                 fan.newest = Some(seq);
             }
+            // The redundant payload is built once for every receiver that takes it, those waiting
+            // for the voice (it enters the loudest ones) as well as those it is sent to.
+            let listened = !fan.serving.is_empty() || !fan.waiting.is_empty();
+            let red = (self.cfg.red && fan.ty == TrackType::Voice && listened).then(|| {
+                fan.red.encode(
+                    OPUS_PAYLOAD_TYPE,
+                    seq,
+                    packet.header.timestamp,
+                    &packet.payload,
+                    newest,
+                )
+            });
             let fan = &*fan;
             // The uplink counts whether or not anyone receives the stream.
             let size = packet.marshal_size() as u64;
@@ -663,7 +708,6 @@ impl Engine {
             // The receivers negotiated their own extension ids; none of the sender's apply.
             packet.header.extension = false;
             packet.header.extensions.clear();
-            let size = packet.marshal_size() as u64;
             let mut sent = [0u64; 4];
             let mut switched = Vec::new();
             let mut pausing = Vec::new();
@@ -706,10 +750,18 @@ impl Engine {
                     if ds.ty == TrackType::Screen {
                         ds.temporal.set_limit(limit);
                     }
-                    if write_down(r, sub, &packet, frame.as_ref(), now, &mut self.dirty) {
+                    if let Some(written) = write_down(
+                        r,
+                        sub,
+                        &packet,
+                        red.as_ref(),
+                        frame.as_ref(),
+                        now,
+                        &mut self.dirty,
+                    ) {
                         sent[type_slot(
                             r.down.get(sub.stream).map_or(TrackType::Video, |d| d.ty),
-                        )] += size;
+                        )] += written;
                     }
                     switched.push(sub);
                 }
@@ -724,11 +776,20 @@ impl Engine {
                 let started = (timed && n == 0).then(Instant::now);
                 if resume && let Some(ds) = r.down.get_mut(sub.stream) {
                     ds.rewrite.resume_after_gap(&packet);
+                    ds.red_hold = red::MAX_REDUNDANT;
                 }
-                let wrote = write_down(r, sub, &packet, frame.as_ref(), now, &mut self.dirty);
+                let wrote = write_down(
+                    r,
+                    sub,
+                    &packet,
+                    red.as_ref(),
+                    frame.as_ref(),
+                    now,
+                    &mut self.dirty,
+                );
                 let ty = r.down.get(sub.stream).map_or(TrackType::Voice, |d| d.ty);
-                if wrote {
-                    sent[type_slot(ty)] += size;
+                if let Some(written) = wrote {
+                    sent[type_slot(ty)] += written;
                 }
                 // A camera being paused goes when the frame it is in is complete.
                 if packet.header.marker && r.down.get(sub.stream).is_some_and(|d| d.pausing) {
@@ -929,21 +990,22 @@ struct Frame {
 }
 
 /// Writes `packet` to the receiver's copy of the stream, rewritten for it, unless it is of a
-/// temporal layer the receiver is not sent (`frame`, for a video). Returns whether it was
-/// accepted for sending.
+/// temporal layer the receiver is not sent (`frame`, for a video). A receiver that negotiated
+/// redundant audio is sent `red`, the payload built for the packet, in its place (or the packet
+/// alone in a RED payload, while what came before it is not what the receiver was sent). Returns
+/// the bytes accepted for sending, `None` when it was not.
 fn write_down(
     r: &mut Session,
     sub: SubRef,
     packet: &rtc::rtp::Packet,
+    red: Option<&bytes::Bytes>,
     frame: Option<&Frame>,
     now: Instant,
     dirty: &mut Vec<SessionKey>,
-) -> bool {
-    let Some(ds) = r.down.get_mut(sub.stream) else {
-        return false;
-    };
+) -> Option<u64> {
+    let ds = r.down.get_mut(sub.stream)?;
     if ds.phase != DownPhase::Active {
-        return false;
+        return None;
     }
     if let Some(f) = frame {
         let temporal = f.descriptor.and_then(|d| d.temporal);
@@ -952,38 +1014,47 @@ fn write_down(
             .admit(packet.header.timestamp, temporal, f.key, f.newest)
         {
             ds.rewrite.leave_out(packet, f.descriptor.as_ref());
-            return false;
+            return None;
         }
     }
-    let Some(sender_id) = ds.sender else {
-        return false;
-    };
-    let Some(mut sender) = r.pc.rtp_sender(sender_id) else {
-        return false;
-    };
+    let sender_id = ds.sender?;
+    let mut sender = r.pc.rtp_sender(sender_id)?;
     if !ds.payload_type_known {
-        let mime = ds.codec.mime_type.clone();
-        if let Some(c) = sender
+        // Redundant audio is what the receiver's answer accepted (see `Engine::on_answer`), else
+        // the payload type of the codec.
+        let mime = &ds.codec.mime_type;
+        let plain = sender
             .get_parameters()
             .rtp_parameters
             .codecs
             .iter()
-            .find(|c| c.rtp_codec.mime_type.eq_ignore_ascii_case(&mime))
-        {
-            ds.rewrite.set_payload_type(c.payload_type);
+            .find(|c| c.rtp_codec.mime_type.eq_ignore_ascii_case(mime))
+            .map(|c| c.payload_type);
+        if let Some(pt) = ds.red_payload_type.or(plain) {
+            ds.rewrite.set_payload_type(pt);
         }
         ds.payload_type_known = true;
     }
     let mut out = packet.clone();
-    if !ds.rewrite.rewrite(&mut out) {
-        return false;
+    if ds.red_payload_type.is_some() {
+        // Never the bare Opus packet under the RED payload type. After a source change or a gap the
+        // packets before this one are not the receiver's: it is sent alone until they are.
+        out.payload = match red {
+            Some(red) if ds.red_hold == 0 => red.clone(),
+            _ => red::wrap(OPUS_PAYLOAD_TYPE, &packet.payload),
+        };
+        ds.red_hold = ds.red_hold.saturating_sub(1);
     }
+    if !ds.rewrite.rewrite(&mut out) {
+        return None;
+    }
+    let size = out.marshal_size() as u64;
     let ok = sender.write_rtp(now, out).is_ok();
     if ok && !r.dirty {
         r.dirty = true;
         dirty.push(sub.session);
     }
-    ok
+    ok.then_some(size)
 }
 
 #[cfg(test)]
