@@ -58,21 +58,22 @@ pub struct Sink {
 struct Clocks {
     by_key: HashMap<String, Vec<Option<RtpClock>>>,
     read: u64,
-    checked: Option<Instant>,
 }
 
 impl Clocks {
+    /// Layer 0 is the first a sender tells of, so a clock for it starts a new session of the source
+    /// (a reconnect, with its own timestamps) and the layers of the one before are dropped.
     fn set(&mut self, key: &str, layer: usize, clock: RtpClock) {
         let layers = self.by_key.entry(key.to_owned()).or_default();
+        if layer == 0 {
+            layers.clear();
+        }
         if layers.len() <= layer {
             layers.resize(layer + 1, None);
         }
         layers[layer] = Some(clock);
     }
 }
-
-/// How often the shared file of clocks is read again.
-const CLOCK_REREAD: Duration = Duration::from_secs(1);
 
 impl Sink {
     /// Opens `path` for appending.
@@ -141,12 +142,18 @@ impl RtpClock {
     }
 }
 
+/// How far before a clock's anchor a packet may arrive and still be of that session of the sender:
+/// a packet is never sent before its schedule, so one that arrived earlier is of the session before.
+const ANCHOR_SLACK_MS: f64 = 5.0;
+
 /// The delay by whichever of a source's layer clocks the timestamp fits best (the smallest delay in
 /// size: a packet does not say which layer it is of, and the layers of one camera are on one
-/// timeline when they start together, as lms-web's do).
+/// timeline when they start together, as lms-web's do). A packet that arrived before the newest
+/// clocks were anchored is of an earlier session of the sender and has no delay.
 pub fn delay_among(clocks: &[RtpClock], ts: u32, arrival_ms: f64) -> Option<f64> {
     clocks
         .iter()
+        .filter(|c| arrival_ms >= c.wall_ms - ANCHOR_SLACK_MS)
         .map(|c| c.delay_ms(ts, arrival_ms))
         .min_by(|a, b| a.abs().total_cmp(&b.abs()))
 }
@@ -177,8 +184,10 @@ impl Sink {
         let Ok(mut c) = self.clocks.lock() else {
             return Vec::new();
         };
-        if c.checked.is_none_or(|at| at.elapsed() >= CLOCK_REREAD) {
-            c.checked = Some(Instant::now());
+        // A sender writes its clocks before its first packet leaves, so a file that grew holds the
+        // newest clock of every packet that has arrived: read it before mapping, not a second late.
+        let grown = std::fs::metadata(&self.clock_file).is_ok_and(|m| m.len() > c.read);
+        if grown {
             self.read_clock_file(&mut c);
         }
         c.by_key
@@ -836,6 +845,30 @@ mod tests {
         let delay = delay_among(&clocks, 900_000, arrival).unwrap();
         assert!((delay - 30.0).abs() < 1e-6, "{delay}");
         assert!(receiver.clocks_of("video:nobody").is_empty());
+    }
+
+    #[test]
+    fn a_reconnected_sender_replaces_its_clocks_for_every_receiver() {
+        let path = scratch("stats-reconnect");
+        let sender = Sink::open(&path).unwrap();
+        let receiver = Sink::open(&path.with_file_name("other.jsonl")).unwrap();
+        let clock = |ts: u32, wall_ms: f64| RtpClock {
+            ts,
+            wall_ms,
+            rate: 90_000.0,
+        };
+        sender.set_clock("video:s01", 0, clock(1000, 10_000.0));
+        sender.set_clock("video:s01", 1, clock(1000, 10_000.0));
+        assert_eq!(receiver.clocks_of("video:s01").len(), 2);
+        // The sender comes back with one layer and timestamps of its own: the receiver, which read
+        // the old ones a moment ago, maps with the new clock at once and the old layer is gone.
+        sender.set_clock("video:s01", 0, clock(7_000_000, 400_000.0));
+        let clocks = receiver.clocks_of("video:s01");
+        assert_eq!(clocks, vec![clock(7_000_000, 400_000.0)]);
+        let delay = delay_among(&clocks, 7_000_900, 400_030.0).unwrap();
+        assert!((delay - 20.0).abs() < 1e-6, "{delay}");
+        // A packet from before the new anchor is of the old session: no delay.
+        assert_eq!(delay_among(&clocks, 1900, 10_050.0), None);
     }
 
     #[test]
