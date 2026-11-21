@@ -638,6 +638,38 @@ impl RecvTrack {
     }
 }
 
+/// The worst moments of a participant's own loop in one reporting interval. A delay seen at a
+/// receiver is the sum of the sender's lateness, the network and the receiver's own stalls; these
+/// two tell a late sender or a busy describe/answer apart from the SFU holding media back.
+#[derive(Debug, Default)]
+pub struct Worst {
+    /// How late the latest video frame went out compared with when it was scheduled.
+    send_late: Duration,
+    /// How long applying a description from the SFU and answering it took.
+    describe: Duration,
+}
+
+impl Worst {
+    /// Counts a video frame sent `late` after its scheduled time.
+    pub fn sent_late(&mut self, late: Duration) {
+        self.send_late = self.send_late.max(late);
+    }
+
+    /// Counts a description handled in `took`.
+    pub fn described(&mut self, took: Duration) {
+        self.describe = self.describe.max(took);
+    }
+
+    /// The worst of each, in milliseconds, and starts the next interval.
+    fn take(&mut self) -> (f64, f64) {
+        let worst = std::mem::take(self);
+        (
+            worst.send_late.as_secs_f64() * 1000.0,
+            worst.describe.as_secs_f64() * 1000.0,
+        )
+    }
+}
+
 /// A packet a redundant payload carries along: its number and the timestamp the block gives it.
 #[derive(Debug, Clone, Copy)]
 pub struct Carried {
@@ -757,13 +789,24 @@ impl Receiver {
         due
     }
 
-    /// Writes a `recv` line for every measured stream.
-    pub fn write(&mut self, probe: &Probe, me: &str, now: Instant, rtt_ms: Option<f64>) {
+    /// Writes a `recv` line for every measured stream, with the worst moments of the
+    /// participant's own loop since the last lines (see [`Worst`]).
+    pub fn write(
+        &mut self,
+        probe: &Probe,
+        me: &str,
+        now: Instant,
+        rtt_ms: Option<f64>,
+        worst: &mut Worst,
+    ) {
+        let (send_late_ms, describe_ms) = worst.take();
         for t in self.tracks.values_mut() {
             let mut fields = t.stats.fields(now, probe.group, t.pli, rtt_ms);
             let (p50, p95) = t.stats.take_delays();
             fields["delay_p50_ms"] = p50.into();
             fields["delay_p95_ms"] = p95.into();
+            fields["send_late_ms"] = send_late_ms.into();
+            fields["describe_ms"] = describe_ms.into();
             probe.recv(&format!("{me}/{}:{}", t.kind, t.sender), fields);
         }
     }
@@ -783,6 +826,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _ = std::fs::remove_file(dir.join("rtp.clocks"));
         dir.join("out.jsonl")
+    }
+
+    #[test]
+    fn the_worst_moments_are_kept_until_taken() {
+        let mut worst = Worst::default();
+        worst.sent_late(Duration::from_millis(40));
+        worst.sent_late(Duration::from_millis(5));
+        worst.described(Duration::from_millis(7));
+        assert_eq!(worst.take(), (40.0, 7.0));
+        assert_eq!(worst.take(), (0.0, 0.0));
     }
 
     #[test]

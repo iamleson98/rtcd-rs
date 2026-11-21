@@ -119,7 +119,11 @@ impl Engine {
         };
         match desc.sdp_type {
             RTCSdpType::Offer => self.on_offer(key, desc, via, now),
-            RTCSdpType::Answer => self.on_answer(key, desc, now),
+            RTCSdpType::Answer => {
+                let began = Instant::now();
+                self.on_answer(key, desc, now);
+                self.trace.answer(began.elapsed());
+            }
             other => {
                 warn!(session = %self.session_id(key), ?other, "unexpected session description type")
             }
@@ -418,6 +422,7 @@ impl Engine {
             self.offers_left -= 1;
         }
         s.wants_offer_since = None;
+        let began = Instant::now();
         self.metrics.signaling_lock_grab_time(
             &s.cfg.group_id,
             now.saturating_duration_since(waiting_since),
@@ -457,6 +462,8 @@ impl Engine {
         self.register_ufrag(key);
         self.send_media_map(key, now);
         self.send_local_description(key, via, now);
+        // Offers that fail on the way are not counted: they are logged as failures.
+        self.trace.offer(began.elapsed());
     }
 
     /// Puts the pending additions and removals into the connection.
