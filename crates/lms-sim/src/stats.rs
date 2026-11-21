@@ -1004,7 +1004,8 @@ mod tests {
         let clocks = receiver.clocks_of("video:s01");
         assert_eq!(clocks.len(), 2);
         let delay = delay_among(&clocks, 900_000, arrival).unwrap();
-        assert!((delay - 30.0).abs() < 1e-6, "{delay}");
+        // Unix milliseconds are about 1.7e12: an f64 holds them to about 0.0002.
+        assert!((delay - 30.0).abs() < 1e-3, "{delay}");
         assert!(receiver.clocks_of("video:nobody").is_empty());
     }
 
