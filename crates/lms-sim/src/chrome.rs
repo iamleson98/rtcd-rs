@@ -23,8 +23,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::class::{message, try_open_session};
-use crate::host::Rtcd;
-use crate::stats::Probe;
+use crate::host::{Rtcd, RtcdConn};
+use crate::stats::{Probe, delay_summary};
 
 const PAGE: &str = include_str!("page.html");
 const QUALITY: &str = include_str!("quality.js");
@@ -104,7 +104,49 @@ pub async fn serve(
     Ok(())
 }
 
-/// One page: joins the call for it and carries messages both ways until either side is gone.
+/// The next message from the SFU's side of the page's session, or never when it has none.
+async fn next_from_sfu(live: &mut Option<(RtcdConn, String)>) -> Option<ClientMessage> {
+    match live {
+        Some((conn, _)) => conn.rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The page's row with the one-way delay of the interval: the samples it computed itself (`ms`) and
+/// the playout times of RTP timestamps (`sync`) mapped to the sender's clock, when this process
+/// holds it (a page for a group on another machine has none, and its delays are null).
+fn with_delay(probe: &Probe, id: &str, v: &Value) -> Value {
+    let mut fields = v["fields"].clone();
+    let mut delays: Vec<f64> = v["ms"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_f64)
+        .collect();
+    if let Some((kind, sender)) = id
+        .rsplit_once('/')
+        .and_then(|(_, stream)| stream.split_once(':'))
+        && let Some(clock) = probe.rtp_clock(kind, sender)
+    {
+        delays.extend(
+            v["sync"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|s| Some(clock.delay_ms(s["rtp"].as_u64()? as u32, s["at"].as_f64()?))),
+        );
+    }
+    let (p50, p95) = delay_summary(&mut delays);
+    fields["delay_p50_ms"] = p50.into();
+    fields["delay_p95_ms"] = p95.into();
+    fields
+}
+
+/// One page: carries its messages to the SFU and back until its websocket is gone. The page's
+/// websocket stays open while its session on the SFU does not: the session opens when the page says
+/// `join` (as the LMS server opens one for lms-web) and ends when it says `leave`, when the SFU closes
+/// it (the page is told, `closed`) or when the SFU is gone (the page is not told: its media path and
+/// its unanswered offers tell it, as they tell lms-web).
 async fn session(
     rtcd: Arc<Rtcd>,
     call: String,
@@ -118,27 +160,59 @@ async fn session(
     };
     let (mut page_tx, mut page_rx) = socket.split();
     let name = format!("chrome-{}", probe.group);
-    let Some((mut conn, sid, _)) = try_open_session(&rtcd, &call, &name).await else {
-        return;
-    };
+    let mut live: Option<(RtcdConn, String)> = None;
     loop {
-        tokio::select! {
-            m = page_rx.next() => {
-                let Some(Ok(WsMessage::Text(text))) = m else { break };
-                let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+        let step = tokio::select! {
+            m = page_rx.next() => Ok(m),
+            m = next_from_sfu(&mut live) => Err(m),
+        };
+        match step {
+            Ok(m) => {
+                let Some(Ok(WsMessage::Text(text))) = m else {
+                    break;
+                };
+                let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
                 let text_of = |k: &str| v[k].as_str().unwrap_or_default().as_bytes().to_vec();
                 match v["t"].as_str() {
-                    Some("sdp") => conn.send(message(&sid, &call, MessageType::Sdp, text_of("data"))),
-                    Some("ice") => conn.send(message(&sid, &call, MessageType::Ice, text_of("data"))),
-                    Some("subscribe") => conn.send(message(
-                        &sid,
-                        &call,
-                        MessageType::VideoSubscribe,
-                        json!({ "session_ids": watch }).to_string().into_bytes(),
-                    )),
+                    Some("join") => {
+                        leave(&mut live).await;
+                        match try_open_session(&rtcd, &call, &name).await {
+                            Some((conn, sid, _)) => live = Some((conn, sid)),
+                            None => {
+                                probe.event(&name, "error", "the SFU did not accept the websocket");
+                                let closed = json!({ "t": "closed" }).to_string();
+                                if page_tx.send(WsMessage::text(closed)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Some("leave") => leave(&mut live).await,
+                    Some("sdp") => {
+                        if let Some((conn, sid)) = &live {
+                            conn.send(message(sid, &call, MessageType::Sdp, text_of("data")));
+                        }
+                    }
+                    Some("ice") => {
+                        if let Some((conn, sid)) = &live {
+                            conn.send(message(sid, &call, MessageType::Ice, text_of("data")));
+                        }
+                    }
+                    Some("subscribe") => {
+                        if let Some((conn, sid)) = &live {
+                            conn.send(message(
+                                sid,
+                                &call,
+                                MessageType::VideoSubscribe,
+                                json!({ "session_ids": watch }).to_string().into_bytes(),
+                            ));
+                        }
+                    }
                     Some("recv") => {
                         if let Some(id) = v["id"].as_str() {
-                            probe.recv(id, v["fields"].clone());
+                            probe.recv(id, with_delay(&probe, id, &v));
                         }
                     }
                     Some("quality") => {
@@ -159,33 +233,91 @@ async fn session(
                     _ => {}
                 }
             }
-            m = conn.rx.recv() => match m {
-                Some(ClientMessage::Rtc(m)) if m.session_id == sid => {
-                    let t = match m.kind {
-                        MessageType::Sdp => "sdp",
-                        MessageType::Ice => "ice",
-                        _ => continue,
-                    };
-                    let mut data = String::from_utf8_lossy(&m.data).into_owned();
-                    if let Some((private, public)) = &advertise {
-                        data = data.replace(private.as_str(), public);
+            Err(m) => {
+                let Some((_, sid)) = &live else { continue };
+                match m {
+                    Some(ClientMessage::Rtc(m)) if m.session_id == *sid => {
+                        let t = match m.kind {
+                            MessageType::Sdp => "sdp",
+                            MessageType::Ice => "ice",
+                            _ => continue,
+                        };
+                        let mut data = String::from_utf8_lossy(&m.data).into_owned();
+                        if let Some((private, public)) = &advertise {
+                            data = data.replace(private.as_str(), public);
+                        }
+                        if page_tx
+                            .send(WsMessage::text(json!({ "t": t, "data": data }).to_string()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                    if page_tx.send(WsMessage::text(json!({ "t": t, "data": data }).to_string())).await.is_err() {
-                        break;
+                    Some(ClientMessage::Close(r)) if r.session_id == *sid => {
+                        probe.event(&name, "error", "the SFU closed the session");
+                        live = None;
+                        let closed = json!({ "t": "closed" }).to_string();
+                        if page_tx.send(WsMessage::text(closed)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        probe.event(&name, "error", "the signaling connection closed");
+                        live = None;
                     }
                 }
-                Some(ClientMessage::Close(r)) if r.session_id == sid => {
-                    probe.event(&name, "error", "the SFU closed the session");
-                    break;
-                }
-                Some(_) => {}
-                None => {
-                    probe.event(&name, "error", "the signaling connection closed");
-                    break;
-                }
-            },
+            }
         }
     }
-    conn.send(ClientMessage::Leave(SessionRef { session_id: sid }));
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    leave(&mut live).await;
+}
+
+/// Ends the page's session on the SFU, if it has one.
+async fn leave(live: &mut Option<(RtcdConn, String)>) {
+    if let Some((conn, session_id)) = live.take() {
+        conn.send(ClientMessage::Leave(SessionRef { session_id }));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stats::{RtpClock, Sink};
+
+    #[test]
+    fn a_pages_playout_times_are_mapped_to_the_senders_clock() {
+        let probe = Probe {
+            sink: Sink::open(&std::env::temp_dir().join("lms-sim-chrome-test.jsonl")).unwrap(),
+            imp: "rtcd-rs/chrome".into(),
+            group: "clean",
+            teacher: "session-teacher".into(),
+            measure: false,
+            leader: false,
+        };
+        probe.clock(
+            "voice",
+            "teacher",
+            RtpClock {
+                ts: 1000,
+                wall_ms: 5_000.0,
+                rate: 48_000.0,
+            },
+        );
+        let row = json!({
+            "fields": { "media": "audio" },
+            // 960 ticks (20 ms) after the anchor, played 80 ms after it: 60 ms; and 100 ms.
+            "sync": [{ "rtp": 1960, "at": 5_080.0 }, { "rtp": 1000, "at": 5_100.0 }],
+            "ms": [],
+        });
+        let f = with_delay(&probe, "chrome-clean/voice:teacher", &row);
+        assert_eq!(f["delay_p50_ms"], 60.0);
+        assert_eq!(f["delay_p95_ms"], 100.0);
+        assert_eq!(f["media"], "audio");
+        // A stream no sender of this process clocks has no delay.
+        let f = with_delay(&probe, "chrome-clean/video:s01", &row);
+        assert!(f["delay_p50_ms"].is_null());
+    }
 }

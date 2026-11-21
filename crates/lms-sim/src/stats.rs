@@ -114,6 +114,16 @@ impl RtpClock {
     }
 }
 
+/// The median and the 95th percentile of `delays` (milliseconds, rounded to a tenth), which this
+/// sorts; `None`s when there are none.
+pub fn delay_summary(delays: &mut [f64]) -> (Option<f64>, Option<f64>) {
+    let round = |v: f64| (v * 10.0).round() / 10.0;
+    (
+        percentile(delays, 0.5).map(round),
+        percentile(delays, 0.95).map(round),
+    )
+}
+
 /// The `p`-th percentile (0 to 1, nearest rank) of `values`, which this sorts.
 fn percentile(values: &mut [f64], p: f64) -> Option<f64> {
     if values.is_empty() {
@@ -189,6 +199,11 @@ impl Probe {
                 "detail": format!("{kind} ts={} wall_ms={:.3} rate={}", clock.ts, clock.wall_ms, clock.rate),
             }),
         );
+    }
+
+    /// Where the in-process sender of `kind` and `sender` says its RTP clock stands, if it said.
+    pub fn rtp_clock(&self, kind: &str, sender: &str) -> Option<RtpClock> {
+        self.sink.clock(&format!("{kind}:{sender}"))
     }
 
     pub fn recv(&self, id: &str, fields: Value) {
@@ -274,11 +289,7 @@ impl RecvTrack {
     /// The median and the 95th percentile of the delays since the last call, which starts the
     /// next interval; `None`s when there were none.
     pub fn take_delays(&mut self) -> (Option<f64>, Option<f64>) {
-        let round = |v: f64| (v * 10.0).round() / 10.0;
-        let out = (
-            percentile(&mut self.delays, 0.5).map(round),
-            percentile(&mut self.delays, 0.95).map(round),
-        );
+        let out = delay_summary(&mut self.delays);
         self.delays.clear();
         out
     }
