@@ -1,15 +1,21 @@
 name: lesson-soak
 
-# Two profiles, each for two hours against this repository's rtcd and against the upstream Go rtcd
-# it replaced, on x64 and on arm64 (see scripts/lesson-soak/README.md):
+# Five profiles against this repository's rtcd and against the upstream Go rtcd it replaced, on x64
+# and on arm64 (see scripts/lesson-soak/README.md). The first two run for two hours:
 #   lesson: a real lesson: a teacher, 25 students, Chromium receivers, a network that misbehaves
 #           for part of the class.
 #   abuse:  the same lesson with the SFU held at the limit: a background load of 90 % of the lower of
 #           the two services' ceilings (found by `calibrate` on the same runner type), churn, hostile
 #           clients, junk and signaling abuse, and a network abuse profile for each participant, from
 #           one seed (the run id) so both services meet the same attacks.
+# The Meet-style profiles are short, and never run on pull requests:
+#   lossy:   25 minutes, the impaired group's random loss swept through 10, 20 and 30 %.
+#   restart: 10 minutes, the SFU restarted at 3 and at 7 minutes.
+#   big:     30 minutes, a class of 92 with 25 cameras, a screen share and a speaker every 20 s.
+# The weekly run does all five; a run by hand picks one (`profile`) and can add rs-nopace (`nopace`).
 # rtcd-rs runs twice, with the camera budget off (`rs`) and on (`rs-budget`, the same image; the
-# variable is set explicitly for each), beside the Go rtcd (`go`). The report compares the first and
+# variable is set explicitly for each), beside the Go rtcd (`go`); by hand a third time, `rs-nopace`
+# (rs-budget with the video pacing off), which is in the report only. The report compares the first and
 # the last clean stretch of each service, holds rtcd-rs as it ships (`rs-budget`: the camera budget is
 # on by default) against the Go rtcd (the same lesson, the same network, the same machine type) and
 # fails when it drifts, crashes or is less stable; rtcd-rs with the budget off, against the Go rtcd
@@ -34,6 +40,15 @@ on:
         # Quoted: bare on and off are YAML booleans, and the choice would not take them.
         options: ['both', 'on', 'off']
         default: 'both'
+      profile:
+        description: "Profile: all (every one), or lesson, abuse, lossy, restart or big alone"
+        type: choice
+        options: ['all', 'lesson', 'abuse', 'lossy', 'restart', 'big']
+        default: 'all'
+      nopace:
+        description: "Also run rs-nopace (rs-budget with the video pacing off; report only)"
+        type: boolean
+        default: false
   pull_request:
     paths:
       - 'crates/lms-sim/**'
@@ -53,6 +68,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       impls: ${{ steps.plan.outputs.impls }}
+      profiles: ${{ steps.plan.outputs.profiles }}
+      meet: ${{ steps.plan.outputs.meet }}
+      lesson: ${{ steps.plan.outputs.lesson }}
+      abuse: ${{ steps.plan.outputs.abuse }}
       minutes: ${{ steps.plan.outputs.minutes }}
       cycle: ${{ steps.plan.outputs.cycle }}
       ramp_step: ${{ steps.plan.outputs.ramp_step }}
@@ -65,6 +84,8 @@ jobs:
           MINUTES: ${{ inputs.minutes }}
           CYCLE: ${{ inputs.cycle }}
           BUDGET: ${{ inputs.budget }}
+          PROFILE: ${{ inputs.profile }}
+          NOPACE: ${{ inputs.nopace }}
         run: |
           case "$EVENT" in
             pull_request) minutes=10 cycle=5 ramp_step=20 ramp_per_step=1 ramp_max=6 ;;
@@ -76,15 +97,42 @@ jobs:
           # The services to run: the budget legs, and always the Go baseline. A run that is not started
           # by hand (and so has no input) and a pull request run all three.
           case "${BUDGET:-both}" in
-            both) impls='["rs","rs-budget","go"]' ;;
-            on) impls='["rs-budget","go"]' ;;
-            off) impls='["rs","go"]' ;;
+            both) impls=(rs rs-budget go) ;;
+            on) impls=(rs-budget go) ;;
+            off) impls=(rs go) ;;
             *) echo "budget is both, on or off"; exit 1 ;;
           esac
+          [ "${NOPACE:-false}" != true ] || impls+=(rs-nopace)
+          # The profiles: a pull request runs the two long ones in short, the Meet-style ones only
+          # on the schedule and by hand.
+          all=(lesson abuse lossy restart big)
+          case "$EVENT" in
+            pull_request) profiles=(lesson abuse) ;;
+            workflow_dispatch)
+              case "${PROFILE:-all}" in
+                all) profiles=("${all[@]}") ;;
+                lesson|abuse|lossy|restart|big) profiles=("$PROFILE") ;;
+                *) echo "profile is all, lesson, abuse, lossy, restart or big"; exit 1 ;;
+              esac ;;
+            *) profiles=("${all[@]}") ;;
+          esac
+          meet=()
+          lesson=false abuse=false
+          for p in "${profiles[@]}"; do
+            case "$p" in
+              lesson) lesson=true ;;
+              abuse) abuse=true ;;
+              *) meet+=("$p") ;;
+            esac
+          done
           # The calibration ramp: at most ramp_max / ramp_per_step steps of ramp_step seconds for each
           # service, so the two of them fit the calibrate job's 60 minutes with the image builds.
           {
-            echo "impls=$impls"
+            echo "impls=$(jq -cn '$ARGS.positional' --args "${impls[@]}")"
+            echo "profiles=$(jq -cn '$ARGS.positional' --args "${profiles[@]}")"
+            echo "meet=$(jq -cn '$ARGS.positional' --args ${meet[@]+"${meet[@]}"})"
+            echo "lesson=$lesson"
+            echo "abuse=$abuse"
             echo "minutes=$minutes"
             echo "cycle=$cycle"
             echo "ramp_step=$ramp_step"
@@ -95,6 +143,7 @@ jobs:
   lesson:
     name: Lesson (${{ matrix.impl }}, ${{ matrix.arch }})
     needs: plan
+    if: needs.plan.outputs.lesson == 'true'
     runs-on: ${{ matrix.os }}
     # A lesson is at most 150 minutes (checked in Plan); expressions have no arithmetic.
     timeout-minutes: 180
@@ -141,6 +190,7 @@ jobs:
   calibrate:
     name: Calibrate (${{ matrix.arch }})
     needs: plan
+    if: needs.plan.outputs.abuse == 'true'
     runs-on: ${{ matrix.os }}
     # Both services are ramped one after the other on this runner; the ramp is budgeted in Plan.
     timeout-minutes: 60
@@ -189,6 +239,7 @@ jobs:
   abuse:
     name: Abuse (${{ matrix.impl }}, ${{ matrix.arch }})
     needs: [plan, calibrate]
+    if: needs.plan.outputs.abuse == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     # As in the lesson job: a Go baseline that does not survive the abuse is reported, not a failure.
@@ -241,15 +292,64 @@ jobs:
           path: out/
           retention-days: 30
 
+  meet:
+    name: Meet-style ${{ matrix.profile }} (${{ matrix.impl }}, ${{ matrix.arch }})
+    needs: plan
+    if: needs.plan.outputs.meet != '[]'
+    runs-on: ${{ matrix.os }}
+    # The longest, big, is 30 minutes of lesson; the rest is the images and the report's inputs.
+    timeout-minutes: 90
+    # As in the lesson job: a Go baseline that does not survive is reported, not a failure.
+    continue-on-error: ${{ matrix.impl == 'go' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: ${{ fromJSON(needs.plan.outputs.meet) }}
+        impl: ${{ fromJSON(needs.plan.outputs.impls) }}
+        arch: [x64, arm64]
+        include:
+          - { arch: x64, os: ubuntu-latest }
+          - { arch: arm64, os: ubuntu-24.04-arm }
+    env:
+      PROFILE: ${{ matrix.profile }}
+      SEED: ${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Kernel modules for the network shaping
+        run: |
+          sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)" || true
+          sudo modprobe ifb sch_netem sch_htb act_mirred cls_u32 || true
+          lsmod | grep -E '^(ifb|sch_netem|sch_htb|act_mirred|cls_u32) ' || true
+      - name: Run the soak
+        env:
+          IMPL: ${{ matrix.impl }}
+        run: |
+          # One sweep is one cycle; the restarts are at 3 and 7 minutes of 10.
+          case "$PROFILE" in
+            lossy) minutes=25 cycle=25 ;;
+            restart) minutes=10 cycle=10 ;;
+            big) minutes=30 cycle=15 ;;
+          esac
+          scripts/ci-run.sh scripts/lesson-soak/run.sh "$IMPL" "$minutes" "$cycle" out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: lesson-soak-${{ matrix.profile }}-${{ matrix.impl }}-${{ matrix.arch }}
+          path: out/
+          retention-days: 30
+
   report:
     name: Report (${{ matrix.profile }}, ${{ matrix.arch }})
-    needs: [plan, lesson, abuse]
-    if: always() && (needs.lesson.result != 'skipped' || needs.abuse.result != 'skipped')
+    needs: [plan, lesson, abuse, meet]
+    if: always() && (needs.lesson.result != 'skipped' || needs.abuse.result != 'skipped' || needs.meet.result != 'skipped')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        profile: [lesson, abuse]
+        profile: ${{ fromJSON(needs.plan.outputs.profiles) }}
         arch: [x64, arm64]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -287,8 +387,8 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           set +e
-          rules=scripts/lesson-soak/rules.json
-          [ "$PROFILE" = abuse ] && rules=scripts/lesson-soak/rules-abuse.json
+          rules=scripts/lesson-soak/rules-$PROFILE.json
+          [ "$PROFILE" != lesson ] || rules=scripts/lesson-soak/rules.json
           # The pairs for the services that ran (see pairs.py).
           read -ra impls <<<"$IMPLS"
           python3 scripts/lesson-soak/pairs.py "$rules" pairs.json "${impls[@]}"
@@ -314,12 +414,13 @@ jobs:
             soak/*/seed.txt
           retention-days: 30
       - name: Fail when a soak failed, left nothing, or rtcd-rs breached a rule
-        if: always() && (matrix.profile == 'lesson' && needs.lesson.result != 'success' || matrix.profile == 'abuse' && needs.abuse.result != 'success' || steps.inputs.outputs.missing != '0' || steps.report.outputs.status != '0')
+        if: always() && (matrix.profile == 'lesson' && needs.lesson.result != 'success' || matrix.profile == 'abuse' && needs.abuse.result != 'success' || matrix.profile != 'lesson' && matrix.profile != 'abuse' && needs.meet.result != 'success' || steps.inputs.outputs.missing != '0' || steps.report.outputs.status != '0')
         env:
           LESSON_RESULT: ${{ needs.lesson.result }}
           ABUSE_RESULT: ${{ needs.abuse.result }}
+          MEET_RESULT: ${{ needs.meet.result }}
           MISSING: ${{ steps.inputs.outputs.missing }}
           REPORT_STATUS: ${{ steps.report.outputs.status }}
         run: |
-          echo "soak jobs: lesson $LESSON_RESULT, abuse $ABUSE_RESULT; missing measurements: $MISSING; report status: $REPORT_STATUS"
+          echo "soak jobs: lesson $LESSON_RESULT, abuse $ABUSE_RESULT, meet-style $MEET_RESULT; missing measurements: $MISSING; report status: $REPORT_STATUS"
           exit 1

@@ -87,6 +87,7 @@ pub fn sfu_config(cfg: &Config, addresses: Vec<LocalAddress>) -> SfuConfig {
     }
     engine.audio_loudest = rtc.audio_loudest.clamp(0, 64) as usize;
     engine.camera_budget = rtc.camera_budget;
+    engine.pacing = rtc.pacing;
     engine.audio_ptime_ms = rtc.audio_ptime_ms.clamp(0, 120) as u32;
     engine.egress_budget_bps = rtc.egress_budget_mbps.clamp(0, 100_000) as u64 * 1_000_000;
     engine.egress_budget_pps = rtc.egress_budget_pps.clamp(0, 100_000_000) as u64;
@@ -304,5 +305,13 @@ mod tests {
         assert!(!sfu_config(&cfg, Vec::new()).engine.egress.adapts());
         cfg.rtc.egress_adapt = true;
         assert!(sfu_config(&cfg, Vec::new()).engine.egress.adapts());
+    }
+
+    #[test]
+    fn pacing_follows_the_configuration() {
+        let mut cfg = Config::default();
+        assert!(sfu_config(&cfg, Vec::new()).engine.pacing);
+        cfg.rtc.pacing = false;
+        assert!(!sfu_config(&cfg, Vec::new()).engine.pacing);
     }
 }
