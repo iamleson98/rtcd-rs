@@ -38,7 +38,7 @@ use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use rtc::statistics::StatsSelector;
 use rtcd_proto::dc::DcMessage;
 use rtcd_proto::{ClientMessage, JoinRequest, Message, MessageType, SessionRef};
-use rtcd_sfu::red::{self, MIME_TYPE_RED, RED_FMTP, RED_PAYLOAD_TYPE};
+use rtcd_sfu::red::{self, MIME_TYPE_RED, OPUS_PAYLOAD_TYPE, RED_FMTP, RED_PAYLOAD_TYPE};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -46,7 +46,7 @@ use tokio::task::JoinHandle;
 use crate::assets::{Assets, CameraLayers, Clip};
 use crate::host::{Rtcd, RtcdConn};
 use crate::hostile::{self, Hostile, Hot, Rng};
-use crate::stats::{Probe, Receiver, RtpClock, wall_ms_at};
+use crate::stats::{Carried, Probe, Receiver, RtpClock, wall_ms_at};
 
 const AUDIO_LEVEL_URI: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
 const MID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
@@ -819,26 +819,43 @@ async fn drive(
                     RTCMessage::RtpPacket(track, packet) => {
                         if let (Some(rx), Some(p)) = (rx.as_mut(), probe) {
                             let size = packet.payload.len() + 12;
-                            // The voice packets the redundant payload carries along: the numbers
-                            // before this one, as many as it has blocks.
-                            if env.red
-                                && packet.header.payload_type == RED_PAYLOAD_TYPE
-                                && let Some(d) = red::decode(&packet.payload)
-                            {
-                                let n = d.redundant.len() as u16;
-                                let carried: Vec<u16> = (1..=n)
-                                    .map(|back| packet.header.sequence_number.wrapping_sub(back))
-                                    .collect();
-                                rx.carry(&track, &carried);
-                            }
-                            if let Some((what, w)) = rx.on_rtp(
-                                p,
-                                arrived,
-                                &track,
-                                packet.header.sequence_number,
-                                packet.header.timestamp,
-                                packet.header.marker,
-                            ) && p.leader
+                            let seq = packet.header.sequence_number;
+                            let pt = packet.header.payload_type;
+                            // A voice counts only in a payload type it negotiated: a packet of
+                            // another one is not heard, so it shows as lost. Redundant audio
+                            // carries the packets before this one along, each stamped as its
+                            // block says.
+                            let mut carried = Vec::new();
+                            let heard = if !track.starts_with("voice") || pt == OPUS_PAYLOAD_TYPE {
+                                true
+                            } else if env.red && pt == RED_PAYLOAD_TYPE {
+                                red::decode(&packet.payload).is_some_and(|d| {
+                                    let n = d.redundant.len() as u16;
+                                    carried = d
+                                        .redundant
+                                        .iter()
+                                        .zip(1..)
+                                        .map(|(block, i)| Carried {
+                                            seq: seq.wrapping_sub(n - i + 1),
+                                            ts: packet.header.timestamp.wrapping_sub(block.offset),
+                                        })
+                                        .collect();
+                                    true
+                                })
+                            } else {
+                                false
+                            };
+                            if heard
+                                && let Some((what, w)) = rx.on_rtp_carrying(
+                                    p,
+                                    arrived,
+                                    &track,
+                                    seq,
+                                    packet.header.timestamp,
+                                    packet.header.marker,
+                                    &carried,
+                                )
+                                && p.leader
                             {
                                 for (on, name) in [(w.seq, "seq"), (w.ts, "timestamp")] {
                                     if on {
