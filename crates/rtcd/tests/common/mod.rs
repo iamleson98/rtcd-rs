@@ -161,6 +161,7 @@ impl WsClient {
             dc_signaling: true,
             host: false,
             observer: false,
+            receiver_budget_kbps: 0,
         }))
         .await;
     }

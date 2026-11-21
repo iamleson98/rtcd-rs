@@ -56,6 +56,16 @@ impl SessionProps {
             .unwrap_or(false)
     }
 
+    /// What the participant may receive in all, in bits per second, or `None` when it has no
+    /// budget: older servers send none, and a recorder is never budgeted.
+    pub fn receiver_budget_bps(&self) -> Option<f64> {
+        if self.observer() {
+            return None;
+        }
+        let kbps = self.0.get("receiverBudgetKbps").and_then(Value::as_u64)?;
+        (kbps > 0).then_some(kbps as f64 * 1000.0)
+    }
+
     /// Whether a node with no room left still takes the participant: the host and the recorder.
     pub fn takes_priority(&self) -> bool {
         self.host() || self.observer()
@@ -91,6 +101,10 @@ impl SessionConfig {
         props.insert("dcSignaling".to_owned(), Value::Bool(join.dc_signaling));
         props.insert("host".to_owned(), Value::Bool(join.host));
         props.insert("observer".to_owned(), Value::Bool(join.observer));
+        props.insert(
+            "receiverBudgetKbps".to_owned(),
+            Value::from(join.receiver_budget_kbps),
+        );
         Self {
             group_id: group_id.to_owned(),
             call_id: join.call_id.clone(),
@@ -115,5 +129,37 @@ impl SessionConfig {
             return Err("SessionID should not be empty");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn join(kbps: u32, observer: bool) -> SessionConfig {
+        SessionConfig::from_join(
+            "g",
+            &JoinRequest {
+                call_id: "c".into(),
+                user_id: "u".into(),
+                session_id: "s".into(),
+                receiver_budget_kbps: kbps,
+                observer,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn the_receiver_budget_is_in_bits_per_second() {
+        assert_eq!(join(2000, false).props.receiver_budget_bps(), Some(2.0e6));
+        assert_eq!(join(1500, false).props.receiver_budget_bps(), Some(1.5e6));
+    }
+
+    #[test]
+    fn no_budget_is_zero_missing_or_an_observer() {
+        assert_eq!(join(0, false).props.receiver_budget_bps(), None);
+        assert_eq!(join(2000, true).props.receiver_budget_bps(), None);
+        assert_eq!(SessionProps::default().receiver_budget_bps(), None);
     }
 }
