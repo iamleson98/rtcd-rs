@@ -6,11 +6,12 @@ is a distroless image with nothing to run inside it). Run with --pid=host and --
 
 One `proc` line per interval, in the soak JSONL schema: rss_mb, cpu_pct (of one core, so 200 is two
 cores), threads, fds, and the UDP receive / send buffer errors of the process's network namespace.
-Stops when the process is gone, with an `error` event.
+When the process is gone there is an `error` event at once (the report excuses it when the harness
+logged an `sfu_restart` just before) and sampling stops.
 
 With `@PIDFILE` the process is the one the file names, and the file is read again every interval: a
-service that is restarted on purpose (the restart profile) is followed to its new process, and only
-one that is not back within a minute is gone. CLIENT_PID_DIR holds one file per client container
+service that is restarted on purpose (the restart profile) is followed to its new process, for as long
+as one that is not back within a minute is waited for. CLIENT_PID_DIR holds one file per client container
 (named for it, holding the pid of its main process); each is sampled as `proc` lines with the id
 `client:<name>`: cpu_pct of the whole container (its cgroup, so the browsers' children count) and
 `cores`, the container's CPU limit (its cpuset, or its quota when that is lower). Run with
@@ -28,7 +29,7 @@ pid_spec, impl, out, interval, seconds = sys.argv[1], sys.argv[2], sys.argv[3], 
 client_dir = sys.argv[6] if len(sys.argv) > 6 else None
 arch = platform.machine()
 ticks = os.sysconf("SC_CLK_TCK")
-# How long a service that is restarted on purpose may take to be back.
+# How long a service whose pid file is used is waited for after the event that it is gone.
 RESTART_GRACE = 60.0
 CGROUP = "/sys/fs/cgroup"
 
@@ -158,9 +159,9 @@ with open(out, "a") as f:
             last_cpu, last_t = cpu, now
             gone_since = None
         except (OSError, KeyError, IndexError, ValueError):
-            if pid_spec.startswith("@"):
-                gone_since = gone_since or time.time()
-                if time.time() - gone_since < RESTART_GRACE:
-                    continue
-            write(f, "event", what="error", detail="the SFU process is gone")
+            if gone_since is None:
+                gone_since = time.time()
+                write(f, "event", what="error", detail="the SFU process is gone")
+            if pid_spec.startswith("@") and time.time() - gone_since < RESTART_GRACE:
+                continue
             break

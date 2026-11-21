@@ -61,9 +61,9 @@ Everything is JSONL, one object per line with `ts` (unix ms), `impl`, `arch` (`x
 * `recv`, every 5 s per received track, counters since the start: `frames`, `freezes`, `freeze_ms`,
   `packets`, `bytes`, `duplicates`, `lost`, `nack`, `pli`, `jitter_ms`, `rtt_ms`, `audio_gap_ms`, `stalled`; Chromium rows of voices also carry `playout_delay_ms` (its mean jitter buffer delay).
   `delay_p50_ms` and `delay_p95_ms` are the one-way delay over the interval (null when there is none): of
-  the synthetic receivers, from the sender's RTP clock (each sender in the same process says where its
-  clock stands on the wall clock: one timeline per source, the same on every simulcast layer, `rtp_clock`
-  events) to the arrival of each audio packet and of each frame's marker packet; of Chromium, from
+  the synthetic receivers, from the sender's RTP clock (each sender says where each of its layers' clocks
+  stands on the wall clock, in `rtp_clock` events and in `rtp.clocks` next to the output, which the lesson
+  processes of the run share: one host, one wall clock, so the impaired group has delays too) to the arrival of each audio packet and of each frame's marker packet; of Chromium, from
   `getSynchronizationSources()` once a second (the playout time of the RTP timestamp it last played,
   mapped to the sender's clock by the relay; the jitter buffer's delay plus half the round trip when
   Chromium gives no timestamp), so it includes the jitter buffer. A group on another machine (`remote`)
@@ -167,7 +167,7 @@ in the report as PASS or MISS, except the one hard limit of the restart profile)
 | `PROFILE` | What it does | In CI | Meet targets (not gated) |
 |---|---|---|---|
 | `lossy` | the impaired group's random loss goes through `clean`, `loss10`, `loss20`, `loss30` and `recover` (`NETEM_PROFILE=loss-sweep`; one sweep is one cycle, so `minutes` and `cycle` are the same) | 25 minutes | audio gap and concealed audio at `loss20` at most 5 %; audio delay p95 at most 250 ms (clean group) |
-| `restart` | `docker restart soak-sfu` at 30 % and at 70 % of the lesson (3 and 7 minutes of 10) on a network that is not shaped; each logs an `sfu_restart` event | 10 minutes | every track receives again within 30 s; audio delay p95 at most 250 ms; gated: within 180 s (a track that does not come back in the report's 150 s window counts as never) |
+| `restart` | the SFU's container is killed (SIGKILL) and started again at 30 % and at 70 % of the lesson (3 and 7 minutes of 10) on a network that is not shaped; each logs an `sfu_restart` event at the kill and an `sfu_up` event when the SFU answers | 10 minutes | every track receives again within 30 s; audio delay p95 at most 250 ms; gated: within 180 s (a track that does not come back in the report's 150 s window counts as never) |
 | `big` | `STUDENTS_CLEAN=80`, `STUDENTS_IMPAIRED=12`, 25 cameras, the teacher's screen share, a speaker every 20 s (`TALK_SECS=20`) and `--watch-max 12`: each student receives the teacher and the first 11 other cameras, what lms-web's stage policy receives on a wide screen | 30 minutes | audio delay p95 at most 250 ms (clean group) |
 
 ```bash
@@ -177,14 +177,14 @@ PROFILE=big scripts/lesson-soak/run.sh rs-budget 30 15 ~/soak
 python3 scripts/lesson-soak/pairs.py scripts/lesson-soak/rules-restart.json ~/soak/pairs.json rs-budget go
 ```
 
-The restart is the one an operator makes: the container stops and starts again with the same address
+The restart is abrupt, the same for both services (a crash or a reboot): the container is killed and started again with the same address
 (`restart_sfu` in `lib.sh`). Its network namespace is made anew, so the segmentation offload is turned
 off again, the sampler follows the SFU to its new process (`sfu.pid`), and `run.sh` does not take
 the absence for a crash: the health check ignores the restarts that `restarts.jsonl` says were made. The
 browser's recovery is lms-web's (`call-client.ts`): an ICE restart after 4 s of "disconnected" or at
 once on "failed" (with 25 s to come back), an offer the SFU does not answer sent again after 10 s and
-the seat given up after the second wait; the page's signaling websocket stays open and the relay opens a
-session on the SFU for each `join`, as the LMS server does. The synthetic students rejoin as they do in
+the seat given up after the second wait; with `--chrome-recovery` (`run.sh` sets it, and the page's `recovery=1`, for these three profiles only) the page's signaling websocket stays open and the relay opens a
+session on the SFU for each `join`, as the LMS server does; the lesson and abuse profiles keep the older page. The synthetic students rejoin as they do in
 the abuse profile.
 
 A run is invalid (the report says so) when a client container was above 90 % of its CPU limit in more

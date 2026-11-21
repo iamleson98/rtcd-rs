@@ -146,17 +146,21 @@ with open(path, "a") as f:
 PY
 }
 
-# Restarts the SFU's container on purpose, the way an operator does (the restart profile): logs an
-# `sfu_restart` event with the number $1 at that moment (OUT/restarts.jsonl), restarts it, and redoes
-# what the container's network needs again (its namespace is made anew: the segmentation offload),
-# waits until it answers and tells the sampler its new process. OUT/restarting exists meanwhile, so
-# that run.sh does not take the SFU's absence for a crash.
+# Restarts the SFU's container on purpose, abruptly (the restart profile): the process is killed
+# (SIGKILL: a crash or a node reboot, the same for both services, not the orderly goodbye of a
+# SIGTERM) and the container started again. An `sfu_restart` event with the number $1 is logged at the
+# kill and an `sfu_up` event when the SFU answers again (OUT/restarts.jsonl); in between the container's
+# network namespace is made anew, so the segmentation offload is turned off again. The sampler is told
+# the new process. OUT/restarting exists meanwhile, so that run.sh does not take the SFU's absence for
+# a crash.
 restart_sfu() {
   : >"$OUT/restarting"
   sfu_event "$OUT/restarts.jsonl" sfu_restart "$1"
-  docker restart soak-sfu >/dev/null
+  docker kill -s KILL soak-sfu >/dev/null
+  docker start soak-sfu >/dev/null
   segment_in_software
   wait_sfu || echo "the SFU did not answer after restart $1" >&2
+  sfu_event "$OUT/restarts.jsonl" sfu_up "$1"
   note_sfu_pid
   rm -f "$OUT/restarting"
 }

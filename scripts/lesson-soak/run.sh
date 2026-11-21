@@ -13,7 +13,7 @@
 # The Meet-style profiles (see README.md, "Meet-style profiles") run the same lesson with one thing
 # changed: PROFILE=lossy sweeps the impaired group's random loss through 10, 20 and 30 % (NETEM_PROFILE=
 # loss-sweep: one sweep is one cycle, so give <minutes> and <cycle_minutes> the same value);
-# PROFILE=restart restarts the SFU's container (`docker restart`) at 30 % and at 70 % of the lesson
+# PROFILE=restart kills and starts the SFU's container (SIGKILL) at 30 % and at 70 % of the lesson
 # (3 and 7 minutes of 10), on a network that is not shaped; PROFILE=big is a class of 92 with 25
 # cameras (STUDENTS_CLEAN=80, STUDENTS_IMPAIRED=12), a screen share, a speaker every 20 s and
 # at most 12 cameras received by each student (`--watch-max`, as lms-web's stage policy).
@@ -77,6 +77,14 @@ else
   TALK_SECS=${TALK_SECS:-30}
   BIG_OPTS=""
 fi
+# The three Meet-style profiles have the browser recover as lms-web does (the page loads with
+# recovery=1 and lms-sim is told with --chrome-recovery); the lesson and the abuse profile are as ever.
+CHROME_QUERY=""
+case "$PROFILE" in lossy | restart | big)
+  BIG_OPTS="$BIG_OPTS --chrome-recovery"
+  CHROME_QUERY="&recovery=1"
+  ;;
+esac
 TOTAL=$((STUDENTS_CLEAN + STUDENTS_IMPAIRED))
 MEASURE=${MEASURE:-6}
 BW_DOWN_MBIT=${BW_DOWN_MBIT:-2.5}
@@ -96,7 +104,7 @@ fi
 
 # The per-process files are this run's; the merged file of the other SFU stays.
 rm -f "$OUT"/clean.jsonl "$OUT"/impaired.jsonl "$OUT"/remote.jsonl "$OUT"/proc.jsonl "$OUT"/netem.jsonl "$OUT"/netem-chrome.jsonl \
-  "$OUT"/abuse.jsonl "$OUT"/sfu-events.jsonl "$OUT"/restarts.jsonl "$OUT"/restarting "$OUT/rtcd-$IMPL"-*.jsonl
+  "$OUT"/abuse.jsonl "$OUT"/sfu-events.jsonl "$OUT"/restarts.jsonl "$OUT"/restarting "$OUT"/rtp.clocks "$OUT/rtcd-$IMPL"-*.jsonl
 
 restart_job=""
 cleanup() {
@@ -119,7 +127,7 @@ start_sampler $((MINUTES * 60 + 900))
 
 chrome() { # name client group: in the namespace of the client, for the clean group
   docker run -d --name "$1" --network "container:$2" --shm-size=1g "${client_cpu[@]}" "$CHROME_IMAGE" \
-    "http://127.0.0.1:8099/?group=$3&ws=8100" >/dev/null
+    "http://127.0.0.1:8099/?group=$3&ws=8100$CHROME_QUERY" >/dev/null
   note_client "$1"
 }
 
@@ -142,7 +150,7 @@ joined soak-impaired
 # The impaired Chromium has a network namespace of its own (so that it is shaped on its own, like each
 # synthetic student), and reaches the page and the signaling relay of the lesson on its address.
 docker run -d --name soak-chrome-impaired --network "$NET" --ip "$CHROME_IMPAIRED_IP" --shm-size=1g \
-  "${client_cpu[@]}" "$CHROME_IMAGE" "http://$IMPAIRED_IP:8099/?group=impaired&ws=8100" >/dev/null
+  "${client_cpu[@]}" "$CHROME_IMAGE" "http://$IMPAIRED_IP:8099/?group=impaired&ws=8100$CHROME_QUERY" >/dev/null
 note_client soak-chrome-impaired
 # A Chromium on another machine joins through a lesson process of its own with no students (the page
 # and the relay are published on the host; the media goes straight to the SFU's published port).

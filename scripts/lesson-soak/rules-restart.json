@@ -33,15 +33,30 @@
   "recover_window_s": 150,
   "targets": [
     {
-      "name": "SFU restart: every track receives again within 30 s (Meet target)",
+      "name": "SFU restart: every track receives again within 30 s (Meet target) (impaired group)",
       "metric": "restart_recover_max",
       "max": 30,
-      "gated": false
+      "gated": false,
+      "scope": "impaired"
     },
     {
-      "name": "SFU restart: every track receives again within 180 s",
+      "name": "SFU restart: every track receives again within 180 s (impaired group)",
       "metric": "restart_recover_max",
-      "max": 180
+      "max": 180,
+      "scope": "impaired"
+    },
+    {
+      "name": "SFU restart: every track receives again within 30 s (Meet target) (clean group)",
+      "metric": "restart_recover_max",
+      "max": 30,
+      "gated": false,
+      "scope": "clean"
+    },
+    {
+      "name": "SFU restart: every track receives again within 180 s (clean group)",
+      "metric": "restart_recover_max",
+      "max": 180,
+      "scope": "clean"
     },
     {
       "name": "audio delay p95 <= 250 ms (Meet target, clean group)",
