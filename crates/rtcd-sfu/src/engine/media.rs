@@ -594,7 +594,8 @@ impl Engine {
             sender: None,
             payload_type_known: false,
             red_payload_type: None,
-            red_hold: 0,
+            // The packets before the first it is sent are not the receiver's.
+            red_hold: red::MAX_REDUNDANT,
             // Video starts at a keyframe; audio at once.
             source: (!video).then_some(source),
             target: video.then_some(source),
