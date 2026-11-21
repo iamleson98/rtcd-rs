@@ -894,7 +894,8 @@ async fn drive(
                 }
                 for v in [camera.as_mut(), screen.as_mut()].into_iter().flatten() {
                     if !v.anchored {
-                        let clock = v.anchor(v.next[0]);
+                        let first = v.next[0];
+                        let clock = v.anchor(first);
                         p.clock(
                             if v.label == "screen" {
                                 "screen"
