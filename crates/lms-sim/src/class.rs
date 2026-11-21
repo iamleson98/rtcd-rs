@@ -41,7 +41,6 @@ use rtcd_proto::{ClientMessage, JoinRequest, Message, MessageType, SessionRef};
 use rtcd_sfu::red::{self, MIME_TYPE_RED, OPUS_PAYLOAD_TYPE, RED_FMTP, RED_PAYLOAD_TYPE};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
 
 use crate::assets::{Assets, CameraLayers, Clip};
 use crate::host::{Rtcd, RtcdConn};
@@ -153,7 +152,8 @@ pub struct Participant {
     pub user_id: String,
     stop: Option<oneshot::Sender<()>>,
     ctl: mpsc::UnboundedSender<Ctl>,
-    task: JoinHandle<()>,
+    /// Fires when the peer's thread has finished.
+    done: oneshot::Receiver<()>,
 }
 
 impl Participant {
@@ -165,7 +165,7 @@ impl Participant {
         if let Some(s) = self.stop.take() {
             let _ = s.send(());
         }
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.task).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.done).await;
     }
 }
 
@@ -437,6 +437,8 @@ const REJOIN_BACKOFF: [Duration; 5] = [
     Duration::from_secs(15),
     Duration::from_secs(30),
 ];
+/// Stack of a peer's thread: its work is async and keeps little on the stack.
+const PEER_STACK: usize = 2 << 20;
 const REJOIN_PATIENCE: Duration = Duration::from_secs(180);
 /// How long a try gets to connect, and how long a media path that failed gets to come back before
 /// the seat is given up (lms-web's `CONNECT_TIMEOUT_MS` and `ICE_RESTART_GRACE_MS`).
@@ -448,6 +450,11 @@ const ICE_FAIL_GRACE: Duration = Duration::from_secs(25);
 /// few tries with growing pauses, each logged as an `event` of kind `rejoin` with the downtime);
 /// it does not restart ICE, so a media path that fails and does not come back within 25 s is
 /// given up and rejoined.
+///
+/// Every participant runs on its own OS thread with a current-thread runtime, so the kernel shares
+/// the CPU between them: one peer parsing a large renegotiation must not hold back another peer's
+/// camera, as in browsers, where each page does that work in its own process. A task on a shared
+/// worker pool would make the SFU look late whenever many peers renegotiate at once.
 pub async fn join(
     rtcd: &Arc<Rtcd>,
     assets: Arc<Assets>,
@@ -457,7 +464,6 @@ pub async fn join(
 ) -> Participant {
     let session_id = format!("session-{}", spec.name);
     let user_id = format!("user-{}", spec.name);
-    let first = build(rtcd, &assets, call, &spec, index, 0).await;
     let (stop, mut stop_rx) = oneshot::channel();
     let (ctl, mut ctl_rx) = mpsc::unbounded_channel::<Ctl>();
     let env = Env {
@@ -482,9 +488,12 @@ pub async fn join(
         mtu: spec.mtu,
         hostile: None,
     };
-    let task = tokio::spawn(async move {
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let (done_tx, done) = oneshot::channel();
+    let peer = async move {
         let mut epoch = 0u32;
-        let mut session = first;
+        let mut session = build(&env.rtcd, &env.assets, &env.call, &spec, index, 0).await;
+        let _ = ready_tx.send(());
         // When the seat was lost, and how many tries it has taken since.
         let mut lost = session.is_none().then(Instant::now);
         let mut tries = 0u32;
@@ -532,13 +541,27 @@ pub async fn join(
             epoch += 1;
             session = build(&env.rtcd, &env.assets, &env.call, &spec, index, epoch).await;
         }
-    });
+    };
+    std::thread::Builder::new()
+        .name(format!("peer-{session_id}"))
+        .stack_size(PEER_STACK)
+        .spawn(move || {
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                rt.block_on(peer);
+            }
+            let _ = done_tx.send(());
+        })
+        .expect("spawn a peer thread");
+    let _ = ready_rx.await;
     Participant {
         session_id,
         user_id,
         stop: Some(stop),
         ctl,
-        task,
+        done,
     }
 }
 
