@@ -23,8 +23,9 @@ use super::types::CloseReason;
 use crate::ids::{TrackType, track_id};
 use crate::layers::Layer;
 use crate::metrics::Direction;
-use crate::peer::AUDIO_LEVEL_URI;
+use crate::peer::{AUDIO_LEVEL_URI, OPUS_PAYLOAD_TYPE, opus_codec};
 use crate::rate::RateMonitor;
+use crate::red::{self, MIME_TYPE_RED, RED_PAYLOAD_TYPE};
 use crate::rewrite::Rewriter;
 use crate::vad::{Monitor, VadConfig};
 use crate::vp8;
@@ -46,6 +47,8 @@ pub(crate) struct Fan {
     pub newest: Option<u16>,
     /// Where a copy of every packet goes, if the stream is being recorded.
     pub tap: Option<Tap>,
+    /// The packets before the current one of a voice, for the redundant audio receivers are sent.
+    pub red: red::Encoder,
 }
 
 #[derive(Deserialize)]
@@ -300,6 +303,13 @@ impl Engine {
             warn!(session = %s.cfg.session_id, ssrc = init.ssrc, "track without a codec");
             return;
         };
+        // A voice a sender wraps in redundant audio is Opus to everyone downstream: `forward`
+        // takes the packet out of it.
+        let codec = if codec.mime_type.eq_ignore_ascii_case(MIME_TYPE_RED) {
+            opus_codec().rtp_codec
+        } else {
+            codec
+        };
         let audio_level = receiver
             .get_parameters()
             .rtp_parameters
@@ -388,6 +398,7 @@ impl Engine {
                 resume: false,
                 newest: None,
                 tap: None,
+                red: red::Encoder::default(),
             },
         );
 
@@ -572,6 +583,7 @@ impl Engine {
             phase: DownPhase::PendingAdd,
             sender: None,
             payload_type_known: false,
+            red_payload_type: None,
             // Video starts at a keyframe; audio at once.
             source: (!video).then_some(source),
             target: video.then_some(source),
@@ -644,11 +656,30 @@ impl Engine {
                 continue;
             };
             let resume = std::mem::take(&mut fan.resume);
+            // Whatever the sender wrapped its voice in, the recording and the receivers that do not
+            // take redundant audio get the Opus packet itself.
+            if !fan.ty.is_video() && packet.header.payload_type == RED_PAYLOAD_TYPE {
+                let Some(opus) = red::primary(&packet.payload) else {
+                    continue;
+                };
+                packet.payload = opus;
+                packet.header.payload_type = OPUS_PAYLOAD_TYPE;
+            }
             let seq = packet.header.sequence_number;
             let newest = is_newer(fan.newest, seq);
             if newest {
                 fan.newest = Some(seq);
             }
+            // The redundant payload is built once for every receiver that takes it.
+            let red = (self.cfg.red && !fan.ty.is_video() && !fan.serving.is_empty()).then(|| {
+                fan.red.encode(
+                    OPUS_PAYLOAD_TYPE,
+                    seq,
+                    packet.header.timestamp,
+                    &packet.payload,
+                    newest,
+                )
+            });
             let fan = &*fan;
             // The uplink counts whether or not anyone receives the stream.
             let size = packet.marshal_size() as u64;
@@ -706,7 +737,15 @@ impl Engine {
                     if ds.ty == TrackType::Screen {
                         ds.temporal.set_limit(limit);
                     }
-                    if write_down(r, sub, &packet, frame.as_ref(), now, &mut self.dirty) {
+                    if write_down(
+                        r,
+                        sub,
+                        &packet,
+                        red.as_ref(),
+                        frame.as_ref(),
+                        now,
+                        &mut self.dirty,
+                    ) {
                         sent[type_slot(
                             r.down.get(sub.stream).map_or(TrackType::Video, |d| d.ty),
                         )] += size;
@@ -725,7 +764,15 @@ impl Engine {
                 if resume && let Some(ds) = r.down.get_mut(sub.stream) {
                     ds.rewrite.resume_after_gap(&packet);
                 }
-                let wrote = write_down(r, sub, &packet, frame.as_ref(), now, &mut self.dirty);
+                let wrote = write_down(
+                    r,
+                    sub,
+                    &packet,
+                    red.as_ref(),
+                    frame.as_ref(),
+                    now,
+                    &mut self.dirty,
+                );
                 let ty = r.down.get(sub.stream).map_or(TrackType::Voice, |d| d.ty);
                 if wrote {
                     sent[type_slot(ty)] += size;
@@ -929,12 +976,14 @@ struct Frame {
 }
 
 /// Writes `packet` to the receiver's copy of the stream, rewritten for it, unless it is of a
-/// temporal layer the receiver is not sent (`frame`, for a video). Returns whether it was
-/// accepted for sending.
+/// temporal layer the receiver is not sent (`frame`, for a video). A receiver that negotiated
+/// redundant audio is sent `red`, the payload built for the packet, in its place. Returns whether
+/// it was accepted for sending.
 fn write_down(
     r: &mut Session,
     sub: SubRef,
     packet: &rtc::rtp::Packet,
+    red: Option<&bytes::Bytes>,
     frame: Option<&Frame>,
     now: Instant,
     dirty: &mut Vec<SessionKey>,
@@ -962,19 +1011,23 @@ fn write_down(
         return false;
     };
     if !ds.payload_type_known {
-        let mime = ds.codec.mime_type.clone();
-        if let Some(c) = sender
-            .get_parameters()
-            .rtp_parameters
-            .codecs
-            .iter()
-            .find(|c| c.rtp_codec.mime_type.eq_ignore_ascii_case(&mime))
-        {
-            ds.rewrite.set_payload_type(c.payload_type);
+        let codecs = &sender.get_parameters().rtp_parameters.codecs;
+        let find = |mime: &str| {
+            codecs
+                .iter()
+                .find(|c| c.rtp_codec.mime_type.eq_ignore_ascii_case(mime))
+                .map(|c| c.payload_type)
+        };
+        ds.red_payload_type = (!ds.ty.is_video()).then(|| find(MIME_TYPE_RED)).flatten();
+        if let Some(pt) = ds.red_payload_type.or_else(|| find(&ds.codec.mime_type)) {
+            ds.rewrite.set_payload_type(pt);
         }
         ds.payload_type_known = true;
     }
     let mut out = packet.clone();
+    if let (Some(red), Some(_)) = (red, ds.red_payload_type) {
+        out.payload = red.clone();
+    }
     if !ds.rewrite.rewrite(&mut out) {
         return false;
     }

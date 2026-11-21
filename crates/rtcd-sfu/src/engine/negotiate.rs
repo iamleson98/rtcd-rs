@@ -22,6 +22,7 @@ use super::signaling::{Channel, Phase};
 use super::types::CloseReason;
 use crate::ids::parse_track_id;
 use crate::metrics::Direction;
+use crate::peer::{opus_codec, red_codec};
 
 /// A hostile client can send unreadable descriptions by the thousand; one is logged per session
 /// per interval (all are counted in the signaling error metric).
@@ -436,6 +437,7 @@ impl Engine {
             RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind,
         };
 
+        let red = self.cfg.red;
         let Some(s) = self.sessions.get_mut(key) else {
             return Ok(());
         };
@@ -468,6 +470,14 @@ impl Engine {
                     );
                     match s.pc.add_track(track) {
                         Ok(id) => {
+                            // Redundant audio is offered ahead of Opus, which a receiver that takes
+                            // it answers in the same order.
+                            if red && matches!(kind, RtpCodecKind::Audio) {
+                                s.pc.rtp_transceiver(id.into())
+                                    .ok_or_else(|| "audio transceiver".to_owned())?
+                                    .set_codec_preferences(vec![red_codec(), opus_codec()])
+                                    .map_err(|err| format!("audio codecs: {err}"))?;
+                            }
                             slot.sender = Some(id);
                             slot.phase = DownPhase::Adding;
                         }

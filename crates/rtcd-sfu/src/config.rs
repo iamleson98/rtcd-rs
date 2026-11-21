@@ -76,6 +76,10 @@ pub struct EngineConfig {
     /// video over the last second, so that it does not arrive as one burst that holds back their
     /// voices, which are never paced. Off sends each frame at once, as the Go rtcd does.
     pub pacing: bool,
+    /// Whether voices go to the receivers that accept it as redundant audio (RFC 2198): each packet
+    /// carries the two before it, so a receiver on a lossy downlink loses less audio, for about
+    /// three times the voice bytes. Off sends plain Opus to everyone, as the Go rtcd does.
+    pub red: bool,
     /// How many voices of one call are forwarded when more microphones are open than that: the
     /// loudest (see `loudest`). 0 forwards every voice, as the Go rtcd does.
     pub audio_loudest: usize,
@@ -120,6 +124,7 @@ impl Default for EngineConfig {
             max_bitrate: 6_000_000,
             ice_lite: true,
             pacing: true,
+            red: true,
             audio_loudest: 0,
             camera_budget: true,
             audio_ptime_ms: 0,

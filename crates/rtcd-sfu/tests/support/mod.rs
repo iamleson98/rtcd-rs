@@ -30,8 +30,8 @@ use rtc::peer_connection::transport::{
 };
 use rtc::peer_connection::{RTCPeerConnection, RTCPeerConnectionBuilder};
 use rtc::rtp_transceiver::rtp_sender::{
-    RTCRtpCodec, RTCRtpCodingParameters, RTCRtpEncodingParameters, RTCRtpHeaderExtensionCapability,
-    RtpCodecKind,
+    RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
+    RTCRtpHeaderExtensionCapability, RtpCodecKind,
 };
 use rtc::rtp_transceiver::{RTCRtpSenderId, RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
 use rtc::sansio::Protocol;
@@ -42,6 +42,7 @@ use rtcd_sfu::config::{EngineConfig, LocalAddress};
 use rtcd_sfu::engine::{CloseReason, Command, Engine, Event, Proto};
 use rtcd_sfu::ids::Rng;
 use rtcd_sfu::metrics::{Metrics, NoMetrics};
+use rtcd_sfu::red::{MIME_TYPE_RED, RED_FMTP, RED_PAYLOAD_TYPE};
 
 pub const AUDIO_LEVEL_URI: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
 pub const SERVER: &str = "10.0.0.1:8443";
@@ -225,6 +226,8 @@ pub struct World {
     /// times at most, as a browser does once a round trip (libwebrtc's `NackRequester`, ten
     /// tries). `None` keeps the library's: every 100 ms, for as long as the packet is missing.
     pub nack_retry: Option<(Duration, u16)>,
+    /// Whether browsers joining from now on can receive redundant audio, as a browser can.
+    pub red: bool,
 }
 
 /// A node with no send budget whose kernel refuses the number of datagrams `refused` says it has
@@ -310,6 +313,7 @@ impl World {
             engine_spent: Duration::ZERO,
             around_engine: |_, _| {},
             nack_retry: None,
+            red: false,
         }
     }
 
@@ -396,6 +400,22 @@ impl World {
         self.next_browser += 1;
         let mut me = MediaEngine::default();
         me.register_default_codecs().unwrap();
+        if self.red {
+            me.register_codec(
+                RTCRtpCodecParameters {
+                    rtp_codec: RTCRtpCodec {
+                        mime_type: MIME_TYPE_RED.into(),
+                        clock_rate: 48000,
+                        channels: 2,
+                        sdp_fmtp_line: RED_FMTP.into(),
+                        rtcp_feedback: vec![],
+                    },
+                    payload_type: RED_PAYLOAD_TYPE,
+                },
+                RtpCodecKind::Audio,
+            )
+            .unwrap();
+        }
         me.register_header_extension(
             RTCRtpHeaderExtensionCapability {
                 uri: AUDIO_LEVEL_URI.into(),

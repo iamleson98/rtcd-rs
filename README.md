@@ -170,6 +170,21 @@ ignores it stays at 20. Forwarded voice keeps the packet time it was sent with, 
 activity detector follows it. The value is 0 (the browser decides, the default) or a multiple of 20
 up to 120.
 
+### Redundant audio
+
+A voice packet lost on a receiver's downlink is lost audio. The node offers `red/48000/2` (RFC 2198,
+`fmtp 111/111`, payload type 63) ahead of Opus to every receiver, and one that answers with it is
+sent each voice packet together with the two before it, so the next packet that arrives repairs a
+loss (a gap of one or two packets). The payload is built once per packet of a speaker, not once per
+listener (`rtcd-sfu`'s `red` module), and keeps the speaker's sequence numbers, so reports, NACK and
+its retransmissions work as they do without it. A redundant copy is left out across a gap in the
+sequence numbers, across the silence DTX leaves (more than 100 ms between packets) and when it
+would not fit the header (a 14-bit timestamp offset, a 10-bit length). A receiver that does not
+answer with it is sent plain Opus, and a speaker that wraps its own voice in RED is unwrapped first.
+It costs about three times the voice bytes to each receiver that takes it. `RTCD_RTC_RED=false`
+(`rtc.red`, on by default) does not offer it, which sends plain Opus to everyone: what the soak's
+`PROFILE=lossy` compares, with `lms-sim --red` receivers beside receivers without it.
+
 ## A receiver's path that carries less than its cameras
 
 A receiver whose downlink carries less than the cameras it is sent loses the excess at random, and

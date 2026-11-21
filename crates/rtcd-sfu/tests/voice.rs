@@ -12,6 +12,7 @@ use rtcd_sfu::config::EngineConfig;
 use rtcd_sfu::engine::{CloseReason, Load};
 use rtcd_sfu::ids::{TrackType, parse_track_id};
 use rtcd_sfu::metrics::{Metrics, ReceiverQuality};
+use rtcd_sfu::red;
 use support::{World, config_with_refusals, engine_config};
 
 /// Waits until browser `i` has received `n` tracks.
@@ -35,6 +36,88 @@ fn a_participant_joins_and_connects() {
     let a = w.join("alice", "call1");
     assert!(w.browsers[a].connected);
     assert_eq!(w.engine.session_count(), 1);
+}
+
+/// Alice speaks to Bob, who takes plain Opus, and to Carol, who can receive redundant audio; the
+/// node is configured with `red`. Returns the world and their indexes.
+fn a_voice_heard_by_a_plain_and_a_red_listener(red: bool) -> (World, usize, usize) {
+    let mut w = World::with_config(EngineConfig {
+        red,
+        ..engine_config()
+    });
+    let a = w.join("alice", "call1");
+    let b = w.join("bob", "call1");
+    w.red = true;
+    let c = w.join("carol", "call1");
+    talk(&mut w, a);
+    wait_tracks(&mut w, b, 1);
+    wait_tracks(&mut w, c, 1);
+    for n in 0..30 {
+        w.send_voice(a, n);
+        w.run_for(Duration::from_millis(20));
+    }
+    w.run_for(Duration::from_millis(200));
+    (w, b, c)
+}
+
+/// The voice frames of the packets browser `i` received on its voice tracks: the payload type of
+/// each and the payload.
+fn voice_packets(w: &World, i: usize) -> Vec<(u8, bytes::Bytes)> {
+    w.browsers[i]
+        .rtp
+        .iter()
+        .filter(|(t, _)| t.starts_with("voice"))
+        .map(|(_, p)| (p.header.payload_type, p.payload.clone()))
+        .collect()
+}
+
+#[test]
+fn a_listener_that_takes_redundant_audio_is_sent_it_and_the_others_plain_opus() {
+    let (w, bob, carol) = a_voice_heard_by_a_plain_and_a_red_listener(true);
+    let plain = voice_packets(&w, bob);
+    assert!(plain.len() >= 30, "{}", plain.len());
+    assert!(plain.iter().all(|(pt, _)| *pt == 111));
+    let heard: Vec<u32> = plain
+        .iter()
+        .filter_map(|(_, p)| support::voice_number(p))
+        .collect();
+    assert_eq!(heard, (0..30).collect::<Vec<_>>());
+
+    let wrapped = voice_packets(&w, carol);
+    assert!(wrapped.iter().all(|(pt, _)| *pt == red::RED_PAYLOAD_TYPE));
+    let decoded: Vec<_> = wrapped
+        .iter()
+        .map(|(_, p)| red::decode(p).expect("a RED payload"))
+        .collect();
+    let numbered: Vec<_> = decoded
+        .iter()
+        .filter_map(|d| Some((support::voice_number(&d.primary)?, d)))
+        .collect();
+    assert_eq!(
+        numbered.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        (0..30).collect::<Vec<_>>(),
+        "the same voice, frame for frame"
+    );
+    // Each frame carries the two before it.
+    let (n, d) = numbered[10];
+    assert_eq!(n, 10);
+    let before: Vec<u32> = d
+        .redundant
+        .iter()
+        .filter_map(|r| support::voice_number(&r.data))
+        .collect();
+    assert_eq!(before, vec![8, 9]);
+    assert!(d.redundant.iter().all(|r| r.payload_type == 111));
+}
+
+#[test]
+fn with_redundant_audio_off_everyone_is_sent_plain_opus() {
+    let (w, bob, carol) = a_voice_heard_by_a_plain_and_a_red_listener(false);
+    for i in [bob, carol] {
+        let voice = voice_packets(&w, i);
+        assert!(voice.len() >= 30);
+        assert!(voice.iter().all(|(pt, _)| *pt == 111), "browser {i}");
+    }
 }
 
 #[test]
