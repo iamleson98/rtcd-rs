@@ -171,7 +171,7 @@ in the report as PASS or MISS, except the one hard limit of the restart profile)
 |---|---|---|---|
 | `lossy` | the impaired group's random loss goes through `clean`, `loss10`, `loss20`, `loss30` and `recover` (`NETEM_PROFILE=loss-sweep`; one sweep is one cycle, so `minutes` and `cycle` are the same) | 25 minutes | audio gap and concealed audio at `loss20` at most 5 %; audio delay p95 at most 250 ms (clean group) |
 | `restart` | the SFU's container is killed (SIGKILL) and started again at 30 % and at 70 % of the lesson (3 and 7 minutes of 10) on a network that is not shaped; each logs an `sfu_restart` event at the kill and an `sfu_up` event when the SFU answers | 10 minutes | every track receives again within 30 s; audio delay p95 at most 250 ms; gated: within 180 s (a track that does not come back in the report's 150 s window counts as never) |
-| `big` | `STUDENTS_CLEAN=80`, `STUDENTS_IMPAIRED=12`, 25 cameras, the teacher's screen share, a speaker every 20 s (`TALK_SECS=20`) and `--watch-max 12`: each student receives the teacher and the first 11 other cameras, what lms-web's stage policy receives on a wide screen | 30 minutes | audio delay p95 at most 250 ms (clean group) |
+| `big` | `STUDENTS_CLEAN=80`, `STUDENTS_IMPAIRED=12`, 25 cameras, the teacher's screen share, a speaker every 20 s (`TALK_SECS=20`) and `--watch-max 12`: each student receives the teacher and the first 11 other cameras, what lms-web's stage policy receives on a wide screen | 30 minutes | audio delay p95 at most 250 ms (clean group); no clean-group video freezes, shown but not gated: rtcd-rs's clean students still freeze about 2 s a minute at this size with no packet loss, under investigation |
 
 ```bash
 PROFILE=lossy scripts/lesson-soak/run.sh rs-budget 25 25 ~/soak
