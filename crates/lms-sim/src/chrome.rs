@@ -40,6 +40,10 @@ pub struct Page {
     /// the network the lesson runs on) and the one to put in its place in what the page is sent, the
     /// way an SFU behind NAT offers its public address (`ice_host_override`) to those on the internet.
     pub advertise: Option<(String, String)>,
+    /// Recovery as lms-web does it (the page loads with `recovery=1`): the page's websocket stays open
+    /// while its session on the SFU does not, see [`session`]. Off, the page's websocket and its
+    /// session end together, and the page takes both back.
+    pub recovery: bool,
 }
 
 /// Serves the page on `bind:port` and the relay on `bind:port + 1`, for as long as the process
@@ -59,6 +63,7 @@ pub async fn serve(
     let references: Arc<Vec<Bytes>> =
         Arc::new(page.references.into_iter().map(Bytes::from).collect());
     let advertise = page.advertise;
+    let recovery = page.recovery;
     tokio::spawn(async move {
         let app = Router::new()
             .route("/", get(|| async { Html(PAGE) }))
@@ -97,6 +102,7 @@ pub async fn serve(
                 probe.clone(),
                 watch.clone(),
                 advertise.clone(),
+                recovery,
                 stream,
             ));
         }
@@ -126,15 +132,10 @@ fn with_delay(probe: &Probe, id: &str, v: &Value) -> Value {
     if let Some((kind, sender)) = id
         .rsplit_once('/')
         .and_then(|(_, stream)| stream.split_once(':'))
-        && let Some(clock) = probe.rtp_clock(kind, sender)
     {
-        delays.extend(
-            v["sync"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|s| Some(clock.delay_ms(s["rtp"].as_u64()? as u32, s["at"].as_f64()?))),
-        );
+        delays.extend(v["sync"].as_array().into_iter().flatten().filter_map(|s| {
+            probe.delay_ms(kind, sender, s["rtp"].as_u64()? as u32, s["at"].as_f64()?)
+        }));
     }
     let (p50, p95) = delay_summary(&mut delays);
     fields["delay_p50_ms"] = p50.into();
@@ -142,17 +143,22 @@ fn with_delay(probe: &Probe, id: &str, v: &Value) -> Value {
     fields
 }
 
-/// One page: carries its messages to the SFU and back until its websocket is gone. The page's
-/// websocket stays open while its session on the SFU does not: the session opens when the page says
-/// `join` (as the LMS server opens one for lms-web) and ends when it says `leave`, when the SFU closes
-/// it (the page is told, `closed`) or when the SFU is gone (the page is not told: its media path and
-/// its unanswered offers tell it, as they tell lms-web).
+/// One page: carries its messages to the SFU and back until its websocket is gone.
+///
+/// Without `recovery` the session on the SFU opens with the websocket and ends with it: when the SFU
+/// closes the session or is gone, the websocket is closed and the page opens a new one.
+///
+/// With `recovery` the page's websocket stays open while its session does not, as lms-web's does
+/// with the LMS server's: the session opens when the page says `join` and ends when it says `leave`,
+/// when the SFU closes it (the page is told, `closed`) or when the SFU is gone (the page is not told:
+/// its media path and its unanswered offers tell it, as they tell lms-web).
 async fn session(
     rtcd: Arc<Rtcd>,
     call: String,
     probe: Probe,
     watch: Vec<String>,
     advertise: Option<(String, String)>,
+    recovery: bool,
     stream: TcpStream,
 ) {
     let Ok(socket) = tokio_tungstenite::accept_async(stream).await else {
@@ -161,6 +167,12 @@ async fn session(
     let (mut page_tx, mut page_rx) = socket.split();
     let name = format!("chrome-{}", probe.group);
     let mut live: Option<(RtcdConn, String)> = None;
+    if !recovery {
+        let Some((conn, sid, _)) = try_open_session(&rtcd, &call, &name).await else {
+            return;
+        };
+        live = Some((conn, sid));
+    }
     loop {
         let step = tokio::select! {
             m = page_rx.next() => Ok(m),
@@ -256,6 +268,9 @@ async fn session(
                     }
                     Some(ClientMessage::Close(r)) if r.session_id == *sid => {
                         probe.event(&name, "error", "the SFU closed the session");
+                        if !recovery {
+                            break;
+                        }
                         live = None;
                         let closed = json!({ "t": "closed" }).to_string();
                         if page_tx.send(WsMessage::text(closed)).await.is_err() {
@@ -265,6 +280,9 @@ async fn session(
                     Some(_) => {}
                     None => {
                         probe.event(&name, "error", "the signaling connection closed");
+                        if !recovery {
+                            break;
+                        }
                         live = None;
                     }
                 }
@@ -289,8 +307,12 @@ mod tests {
 
     #[test]
     fn a_pages_playout_times_are_mapped_to_the_senders_clock() {
+        let dir = std::env::temp_dir().join("lms-sim-chrome");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("rtp.clocks"));
+        let scratch = dir.join("out.jsonl");
         let probe = Probe {
-            sink: Sink::open(&std::env::temp_dir().join("lms-sim-chrome-test.jsonl")).unwrap(),
+            sink: Sink::open(&scratch).unwrap(),
             imp: "rtcd-rs/chrome".into(),
             group: "clean",
             teacher: "session-teacher".into(),
@@ -300,6 +322,7 @@ mod tests {
         probe.clock(
             "voice",
             "teacher",
+            0,
             RtpClock {
                 ts: 1000,
                 wall_ms: 5_000.0,

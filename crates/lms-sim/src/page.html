@@ -62,11 +62,13 @@ let pc, dc, pollTimer, failTimer, disconnectTimer, answerTimer, retryTimer;
 // its own (the counters start again), told by `#epoch` in the ids.
 const BACKOFF = [1000, 3000, 8000, 15000, 30000];
 const PATIENCE = 180000;
-// The media path's recovery is lms-web's (call-client.ts): a path that stays "disconnected" is
-// rebuilt (ICE restart) after 4 s; one that failed is rebuilt at once and given 25 s to come back; an
-// offer the SFU does not answer in 10 s is sent again once, and the seat is given up if that is not
-// answered either. The websocket to the relay stays open throughout (the relay opens a session on the
-// SFU for each `join`, as the LMS server does for lms-web).
+// With `recovery=1` the media path's recovery is lms-web's (call-client.ts): a path that stays
+// "disconnected" is rebuilt (ICE restart) after 4 s; one that failed is rebuilt at once and given 25 s
+// to come back; an offer the SFU does not answer in 10 s is sent again once, and the seat is given up
+// if that is not answered either. The websocket to the relay stays open throughout (the relay opens a
+// session on the SFU for each `join`, as the LMS server does for lms-web). Without it a path that
+// failed is given 25 s and then the websocket, and with it the session, is closed and made again.
+const recovery = q.get('recovery') === '1';
 const ICE_DISCONNECTED_RESTART = 4000;
 const ICE_FAIL_GRACE = 25000;
 const ANSWER_TIMEOUT = 10000;
@@ -154,7 +156,7 @@ document.getElementById('tap').onclick = (e) => {
 };
 
 async function start() {
-	send({ t: 'join' });
+	if (recovery) send({ t: 'join' });
 	codecsLogged = false;
 	const mine = (pc = new RTCPeerConnection({ iceServers: [], bundlePolicy: 'max-bundle' }));
 	dc = pc.createDataChannel('calls-dc');
@@ -162,22 +164,25 @@ async function start() {
 	// The microphone slot: a student listening has it muted, so it sends nothing.
 	pc.addTransceiver('audio', { direction: 'sendonly' });
 	pc.onicecandidate = (e) => e.candidate && send({ t: 'ice', data: JSON.stringify(e.candidate.toJSON()) });
-	pc.onnegotiationneeded = () => queue(negotiate);
+	if (recovery) pc.onnegotiationneeded = () => queue(negotiate);
 	pc.onconnectionstatechange = () => {
 		if (pc !== mine) return;
 		event('ice_state', `connection:${pc.connectionState}`);
 		clearTimeout(failTimer);
 		clearTimeout(disconnectTimer);
-		if (pc.connectionState === 'disconnected') {
-			disconnectTimer = setTimeout(() => {
-				if (pc === mine && pc.connectionState === 'disconnected') pc.restartIce();
-			}, ICE_DISCONNECTED_RESTART);
-		} else if (pc.connectionState === 'failed') {
+		if (pc.connectionState === 'failed') {
 			// The websocket still works: a new media path first, and the seat is given up if it does not come back.
 			pc.restartIce();
 			failTimer = setTimeout(() => {
-				if (pc === mine && pc.connectionState !== 'connected') fail('the media path stayed down');
+				if (pc !== mine || pc.connectionState === 'connected') return;
+				if (recovery) return fail('the media path stayed down');
+				event('error', 'the media path stayed down');
+				ws.close();
 			}, ICE_FAIL_GRACE);
+		} else if (recovery && pc.connectionState === 'disconnected') {
+			disconnectTimer = setTimeout(() => {
+				if (pc === mine && pc.connectionState === 'disconnected') pc.restartIce();
+			}, ICE_DISCONNECTED_RESTART);
 		}
 	};
 	pc.oniceconnectionstatechange = () => event('ice_state', `ice:${pc.iceConnectionState}`);
@@ -194,7 +199,12 @@ async function start() {
 		const json = decodeSdp(new Uint8Array(e.data));
 		if (json) queue(async () => onDescription(await inflate(json), true));
 	};
-	await negotiate();
+	if (recovery) {
+		await negotiate();
+	} else {
+		await pc.setLocalDescription(await pc.createOffer());
+		send({ t: 'sdp', data: JSON.stringify(pc.localDescription) });
+	}
 	pollTimer = setInterval(poll, 1000);
 }
 
@@ -215,7 +225,6 @@ function teardown() {
 	for (const el of document.querySelectorAll('video, audio')) el.remove();
 	seen = new Map();
 	els = new Map();
-	concealed = new Map();
 	delays = new Map();
 	ticks = 0;
 }
@@ -255,9 +264,7 @@ function owners() {
 // ---- what Chrome measures, once a second, written every fifth ----
 let seen = new Map();
 let ticks = 0;
-// Per stream: what its audio had concealed, made up and recovered when its last row went out, and the
-// delay samples of the interval (see sampleDelay).
-let concealed = new Map();
+// Per stream: the delay samples of the interval (see sampleDelay).
 let delays = new Map();
 const jitterBuffer = new Map();
 
@@ -277,14 +284,20 @@ function sampleDelay(report, owner, rtt) {
 		const key = `${kind}:${session.replace(/^session-/, '')}`;
 		if (!delays.has(key)) delays.set(key, { sync: [], ms: [], last: null });
 		const slot = delays.get(key);
-		const source = t.receiver.getSynchronizationSources().find((s) => typeof s.rtpTimestamp === 'number');
+		const r = inbound.get(t.mid);
+		// The latest source of this receiver's own stream (its SSRC is the inbound-rtp's).
+		const source = t.receiver
+			.getSynchronizationSources()
+			.filter((s) => typeof s.rtpTimestamp === 'number' && s.source === r?.ssrc)
+			.reduce((a, s) => (!a || s.timestamp > a.timestamp ? s : a), null);
 		if (source) {
 			if (source.rtpTimestamp === slot.last) continue;
 			slot.last = source.rtpTimestamp;
-			slot.sync.push({ rtp: source.rtpTimestamp, at: performance.timeOrigin + source.timestamp });
+			// Chrome gives the time as unix milliseconds; one from the page's time origin is made one.
+			const at = source.timestamp < 1e12 ? performance.timeOrigin + source.timestamp : source.timestamp;
+			slot.sync.push({ rtp: source.rtpTimestamp, at });
 			continue;
 		}
-		const r = inbound.get(t.mid);
 		if (!r || !(r.jitterBufferEmittedCount > 0)) continue;
 		const before = jitterBuffer.get(t.mid) ?? { delay: 0, emitted: 0 };
 		const emitted = r.jitterBufferEmittedCount - before.emitted;
@@ -337,10 +350,6 @@ async function poll() {
 				freezeMs += Math.round(open);
 			}
 		}
-		// What the audio concealed, made up from redundancy and recovered over the interval.
-		const was = concealed.get(key) ?? { samples: 0, events: 0, fec: 0 };
-		const total = { samples: r.concealedSamples ?? 0, events: r.concealmentEvents ?? 0, fec: r.fecPacketsReceived ?? 0 };
-		concealed.set(key, total);
 		const samples = delays.get(key);
 		delays.delete(key);
 		send({
@@ -350,9 +359,10 @@ async function poll() {
 			ms: samples?.ms ?? [],
 			fields: {
 				...(audio ? {
-					concealed_samples: total.samples - was.samples,
-					concealment_events: total.events - was.events,
-					fec_packets: total.fec - was.fec,
+					// Running totals, as the counters above are (the report takes the differences).
+					concealed_samples: r.concealedSamples ?? 0,
+					concealment_events: r.concealmentEvents ?? 0,
+					fec_packets: r.fecPacketsReceived ?? 0,
 				} : {}),
 				media: audio ? 'audio' : 'video',
 				group,

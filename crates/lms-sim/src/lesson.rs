@@ -29,6 +29,10 @@
 //! student of an impaired group changes its UDP source port now and then) and `--mtu` (an impaired
 //! group sends datagrams of MTU size and over).
 //!
+//! `--chrome-recovery` makes the browser recover as lms-web's does (see `lms_sim::chrome`): the page
+//! is loaded with `recovery=1` (`scripts/lesson-soak/run.sh` does both, for the profiles that restart
+//! the SFU or sweep the loss).
+//!
 //! `--watch-max K` (default 12, what lms-web's `stage-policy.ts` receives on a wide screen) is the most
 //! cameras a student receives: the teacher's, and the K - 1 first of the others (those who have been
 //! in the call longest, as the stage policy ranks them when nobody speaks or raises a hand), so a class
@@ -71,6 +75,7 @@ struct Args {
     chrome: Option<u16>,
     chrome_bind: String,
     chrome_advertise: Option<String>,
+    chrome_recovery: bool,
     udp_base: Option<u16>,
     seed: Option<u64>,
     teacher_reconnect_mins: Option<u64>,
@@ -99,6 +104,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
         chrome: None,
         chrome_bind: "127.0.0.1".into(),
         chrome_advertise: None,
+        chrome_recovery: false,
         udp_base: None,
         seed: None,
         teacher_reconnect_mins: None,
@@ -112,6 +118,10 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
     while let Some(k) = it.next() {
         if k == "--teacher" {
             a.teacher = true;
+            continue;
+        }
+        if k == "--chrome-recovery" {
+            a.chrome_recovery = true;
             continue;
         }
         if k == "--mtu" {
@@ -236,6 +246,7 @@ pub async fn run(args: impl Iterator<Item = String>, assets: PathBuf) {
                     .chrome_advertise
                     .clone()
                     .map(|public| (a.media.ip().to_string(), public)),
+                recovery: a.chrome_recovery,
             },
             &a.chrome_bind,
             port,

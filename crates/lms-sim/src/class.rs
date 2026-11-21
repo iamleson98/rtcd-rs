@@ -186,8 +186,8 @@ pub(crate) struct Video {
     /// bits either way, as a browser's is.
     pub(crate) temporal: bool,
     pub(crate) mid: Option<String>,
-    /// Whether the layers' timestamps are on one timeline anchored to the wall clock (see
-    /// [`Video::anchor`]); a try that is not connected has no schedule to anchor to.
+    /// Whether the layers' clocks have been told to the receivers (see [`Video::clocks`]); a try
+    /// that is not connected has no schedule to tell of.
     anchored: bool,
 }
 
@@ -219,7 +219,7 @@ impl Video {
             next: vec![now; n],
             step: clips
                 .iter()
-                .map(|c| Duration::from_nanos(1_000_000_000 / u64::from(c.fps)))
+                .map(|c| Duration::from_micros(1_000_000 / u64::from(c.fps)))
                 .collect(),
             clips,
             temporal,
@@ -228,23 +228,16 @@ impl Video {
         }
     }
 
-    /// Puts every layer on one timeline (the layers' frames are on the same clock, as one
-    /// encoder's are), the latest of the layers' timestamps, that starts at `at`; returns where
-    /// that clock stands on the wall clock.
-    fn anchor(&mut self, at: Instant) -> RtpClock {
-        let ts = self
-            .ts
-            .iter()
-            .copied()
-            .reduce(|a, b| if b.wrapping_sub(a) as i32 > 0 { b } else { a })
-            .unwrap_or_default();
-        self.ts.fill(ts);
-        self.anchored = true;
-        RtpClock {
-            ts,
-            wall_ms: wall_ms_at(at),
-            rate: 90_000.0,
-        }
+    /// Where each layer's RTP clock stands on the wall clock, the first frame of each due at the
+    /// time `next` says: it carries the timestamp one frame on from the layer's last.
+    fn clocks(&self) -> Vec<RtpClock> {
+        (0..self.ssrcs.len())
+            .map(|l| RtpClock {
+                ts: self.ts[l].wrapping_add(90_000 / self.clips[l].fps),
+                wall_ms: wall_ms_at(self.next[l]),
+                rate: 90_000.0,
+            })
+            .collect()
     }
 
     /// The encoder starts over with a keyframe on every layer.
@@ -885,6 +878,7 @@ async fn drive(
                     p.clock(
                         "voice",
                         sender,
+                        0,
                         RtpClock {
                             ts: mic_ts,
                             wall_ms: wall_ms_at(next_audio),
@@ -894,17 +888,15 @@ async fn drive(
                 }
                 for v in [camera.as_mut(), screen.as_mut()].into_iter().flatten() {
                     if !v.anchored {
-                        let first = v.next[0];
-                        let clock = v.anchor(first);
-                        p.clock(
-                            if v.label == "screen" {
-                                "screen"
-                            } else {
-                                "video"
-                            },
-                            sender,
-                            clock,
-                        );
+                        v.anchored = true;
+                        let kind = if v.label == "screen" {
+                            "screen"
+                        } else {
+                            "video"
+                        };
+                        for (layer, clock) in v.clocks().into_iter().enumerate() {
+                            p.clock(kind, sender, layer, clock);
+                        }
                     }
                 }
             }
@@ -1370,8 +1362,7 @@ fn send_frame(pc: &mut RTCPeerConnection, v: &mut Video, l: usize, on: bool) {
     let step = v.pos[l] % 4;
     let (frame, key) = clip.frames[v.pos[l] % clip.frames.len()].clone();
     v.pos[l] = (v.pos[l] + 1) % clip.frames.len();
-    let ts = v.ts[l];
-    v.ts[l] = ts.wrapping_add(90_000 / clip.fps);
+    v.ts[l] = v.ts[l].wrapping_add(90_000 / clip.fps);
     v.picture_id[l] = v.picture_id[l].wrapping_add(1) & 0x7fff;
     let tid = TEMPORAL_PATTERN[step];
     if v.temporal && tid == 0 {
@@ -1392,7 +1383,7 @@ fn send_frame(pc: &mut RTCPeerConnection, v: &mut Video, l: usize, on: bool) {
             marker: n == chunks.len() - 1,
             payload_type: pt,
             sequence_number: v.seq[l],
-            timestamp: ts,
+            timestamp: v.ts[l],
             ssrc: v.ssrcs[l],
             ..Default::default()
         };
@@ -1483,7 +1474,7 @@ mod tests {
     }
 
     #[test]
-    fn the_layers_of_a_camera_share_one_timeline_that_is_anchored_to_the_wall_clock() {
+    fn each_layer_tells_where_its_clock_stands_without_changing_its_timestamps() {
         let clip = |fps| Clip {
             width: 16,
             height: 16,
@@ -1491,7 +1482,7 @@ mod tests {
             frames: vec![(vec![0], true)],
         };
         let at = Instant::now();
-        let mut v = Video::new(
+        let v = Video::new(
             RTCRtpSenderId::from(0usize),
             "camera",
             vec![1, 2],
@@ -1499,12 +1490,11 @@ mod tests {
             (true, false),
             at,
         );
-        assert_ne!(v.ts[0], v.ts[1], "a layer starts on its own");
-        let clock = v.anchor(at);
-        assert_eq!(v.ts[0], v.ts[1]);
-        assert_eq!(clock.ts, v.ts[0]);
-        assert_eq!(clock.rate, 90_000.0);
-        assert!((wall_ms_at(at) - clock.wall_ms).abs() < 50.0);
+        let clocks = v.clocks();
+        // The first frame of each layer carries its start timestamp and one frame.
+        assert_eq!((clocks[0].ts, clocks[1].ts), (1000 + 6000, 900_000 + 3750));
+        assert!(clocks.iter().all(|c| c.rate == 90_000.0));
+        assert!((wall_ms_at(at) - clocks[0].wall_ms).abs() < 50.0);
     }
 
     #[test]

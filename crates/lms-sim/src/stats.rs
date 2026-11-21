@@ -16,12 +16,14 @@
 //! * the **delay** is the one-way time from a sender to a receiver in the same process: the sender
 //!   says where its RTP clock stood on the wall clock ([`RtpClock`]), the receiver maps the
 //!   timestamp of every audio packet and of each video frame's marker packet to the wall clock
-//!   and subtracts it from the arrival. A receiver in another process has no clock to map to.
+//!   and subtracts it from the arrival. The processes of one run share the clocks through a file
+//!   next to the output (`rtp.clocks`: the same host, so the same wall clock); a receiver with
+//!   none to map to (a group on another machine) writes null.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -44,9 +46,33 @@ pub const INTERVAL: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 pub struct Sink {
     out: Mutex<File>,
-    /// Where each sender's RTP clock stands, by `<kind>:<sender>` (`voice`, `video`, `screen`).
-    clocks: Mutex<HashMap<String, RtpClock>>,
+    /// Where each sender's RTP clocks stand, from this process and from the file the processes of
+    /// the run share.
+    clocks: Mutex<Clocks>,
+    clock_file: PathBuf,
 }
+
+/// The RTP clocks senders have told of, by `<kind>:<sender>` (`voice`, `video`, `screen`), one
+/// per layer, and how much of the shared file has been read.
+#[derive(Debug, Default)]
+struct Clocks {
+    by_key: HashMap<String, Vec<Option<RtpClock>>>,
+    read: u64,
+    checked: Option<Instant>,
+}
+
+impl Clocks {
+    fn set(&mut self, key: &str, layer: usize, clock: RtpClock) {
+        let layers = self.by_key.entry(key.to_owned()).or_default();
+        if layers.len() <= layer {
+            layers.resize(layer + 1, None);
+        }
+        layers[layer] = Some(clock);
+    }
+}
+
+/// How often the shared file of clocks is read again.
+const CLOCK_REREAD: Duration = Duration::from_secs(1);
 
 impl Sink {
     /// Opens `path` for appending.
@@ -55,6 +81,7 @@ impl Sink {
         Ok(Arc::new(Self {
             out: Mutex::new(out),
             clocks: Mutex::default(),
+            clock_file: path.with_file_name("rtp.clocks"),
         }))
     }
 
@@ -114,6 +141,16 @@ impl RtpClock {
     }
 }
 
+/// The delay by whichever of a source's layer clocks the timestamp fits best (the smallest delay in
+/// size: a packet does not say which layer it is of, and the layers of one camera are on one
+/// timeline when they start together, as lms-web's do).
+pub fn delay_among(clocks: &[RtpClock], ts: u32, arrival_ms: f64) -> Option<f64> {
+    clocks
+        .iter()
+        .map(|c| c.delay_ms(ts, arrival_ms))
+        .min_by(|a, b| a.abs().total_cmp(&b.abs()))
+}
+
 /// The median and the 95th percentile of `delays` (milliseconds, rounded to a tenth), which this
 /// sorts; `None`s when there are none.
 pub fn delay_summary(delays: &mut [f64]) -> (Option<f64>, Option<f64>) {
@@ -135,13 +172,70 @@ fn percentile(values: &mut [f64], p: f64) -> Option<f64> {
 }
 
 impl Sink {
-    fn clock(&self, key: &str) -> Option<RtpClock> {
-        self.clocks.lock().ok()?.get(key).copied()
+    /// Every layer's clock of `key` (the sender's own process, or another's through the file).
+    fn clocks_of(&self, key: &str) -> Vec<RtpClock> {
+        let Ok(mut c) = self.clocks.lock() else {
+            return Vec::new();
+        };
+        if c.checked.is_none_or(|at| at.elapsed() >= CLOCK_REREAD) {
+            c.checked = Some(Instant::now());
+            self.read_clock_file(&mut c);
+        }
+        c.by_key
+            .get(key)
+            .map(|l| l.iter().flatten().copied().collect())
+            .unwrap_or_default()
     }
 
-    fn set_clock(&self, key: String, clock: RtpClock) {
+    /// Takes in the lines other processes have added to the shared file since the last read.
+    fn read_clock_file(&self, c: &mut Clocks) {
+        let Ok(mut file) = File::open(&self.clock_file) else {
+            return;
+        };
+        let mut text = String::new();
+        if file.seek(SeekFrom::Start(c.read)).is_err() || file.read_to_string(&mut text).is_err() {
+            return;
+        }
+        // Only whole lines: a writer may be in the middle of one.
+        let whole = text.rfind('\n').map_or(0, |i| i + 1);
+        for line in text[..whole].lines() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if let (Some(key), Some(layer), Some(ts), Some(wall_ms), Some(rate)) = (
+                v["key"].as_str(),
+                v["layer"].as_u64(),
+                v["ts"].as_u64(),
+                v["wall_ms"].as_f64(),
+                v["rate"].as_f64(),
+            ) {
+                c.set(
+                    key,
+                    layer as usize,
+                    RtpClock {
+                        ts: ts as u32,
+                        wall_ms,
+                        rate,
+                    },
+                );
+            }
+        }
+        c.read += whole as u64;
+    }
+
+    fn set_clock(&self, key: &str, layer: usize, clock: RtpClock) {
         if let Ok(mut c) = self.clocks.lock() {
-            c.insert(key, clock);
+            c.set(key, layer, clock);
+        }
+        let line = json!({
+            "key": key, "layer": layer, "ts": clock.ts, "wall_ms": clock.wall_ms, "rate": clock.rate,
+        });
+        if let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.clock_file)
+        {
+            let _ = f.write_all(format!("{line}\n").as_bytes());
         }
     }
 }
@@ -186,24 +280,33 @@ impl Probe {
         );
     }
 
-    /// A sender tells where its RTP clock for `kind` (`voice`, `video` or `screen`) stands on the
-    /// wall clock, to the receivers in this process and to the log.
-    pub fn clock(&self, kind: &str, sender: &str, clock: RtpClock) {
-        self.sink.set_clock(format!("{kind}:{sender}"), clock);
+    /// A sender tells where its RTP clock for `kind` (`voice`, `video` or `screen`) and layer
+    /// stands on the wall clock, to the receivers of the run and to the log.
+    pub fn clock(&self, kind: &str, sender: &str, layer: usize, clock: RtpClock) {
+        self.sink
+            .set_clock(&format!("{kind}:{sender}"), layer, clock);
         self.sink.write(
             &self.imp,
             "event",
             sender,
             json!({
                 "what": "rtp_clock", "group": self.group,
-                "detail": format!("{kind} ts={} wall_ms={:.3} rate={}", clock.ts, clock.wall_ms, clock.rate),
+                "detail": format!(
+                    "{kind} layer={layer} ts={} wall_ms={:.3} rate={}",
+                    clock.ts, clock.wall_ms, clock.rate
+                ),
             }),
         );
     }
 
-    /// Where the in-process sender of `kind` and `sender` says its RTP clock stands, if it said.
-    pub fn rtp_clock(&self, kind: &str, sender: &str) -> Option<RtpClock> {
-        self.sink.clock(&format!("{kind}:{sender}"))
+    /// The one-way delay of a packet of `kind` from `sender` stamped `ts` that arrived at
+    /// `arrival_ms`, if the sender said where its clocks stand (see [`delay_among`]).
+    pub fn delay_ms(&self, kind: &str, sender: &str, ts: u32, arrival_ms: f64) -> Option<f64> {
+        delay_among(
+            &self.sink.clocks_of(&format!("{kind}:{sender}")),
+            ts,
+            arrival_ms,
+        )
     }
 
     pub fn recv(&self, id: &str, fields: Value) {
@@ -538,9 +641,9 @@ impl Receiver {
         // Of the video, the marker packet of a frame is the one that completes it.
         if t.stats.duplicates == duplicates
             && (marker || !t.stats.video)
-            && let Some(clock) = probe.sink.clock(&format!("{}:{}", t.kind, t.sender))
+            && let Some(delay) = probe.delay_ms(&t.kind, &t.sender, ts, wall_ms_at(now))
         {
-            t.stats.add_delay(clock.delay_ms(ts, wall_ms_at(now)));
+            t.stats.add_delay(delay);
         }
         Some((format!("{}:{}", t.kind, t.sender), wrapped))
     }
@@ -590,6 +693,14 @@ mod tests {
 
     fn clock() -> Instant {
         Instant::now()
+    }
+
+    /// An output file in a directory of its own, with no clocks shared in it yet.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lms-sim-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("rtp.clocks"));
+        dir.join("out.jsonl")
     }
 
     #[test]
@@ -695,9 +806,41 @@ mod tests {
     }
 
     #[test]
+    fn another_process_reads_the_clocks_from_the_shared_file() {
+        let path = scratch("stats-shared");
+        let sender = Sink::open(&path).unwrap();
+        let receiver = Sink::open(&path.with_file_name("other.jsonl")).unwrap();
+        let sent = wall_ms_at(clock()) - 30.0;
+        // Two layers of one camera that start apart: the one that fits the timestamp is the clock.
+        sender.set_clock(
+            "video:s01",
+            0,
+            RtpClock {
+                ts: 1000,
+                wall_ms: sent,
+                rate: 90_000.0,
+            },
+        );
+        sender.set_clock(
+            "video:s01",
+            1,
+            RtpClock {
+                ts: 900_000,
+                wall_ms: sent,
+                rate: 90_000.0,
+            },
+        );
+        let clocks = receiver.clocks_of("video:s01");
+        assert_eq!(clocks.len(), 2);
+        let delay = delay_among(&clocks, 900_000, wall_ms_at(clock())).unwrap();
+        assert!((delay - 30.0).abs() < 5.0, "{delay}");
+        assert!(receiver.clocks_of("video:nobody").is_empty());
+    }
+
+    #[test]
     fn delays_are_taken_per_interval_and_only_for_audio_and_frame_ends() {
         let probe = Probe {
-            sink: Sink::open(&std::env::temp_dir().join("lms-sim-stats-delay-test.jsonl")).unwrap(),
+            sink: Sink::open(&scratch("stats-delay")).unwrap(),
             imp: "rtcd-rs".into(),
             group: "clean",
             teacher: "session-teacher".into(),
@@ -709,6 +852,7 @@ mod tests {
         probe.clock(
             "voice",
             "teacher",
+            0,
             RtpClock {
                 ts: 0,
                 wall_ms: sent,
@@ -718,6 +862,7 @@ mod tests {
         probe.clock(
             "video",
             "teacher",
+            0,
             RtpClock {
                 ts: 0,
                 wall_ms: sent,
@@ -752,7 +897,7 @@ mod tests {
     #[test]
     fn only_the_teachers_voice_and_the_videos_are_measured() {
         let probe = Probe {
-            sink: Sink::open(&std::env::temp_dir().join("lms-sim-stats-test.jsonl")).unwrap(),
+            sink: Sink::open(&scratch("stats")).unwrap(),
             imp: "rtcd-rs".into(),
             group: "clean",
             teacher: "session-teacher".into(),
