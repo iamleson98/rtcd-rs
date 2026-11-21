@@ -45,7 +45,7 @@ use tokio::task::JoinHandle;
 use crate::assets::{Assets, CameraLayers, Clip};
 use crate::host::{Rtcd, RtcdConn};
 use crate::hostile::{self, Hostile, Hot, Rng};
-use crate::stats::{Probe, Receiver};
+use crate::stats::{Probe, Receiver, RtpClock, wall_ms_at};
 
 const AUDIO_LEVEL_URI: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
 const MID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
@@ -186,6 +186,9 @@ pub(crate) struct Video {
     /// bits either way, as a browser's is.
     pub(crate) temporal: bool,
     pub(crate) mid: Option<String>,
+    /// Whether the layers' clocks have been told to the receivers (see [`Video::clocks`]); a try
+    /// that is not connected has no schedule to tell of.
+    anchored: bool,
 }
 
 impl Video {
@@ -221,7 +224,20 @@ impl Video {
             clips,
             temporal,
             mid: None,
+            anchored: false,
         }
+    }
+
+    /// Where each layer's RTP clock stands on the wall clock, the first frame of each due at the
+    /// time `next` says: it carries the timestamp one frame on from the layer's last.
+    fn clocks(&self) -> Vec<RtpClock> {
+        (0..self.ssrcs.len())
+            .map(|l| RtpClock {
+                ts: self.ts[l].wrapping_add(90_000 / self.clips[l].fps),
+                wall_ms: wall_ms_at(self.next[l]),
+                rate: 90_000.0,
+            })
+            .collect()
     }
 
     /// The encoder starts over with a keyframe on every layer.
@@ -703,6 +719,8 @@ async fn drive(
     let mut mic_seq = if wrap { WRAP_SEQ } else { 0u16 };
     let mut mic_ts = if wrap { WRAP_AUDIO_TS } else { 0u32 };
     let mut mic_pos = 0usize;
+    let mut mic_anchored = false;
+    let sender = sid.strip_prefix("session-").unwrap_or(sid);
     let mut next_audio = Instant::now();
     // What this participant measures of what it receives, and where to ask for a keyframe.
     let mut rx = probe
@@ -851,6 +869,37 @@ async fn drive(
             if let Some(data) = watch.take() {
                 conn.send(message(sid, call, MessageType::VideoSubscribe, data));
             }
+            // The senders say where their RTP clocks stand on the wall clock: the schedule starts
+            // at `next_audio` and at the first frame of each camera, and the timestamps go on at
+            // the rate of the schedule.
+            if let Some(p) = probe {
+                if !mic_anchored {
+                    mic_anchored = true;
+                    p.clock(
+                        "voice",
+                        sender,
+                        0,
+                        RtpClock {
+                            ts: mic_ts,
+                            wall_ms: wall_ms_at(next_audio),
+                            rate: 48_000.0,
+                        },
+                    );
+                }
+                for v in [camera.as_mut(), screen.as_mut()].into_iter().flatten() {
+                    if !v.anchored {
+                        v.anchored = true;
+                        let kind = if v.label == "screen" {
+                            "screen"
+                        } else {
+                            "video"
+                        };
+                        for (layer, clock) in v.clocks().into_iter().enumerate() {
+                            p.clock(kind, sender, layer, clock);
+                        }
+                    }
+                }
+            }
             if persist.voice {
                 while next_audio <= now {
                     let seq = mic_seq;
@@ -957,8 +1006,10 @@ async fn drive(
             }
         } else {
             next_audio = now;
+            mic_anchored = false;
             for v in [camera.as_mut(), screen.as_mut()].into_iter().flatten() {
                 v.next.fill(now);
+                v.anchored = false;
             }
         }
 
@@ -1420,6 +1471,30 @@ mod tests {
         assert_eq!((v.ssrcs.len(), v.step.len(), v.clips.len()), (2, 2, 2));
         assert!(v.step[0] > v.step[1], "the small layer is the slower");
         assert_eq!(TEMPORAL_PATTERN, [0, 2, 1, 2]);
+    }
+
+    #[test]
+    fn each_layer_tells_where_its_clock_stands_without_changing_its_timestamps() {
+        let clip = |fps| Clip {
+            width: 16,
+            height: 16,
+            fps,
+            frames: vec![(vec![0], true)],
+        };
+        let at = Instant::now();
+        let v = Video::new(
+            RTCRtpSenderId::from(0usize),
+            "camera",
+            vec![1, 2],
+            vec![clip(15), clip(24)],
+            (true, false),
+            at,
+        );
+        let clocks = v.clocks();
+        // The first frame of each layer carries its start timestamp and one frame.
+        assert_eq!((clocks[0].ts, clocks[1].ts), (1000 + 6000, 900_000 + 3750));
+        assert!(clocks.iter().all(|c| c.rate == 90_000.0));
+        assert!((wall_ms_at(at) - clocks[0].wall_ms).abs() < 50.0);
     }
 
     #[test]

@@ -12,12 +12,18 @@
 //! * **lost** is the packets the sequence numbers say were sent and never came, as the RTP receiver
 //!   report counts them (a late packet that comes after all takes one off; a number that comes
 //!   twice counts once, and the second time is a **duplicate**, so a loss is not hidden by a copy);
-//! * **nack** is the packets asked for again: every sequence number the receiver saw skipped.
+//! * **nack** is the packets asked for again: every sequence number the receiver saw skipped;
+//! * the **delay** is the one-way time from a sender to a receiver in the same process: the sender
+//!   says where its RTP clock stood on the wall clock ([`RtpClock`]), the receiver maps the
+//!   timestamp of every audio packet and of each video frame's marker packet to the wall clock
+//!   and subtracts it from the arrival. The processes of one run share the clocks through a file
+//!   next to the output (`rtp.clocks`: the same host, so the same wall clock); a receiver with
+//!   none to map to (a group on another machine) writes null.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -40,6 +46,33 @@ pub const INTERVAL: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 pub struct Sink {
     out: Mutex<File>,
+    /// Where each sender's RTP clocks stand, from this process and from the file the processes of
+    /// the run share.
+    clocks: Mutex<Clocks>,
+    clock_file: PathBuf,
+}
+
+/// The RTP clocks senders have told of, by `<kind>:<sender>` (`voice`, `video`, `screen`), one
+/// per layer, and how much of the shared file has been read.
+#[derive(Debug, Default)]
+struct Clocks {
+    by_key: HashMap<String, Vec<Option<RtpClock>>>,
+    read: u64,
+}
+
+impl Clocks {
+    /// Layer 0 is the first a sender tells of, so a clock for it starts a new session of the source
+    /// (a reconnect, with its own timestamps) and the layers of the one before are dropped.
+    fn set(&mut self, key: &str, layer: usize, clock: RtpClock) {
+        let layers = self.by_key.entry(key.to_owned()).or_default();
+        if layer == 0 {
+            layers.clear();
+        }
+        if layers.len() <= layer {
+            layers.resize(layer + 1, None);
+        }
+        layers[layer] = Some(clock);
+    }
 }
 
 impl Sink {
@@ -48,6 +81,8 @@ impl Sink {
         let out = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Arc::new(Self {
             out: Mutex::new(out),
+            clocks: Mutex::default(),
+            clock_file: path.with_file_name("rtp.clocks"),
         }))
     }
 
@@ -74,6 +109,144 @@ pub fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// The wall clock, in unix milliseconds, at the instant `at` (earlier or later than now).
+pub fn wall_ms_at(at: Instant) -> f64 {
+    let now = Instant::now();
+    let wall = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64() * 1000.0);
+    if at <= now {
+        wall - (now - at).as_secs_f64() * 1000.0
+    } else {
+        wall + (at - now).as_secs_f64() * 1000.0
+    }
+}
+
+/// Where a sender's RTP clock stood on the wall clock: the packet stamped `ts` was due out at
+/// `wall_ms`, and the timestamps go on at `rate` ticks a second (one timeline per source, the
+/// same on every simulcast layer).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RtpClock {
+    pub ts: u32,
+    pub wall_ms: f64,
+    pub rate: f64,
+}
+
+impl RtpClock {
+    /// The one-way delay of a packet stamped `ts` that arrived at `arrival_ms` (unix milliseconds).
+    pub fn delay_ms(&self, ts: u32, arrival_ms: f64) -> f64 {
+        let ticks = f64::from(ts.wrapping_sub(self.ts) as i32);
+        arrival_ms - (self.wall_ms + ticks / self.rate * 1000.0)
+    }
+}
+
+/// How far before a clock's anchor a packet may arrive and still be of that session of the sender:
+/// a packet is never sent before its schedule, so one that arrived earlier is of the session before.
+const ANCHOR_SLACK_MS: f64 = 5.0;
+
+/// The delay by whichever of a source's layer clocks the timestamp fits best (the smallest delay in
+/// size: a packet does not say which layer it is of, and the layers of one camera are on one
+/// timeline when they start together, as lms-web's do). A packet that arrived before the newest
+/// clocks were anchored is of an earlier session of the sender and has no delay.
+pub fn delay_among(clocks: &[RtpClock], ts: u32, arrival_ms: f64) -> Option<f64> {
+    clocks
+        .iter()
+        .filter(|c| arrival_ms >= c.wall_ms - ANCHOR_SLACK_MS)
+        .map(|c| c.delay_ms(ts, arrival_ms))
+        .min_by(|a, b| a.abs().total_cmp(&b.abs()))
+}
+
+/// The median and the 95th percentile of `delays` (milliseconds, rounded to a tenth), which this
+/// sorts; `None`s when there are none.
+pub fn delay_summary(delays: &mut [f64]) -> (Option<f64>, Option<f64>) {
+    let round = |v: f64| (v * 10.0).round() / 10.0;
+    (
+        percentile(delays, 0.5).map(round),
+        percentile(delays, 0.95).map(round),
+    )
+}
+
+/// The `p`-th percentile (0 to 1, nearest rank) of `values`, which this sorts.
+fn percentile(values: &mut [f64], p: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let rank = ((values.len() as f64 * p).ceil() as usize).clamp(1, values.len());
+    Some(values[rank - 1])
+}
+
+impl Sink {
+    /// Every layer's clock of `key` (the sender's own process, or another's through the file).
+    fn clocks_of(&self, key: &str) -> Vec<RtpClock> {
+        let Ok(mut c) = self.clocks.lock() else {
+            return Vec::new();
+        };
+        // A sender writes its clocks before its first packet leaves, so a file that grew holds the
+        // newest clock of every packet that has arrived: read it before mapping, not a second late.
+        let grown = std::fs::metadata(&self.clock_file).is_ok_and(|m| m.len() > c.read);
+        if grown {
+            self.read_clock_file(&mut c);
+        }
+        c.by_key
+            .get(key)
+            .map(|l| l.iter().flatten().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Takes in the lines other processes have added to the shared file since the last read.
+    fn read_clock_file(&self, c: &mut Clocks) {
+        let Ok(mut file) = File::open(&self.clock_file) else {
+            return;
+        };
+        let mut text = String::new();
+        if file.seek(SeekFrom::Start(c.read)).is_err() || file.read_to_string(&mut text).is_err() {
+            return;
+        }
+        // Only whole lines: a writer may be in the middle of one.
+        let whole = text.rfind('\n').map_or(0, |i| i + 1);
+        for line in text[..whole].lines() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if let (Some(key), Some(layer), Some(ts), Some(wall_ms), Some(rate)) = (
+                v["key"].as_str(),
+                v["layer"].as_u64(),
+                v["ts"].as_u64(),
+                v["wall_ms"].as_f64(),
+                v["rate"].as_f64(),
+            ) {
+                c.set(
+                    key,
+                    layer as usize,
+                    RtpClock {
+                        ts: ts as u32,
+                        wall_ms,
+                        rate,
+                    },
+                );
+            }
+        }
+        c.read += whole as u64;
+    }
+
+    fn set_clock(&self, key: &str, layer: usize, clock: RtpClock) {
+        if let Ok(mut c) = self.clocks.lock() {
+            c.set(key, layer, clock);
+        }
+        let line = json!({
+            "key": key, "layer": layer, "ts": clock.ts, "wall_ms": clock.wall_ms, "rate": clock.rate,
+        });
+        if let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.clock_file)
+        {
+            let _ = f.write_all(format!("{line}\n").as_bytes());
+        }
+    }
 }
 
 /// Where a participant's measurements go and what it is measuring.
@@ -114,6 +287,35 @@ impl Probe {
                 "downtime_ms": downtime_ms, "attempts": attempts,
             }),
         );
+    }
+
+    /// A sender tells where its RTP clock for `kind` (`voice`, `video` or `screen`) and layer
+    /// stands on the wall clock, to the receivers of the run and to the log.
+    pub fn clock(&self, kind: &str, sender: &str, layer: usize, clock: RtpClock) {
+        self.sink
+            .set_clock(&format!("{kind}:{sender}"), layer, clock);
+        self.sink.write(
+            &self.imp,
+            "event",
+            sender,
+            json!({
+                "what": "rtp_clock", "group": self.group,
+                "detail": format!(
+                    "{kind} layer={layer} ts={} wall_ms={:.3} rate={}",
+                    clock.ts, clock.wall_ms, clock.rate
+                ),
+            }),
+        );
+    }
+
+    /// The one-way delay of a packet of `kind` from `sender` stamped `ts` that arrived at
+    /// `arrival_ms`, if the sender said where its clocks stand (see [`delay_among`]).
+    pub fn delay_ms(&self, kind: &str, sender: &str, ts: u32, arrival_ms: f64) -> Option<f64> {
+        delay_among(
+            &self.sink.clocks_of(&format!("{kind}:{sender}")),
+            ts,
+            arrival_ms,
+        )
     }
 
     pub fn recv(&self, id: &str, fields: Value) {
@@ -160,6 +362,8 @@ pub struct RecvTrack {
     /// or the network's duplicate), and which of the last [`SEEN_BITS`] numbers have arrived.
     duplicates: u64,
     seen: [u64; (SEEN_BITS / 64) as usize],
+    /// The one-way delays measured since the last line.
+    delays: Vec<f64>,
 }
 
 impl RecvTrack {
@@ -185,7 +389,21 @@ impl RecvTrack {
             bytes: 0,
             duplicates: 0,
             seen: [0; (SEEN_BITS / 64) as usize],
+            delays: Vec::new(),
         }
+    }
+
+    /// Takes a measured one-way delay.
+    pub fn add_delay(&mut self, ms: f64) {
+        self.delays.push(ms);
+    }
+
+    /// The median and the 95th percentile of the delays since the last call, which starts the
+    /// next interval; `None`s when there were none.
+    pub fn take_delays(&mut self) -> (Option<f64>, Option<f64>) {
+        let out = delay_summary(&mut self.delays);
+        self.delays.clear();
+        out
     }
 
     /// Counts the size of a packet that arrived (RTP header and payload).
@@ -427,7 +645,15 @@ impl Receiver {
             );
         }
         let t = self.tracks.get_mut(track)?;
+        let duplicates = t.stats.duplicates;
         let wrapped = t.stats.on_packet(now, seq, ts, marker);
+        // Of the video, the marker packet of a frame is the one that completes it.
+        if t.stats.duplicates == duplicates
+            && (marker || !t.stats.video)
+            && let Some(delay) = probe.delay_ms(&t.kind, &t.sender, ts, wall_ms_at(now))
+        {
+            t.stats.add_delay(delay);
+        }
         Some((format!("{}:{}", t.kind, t.sender), wrapped))
     }
 
@@ -459,12 +685,13 @@ impl Receiver {
     }
 
     /// Writes a `recv` line for every measured stream.
-    pub fn write(&self, probe: &Probe, me: &str, now: Instant, rtt_ms: Option<f64>) {
-        for t in self.tracks.values() {
-            probe.recv(
-                &format!("{me}/{}:{}", t.kind, t.sender),
-                t.stats.fields(now, probe.group, t.pli, rtt_ms),
-            );
+    pub fn write(&mut self, probe: &Probe, me: &str, now: Instant, rtt_ms: Option<f64>) {
+        for t in self.tracks.values_mut() {
+            let mut fields = t.stats.fields(now, probe.group, t.pli, rtt_ms);
+            let (p50, p95) = t.stats.take_delays();
+            fields["delay_p50_ms"] = p50.into();
+            fields["delay_p95_ms"] = p95.into();
+            probe.recv(&format!("{me}/{}:{}", t.kind, t.sender), fields);
         }
     }
 }
@@ -475,6 +702,14 @@ mod tests {
 
     fn clock() -> Instant {
         Instant::now()
+    }
+
+    /// An output file in a directory of its own, with no clocks shared in it yet.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lms-sim-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("rtp.clocks"));
+        dir.join("out.jsonl")
     }
 
     #[test]
@@ -568,9 +803,136 @@ mod tests {
     }
 
     #[test]
+    fn the_delay_follows_the_senders_clock_across_the_timestamp_wrap() {
+        let clock = RtpClock {
+            ts: u32::MAX - 959,
+            wall_ms: 1_000_000.0,
+            rate: 48_000.0,
+        };
+        // 20 ms after the anchor in sender time (past the wrap), arrived 35 ms after the anchor.
+        assert!((clock.delay_ms(0, 1_000_035.0) - 15.0).abs() < 1e-6);
+        assert!((clock.delay_ms(u32::MAX - 959, 1_000_012.0) - 12.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn another_process_reads_the_clocks_from_the_shared_file() {
+        let path = scratch("stats-shared");
+        let sender = Sink::open(&path).unwrap();
+        let receiver = Sink::open(&path.with_file_name("other.jsonl")).unwrap();
+        let arrival = wall_ms_at(clock());
+        let sent = arrival - 30.0;
+        // Two layers of one camera that start apart: the one that fits the timestamp is the clock.
+        sender.set_clock(
+            "video:s01",
+            0,
+            RtpClock {
+                ts: 1000,
+                wall_ms: sent,
+                rate: 90_000.0,
+            },
+        );
+        sender.set_clock(
+            "video:s01",
+            1,
+            RtpClock {
+                ts: 900_000,
+                wall_ms: sent,
+                rate: 90_000.0,
+            },
+        );
+        let clocks = receiver.clocks_of("video:s01");
+        assert_eq!(clocks.len(), 2);
+        let delay = delay_among(&clocks, 900_000, arrival).unwrap();
+        // Unix milliseconds are about 1.7e12: an f64 holds them to about 0.0002.
+        assert!((delay - 30.0).abs() < 1e-3, "{delay}");
+        assert!(receiver.clocks_of("video:nobody").is_empty());
+    }
+
+    #[test]
+    fn a_reconnected_sender_replaces_its_clocks_for_every_receiver() {
+        let path = scratch("stats-reconnect");
+        let sender = Sink::open(&path).unwrap();
+        let receiver = Sink::open(&path.with_file_name("other.jsonl")).unwrap();
+        let clock = |ts: u32, wall_ms: f64| RtpClock {
+            ts,
+            wall_ms,
+            rate: 90_000.0,
+        };
+        sender.set_clock("video:s01", 0, clock(1000, 10_000.0));
+        sender.set_clock("video:s01", 1, clock(1000, 10_000.0));
+        assert_eq!(receiver.clocks_of("video:s01").len(), 2);
+        // The sender comes back with one layer and timestamps of its own: the receiver, which read
+        // the old ones a moment ago, maps with the new clock at once and the old layer is gone.
+        sender.set_clock("video:s01", 0, clock(7_000_000, 400_000.0));
+        let clocks = receiver.clocks_of("video:s01");
+        assert_eq!(clocks, vec![clock(7_000_000, 400_000.0)]);
+        let delay = delay_among(&clocks, 7_000_900, 400_030.0).unwrap();
+        assert!((delay - 20.0).abs() < 1e-6, "{delay}");
+        // A packet from before the new anchor is of the old session: no delay.
+        assert_eq!(delay_among(&clocks, 1900, 10_050.0), None);
+    }
+
+    #[test]
+    fn delays_are_taken_per_interval_and_only_for_audio_and_frame_ends() {
+        let probe = Probe {
+            sink: Sink::open(&scratch("stats-delay")).unwrap(),
+            imp: "rtcd-rs".into(),
+            group: "clean",
+            teacher: "session-teacher".into(),
+            measure: true,
+            leader: false,
+        };
+        let now = clock();
+        let sent = wall_ms_at(now) - 40.0;
+        probe.clock(
+            "voice",
+            "teacher",
+            0,
+            RtpClock {
+                ts: 0,
+                wall_ms: sent,
+                rate: 48_000.0,
+            },
+        );
+        probe.clock(
+            "video",
+            "teacher",
+            0,
+            RtpClock {
+                ts: 0,
+                wall_ms: sent,
+                rate: 90_000.0,
+            },
+        );
+        let mut r = Receiver::default();
+        r.on_rtp(&probe, now, "voice_session-teacher_a", 1, 0, false);
+        // Two packets of one frame: only the one with the marker is a delay sample.
+        r.on_rtp(&probe, now, "video_session-teacher_a", 1, 0, false);
+        r.on_rtp(&probe, now, "video_session-teacher_a", 2, 0, true);
+        // A sender that did not say where its clock stands has no delay.
+        r.on_rtp(&probe, now, "screen_session-teacher_a", 1, 0, true);
+        for t in r.tracks.values_mut() {
+            let (p50, p95) = t.stats.take_delays();
+            match t.kind.as_str() {
+                "screen" => assert_eq!((p50, p95), (None, None)),
+                _ => {
+                    assert!((p50.unwrap() - 40.0).abs() < 5.0, "{p50:?}");
+                    assert_eq!(t.stats.delays.len(), 0);
+                }
+            }
+        }
+        let mut t = RecvTrack::new(false);
+        for ms in [10.0, 20.0, 30.0, 40.0, 100.0] {
+            t.add_delay(ms);
+        }
+        assert_eq!(t.take_delays(), (Some(30.0), Some(100.0)));
+        assert_eq!(t.take_delays(), (None, None));
+    }
+
+    #[test]
     fn only_the_teachers_voice_and_the_videos_are_measured() {
         let probe = Probe {
-            sink: Sink::open(&std::env::temp_dir().join("lms-sim-stats-test.jsonl")).unwrap(),
+            sink: Sink::open(&scratch("stats")).unwrap(),
             imp: "rtcd-rs".into(),
             group: "clean",
             teacher: "session-teacher".into(),
