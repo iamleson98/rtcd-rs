@@ -197,6 +197,14 @@ pub struct RtcConfig {
     /// the `camera_budget` module of rtcd-sfu). On by default; off sends every camera whole,
     /// whatever the path drops.
     pub camera_budget: bool,
+    /// Whether video sends are paced: a frame leaves at about twice the rate the participant was
+    /// sent video over the last second instead of as one burst. On by default; off sends each
+    /// frame at once, as the Go rtcd does (what the soak's `rs-nopace` leg measures).
+    pub pacing: bool,
+    /// Whether voices go as redundant audio (RFC 2198: each packet carries the two before it) to
+    /// the receivers that accept it, so a lossy downlink loses less audio, for about three times
+    /// the voice bytes. On by default; off sends plain Opus to everyone (what the soak compares).
+    pub red: bool,
     /// The packet time, in milliseconds, browsers are asked to send their voice with. A longer one
     /// makes fewer, larger packets: 40 halves the packets a call's open microphones cost every
     /// listener, for 20 ms more delay (a browser sends 20 on its own). 0, the default, leaves it
@@ -382,6 +390,8 @@ impl Default for RtcConfig {
             shards: 0,
             audio_loudest: 3,
             camera_budget: true,
+            pacing: true,
+            red: true,
             audio_ptime_ms: 0,
             egress_budget_mbps: 0,
             egress_budget_pps: 0,
@@ -536,6 +546,8 @@ impl Config {
         integer!("RTC_SHARDS", self.rtc.shards);
         integer!("RTC_AUDIOLOUDEST", self.rtc.audio_loudest);
         boolean!("RTC_CAMERABUDGET", self.rtc.camera_budget);
+        boolean!("RTC_PACING", self.rtc.pacing);
+        boolean!("RTC_RED", self.rtc.red);
         integer!("RTC_AUDIOPTIMEMS", self.rtc.audio_ptime_ms);
         integer!("RTC_EGRESSBUDGETMBPS", self.rtc.egress_budget_mbps);
         integer!("RTC_EGRESSBUDGETPPS", self.rtc.egress_budget_pps);
@@ -920,6 +932,11 @@ mod tests {
             c.rtc.camera_budget,
             "a receiver's cameras are held to what its path carries unless asked otherwise"
         );
+        assert!(c.rtc.pacing, "video sends are paced unless asked otherwise");
+        assert!(
+            c.rtc.red,
+            "voices go as redundant audio unless asked otherwise"
+        );
         assert!(
             c.rtc.refuse_when_saturated,
             "a saturated shard refuses joins unless told not to"
@@ -1044,6 +1061,8 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
             ("RTCD_RTC_ICEPORTUDP", "30000"),
             ("RTCD_RTC_AUDIOLOUDEST", "5"),
             ("RTCD_RTC_CAMERABUDGET", "false"),
+            ("RTCD_RTC_PACING", "false"),
+            ("RTCD_RTC_RED", "false"),
             ("RTCD_RTC_AUDIOPTIMEMS", "40"),
             ("RTCD_RTC_EGRESSBUDGETMBPS", "250"),
             ("RTCD_RTC_EGRESSBUDGETPPS", "120000"),
@@ -1071,6 +1090,8 @@ ice_servers = ["stun:a:3478", {urls = ["turn:b:3478"], username = "u", credentia
         assert_eq!(c.rtc.ice_port_udp, 30000);
         assert_eq!(c.rtc.audio_loudest, 5);
         assert!(!c.rtc.camera_budget);
+        assert!(!c.rtc.pacing);
+        assert!(!c.rtc.red);
         assert_eq!(c.rtc.audio_ptime_ms, 40);
         assert_eq!(c.rtc.egress_budget_mbps, 250);
         assert_eq!(c.rtc.egress_budget_pps, 120_000);

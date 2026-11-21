@@ -199,6 +199,12 @@ pub(crate) struct DownStream {
     pub sender: Option<RTCRtpSenderId>,
     /// The payload type was read from the sender (it exists once the offer is answered).
     pub payload_type_known: bool,
+    /// The payload type the receiver negotiated for redundant audio (see [`crate::red`]): the
+    /// stream is sent in it instead of as plain Opus.
+    pub red_payload_type: Option<u8>,
+    /// How many packets are still to be sent alone, because the ones before them are not what the
+    /// receiver was sent (the stream switched source or went on after a gap).
+    pub red_hold: usize,
     /// The source currently feeding the stream.
     pub source: Option<u32>,
     /// The source the stream is waiting to be moved onto, at its next keyframe.

@@ -159,3 +159,10 @@ class Pairs(unittest.TestCase):
         got = pairs.build(self.rules, ["rs-budget", "go"])["compare"]
         self.assertEqual([(p["subject"], p.get("gate", True)) for p in got],
                          [("rtcd-rs-budget", True), ("rtcd-rs-budget/chrome", True)])
+
+    def test_the_nopace_leg_is_report_only_beside_the_shipped_one(self):
+        got = pairs.build(self.rules, ["rs-budget", "rs-nopace", "go"])["compare"]
+        self.assertEqual([(p["subject"], p["baseline"], p.get("gate", True)) for p in got], [
+            ("rtcd-rs-budget", "rtcd-go", True), ("rtcd-rs-budget/chrome", "rtcd-go/chrome", True),
+            ("rtcd-rs-nopace", "rtcd-go", False), ("rtcd-rs-nopace", "rtcd-rs-budget", False),
+            ("rtcd-rs-nopace/chrome", "rtcd-go/chrome", False), ("rtcd-rs-nopace/chrome", "rtcd-rs-budget/chrome", False)])

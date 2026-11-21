@@ -27,8 +27,8 @@ use rtc::peer_connection::{RTCPeerConnection, RTCPeerConnectionBuilder};
 use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtp_transceiver::rtp_sender::{
-    RTCRtpCodec, RTCRtpCodingParameters, RTCRtpEncodingParameters, RTCRtpHeaderExtensionCapability,
-    RtpCodecKind,
+    RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
+    RTCRtpHeaderExtensionCapability, RtpCodecKind,
 };
 use rtc::rtp_transceiver::{
     RTCRtpReceiverId, RTCRtpSenderId, RTCRtpTransceiverDirection, RTCRtpTransceiverInit,
@@ -38,6 +38,7 @@ use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use rtc::statistics::StatsSelector;
 use rtcd_proto::dc::DcMessage;
 use rtcd_proto::{ClientMessage, JoinRequest, Message, MessageType, SessionRef};
+use rtcd_sfu::red::{self, MIME_TYPE_RED, OPUS_PAYLOAD_TYPE, RED_FMTP, RED_PAYLOAD_TYPE};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -45,7 +46,7 @@ use tokio::task::JoinHandle;
 use crate::assets::{Assets, CameraLayers, Clip};
 use crate::host::{Rtcd, RtcdConn};
 use crate::hostile::{self, Hostile, Hot, Rng};
-use crate::stats::{Probe, Receiver};
+use crate::stats::{Carried, Probe, Receiver, RtpClock, wall_ms_at};
 
 const AUDIO_LEVEL_URI: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
 const MID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
@@ -90,6 +91,8 @@ pub struct Spec {
     pub udp_base: Option<u16>,
     /// Sends datagrams of MTU size and over at intervals (see [`Ctl::Mtu`]) from the start.
     pub mtu: bool,
+    /// Negotiates redundant audio (RFC 2198) and counts the voice packets it recovers.
+    pub red: bool,
     /// Seeds what the participant does at random (the hostile behaviours, the sizes of the MTU
     /// datagrams).
     pub seed: u64,
@@ -186,6 +189,9 @@ pub(crate) struct Video {
     /// bits either way, as a browser's is.
     pub(crate) temporal: bool,
     pub(crate) mid: Option<String>,
+    /// Whether the layers' clocks have been told to the receivers (see [`Video::clocks`]); a try
+    /// that is not connected has no schedule to tell of.
+    anchored: bool,
 }
 
 impl Video {
@@ -221,7 +227,20 @@ impl Video {
             clips,
             temporal,
             mid: None,
+            anchored: false,
         }
+    }
+
+    /// Where each layer's RTP clock stands on the wall clock, the first frame of each due at the
+    /// time `next` says: it carries the timestamp one frame on from the layer's last.
+    fn clocks(&self) -> Vec<RtpClock> {
+        (0..self.ssrcs.len())
+            .map(|l| RtpClock {
+                ts: self.ts[l].wrapping_add(90_000 / self.clips[l].fps),
+                wall_ms: wall_ms_at(self.next[l]),
+                rate: 90_000.0,
+            })
+            .collect()
     }
 
     /// The encoder starts over with a keyframe on every layer.
@@ -349,6 +368,7 @@ struct Env {
     udp_base: Option<u16>,
     seed: u64,
     tally: Option<Arc<AtomicU64>>,
+    red: bool,
 }
 
 /// What a participant has been told to do, which a new try picks up where the last left off.
@@ -450,6 +470,7 @@ pub async fn join(
         udp_base: spec.udp_base,
         seed: spec.seed,
         tally: spec.tally.clone(),
+        red: spec.red,
     };
     let mut persist = Persist {
         voice: spec.voice,
@@ -542,6 +563,22 @@ async fn build(
     rtcd.exempt(addr);
     let mut me = MediaEngine::default();
     me.register_default_codecs().expect("codecs");
+    if spec.red {
+        me.register_codec(
+            RTCRtpCodecParameters {
+                rtp_codec: RTCRtpCodec {
+                    mime_type: MIME_TYPE_RED.into(),
+                    clock_rate: 48000,
+                    channels: 2,
+                    sdp_fmtp_line: RED_FMTP.into(),
+                    rtcp_feedback: vec![],
+                },
+                payload_type: RED_PAYLOAD_TYPE,
+            },
+            RtpCodecKind::Audio,
+        )
+        .expect("red");
+    }
     me.register_header_extension(
         RTCRtpHeaderExtensionCapability {
             uri: AUDIO_LEVEL_URI.into(),
@@ -703,6 +740,8 @@ async fn drive(
     let mut mic_seq = if wrap { WRAP_SEQ } else { 0u16 };
     let mut mic_ts = if wrap { WRAP_AUDIO_TS } else { 0u32 };
     let mut mic_pos = 0usize;
+    let mut mic_anchored = false;
+    let sender = sid.strip_prefix("session-").unwrap_or(sid);
     let mut next_audio = Instant::now();
     // What this participant measures of what it receives, and where to ask for a keyframe.
     let mut rx = probe
@@ -780,14 +819,43 @@ async fn drive(
                     RTCMessage::RtpPacket(track, packet) => {
                         if let (Some(rx), Some(p)) = (rx.as_mut(), probe) {
                             let size = packet.payload.len() + 12;
-                            if let Some((what, w)) = rx.on_rtp(
-                                p,
-                                arrived,
-                                &track,
-                                packet.header.sequence_number,
-                                packet.header.timestamp,
-                                packet.header.marker,
-                            ) && p.leader
+                            let seq = packet.header.sequence_number;
+                            let pt = packet.header.payload_type;
+                            // A voice counts only in a payload type it negotiated: a packet of
+                            // another one is not heard, so it shows as lost. Redundant audio
+                            // carries the packets before this one along, each stamped as its
+                            // block says.
+                            let mut carried = Vec::new();
+                            let heard = if !track.starts_with("voice") || pt == OPUS_PAYLOAD_TYPE {
+                                true
+                            } else if env.red && pt == RED_PAYLOAD_TYPE {
+                                red::decode(&packet.payload).is_some_and(|d| {
+                                    let n = d.redundant.len() as u16;
+                                    carried = d
+                                        .redundant
+                                        .iter()
+                                        .zip(1..)
+                                        .map(|(block, i)| Carried {
+                                            seq: seq.wrapping_sub(n - i + 1),
+                                            ts: packet.header.timestamp.wrapping_sub(block.offset),
+                                        })
+                                        .collect();
+                                    true
+                                })
+                            } else {
+                                false
+                            };
+                            if heard
+                                && let Some((what, w)) = rx.on_rtp_carrying(
+                                    p,
+                                    arrived,
+                                    &track,
+                                    seq,
+                                    packet.header.timestamp,
+                                    packet.header.marker,
+                                    &carried,
+                                )
+                                && p.leader
                             {
                                 for (on, name) in [(w.seq, "seq"), (w.ts, "timestamp")] {
                                     if on {
@@ -850,6 +918,37 @@ async fn drive(
             }
             if let Some(data) = watch.take() {
                 conn.send(message(sid, call, MessageType::VideoSubscribe, data));
+            }
+            // The senders say where their RTP clocks stand on the wall clock: the schedule starts
+            // at `next_audio` and at the first frame of each camera, and the timestamps go on at
+            // the rate of the schedule.
+            if let Some(p) = probe {
+                if !mic_anchored {
+                    mic_anchored = true;
+                    p.clock(
+                        "voice",
+                        sender,
+                        0,
+                        RtpClock {
+                            ts: mic_ts,
+                            wall_ms: wall_ms_at(next_audio),
+                            rate: 48_000.0,
+                        },
+                    );
+                }
+                for v in [camera.as_mut(), screen.as_mut()].into_iter().flatten() {
+                    if !v.anchored {
+                        v.anchored = true;
+                        let kind = if v.label == "screen" {
+                            "screen"
+                        } else {
+                            "video"
+                        };
+                        for (layer, clock) in v.clocks().into_iter().enumerate() {
+                            p.clock(kind, sender, layer, clock);
+                        }
+                    }
+                }
             }
             if persist.voice {
                 while next_audio <= now {
@@ -957,8 +1056,10 @@ async fn drive(
             }
         } else {
             next_audio = now;
+            mic_anchored = false;
             for v in [camera.as_mut(), screen.as_mut()].into_iter().flatten() {
                 v.next.fill(now);
+                v.anchored = false;
             }
         }
 
@@ -1420,6 +1521,30 @@ mod tests {
         assert_eq!((v.ssrcs.len(), v.step.len(), v.clips.len()), (2, 2, 2));
         assert!(v.step[0] > v.step[1], "the small layer is the slower");
         assert_eq!(TEMPORAL_PATTERN, [0, 2, 1, 2]);
+    }
+
+    #[test]
+    fn each_layer_tells_where_its_clock_stands_without_changing_its_timestamps() {
+        let clip = |fps| Clip {
+            width: 16,
+            height: 16,
+            fps,
+            frames: vec![(vec![0], true)],
+        };
+        let at = Instant::now();
+        let v = Video::new(
+            RTCRtpSenderId::from(0usize),
+            "camera",
+            vec![1, 2],
+            vec![clip(15), clip(24)],
+            (true, false),
+            at,
+        );
+        let clocks = v.clocks();
+        // The first frame of each layer carries its start timestamp and one frame.
+        assert_eq!((clocks[0].ts, clocks[1].ts), (1000 + 6000, 900_000 + 3750));
+        assert!(clocks.iter().all(|c| c.rate == 90_000.0));
+        assert!((wall_ms_at(at) - clocks[0].wall_ms).abs() < 50.0);
     }
 
     #[test]

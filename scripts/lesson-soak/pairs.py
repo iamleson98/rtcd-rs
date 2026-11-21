@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """The rules file for the services a run has: rules.json's pairs with the right subject.
 
-    pairs.py RULES.json OUT.json IMPL...        (IMPL: rs, rs-budget, go)
+    pairs.py RULES.json OUT.json IMPL...        (IMPL: rs, rs-budget, rs-nopace, go)
 
 rtcd-rs as it ships is the gated subject: held against the Go rtcd (the pairs of RULES.json with
 their rtcd-rs replaced). It ships with the camera budget on (rs-budget); without that leg, rs is
 gated instead. The other leg, when it ran, is in the report only (`"gate": false`: a breach shows in
-the tables and does not fail), against the Go rtcd and against the shipped leg.
+the tables and does not fail), against the Go rtcd and against the shipped leg. rs-nopace (the shipped
+leg with the video pacing off) is such a leg.
 """
 import json
 import sys
 
 SUBJECT = "rtcd-rs"
-LABELS = {"rs": "rtcd-rs", "rs-budget": "rtcd-rs-budget"}
+LABELS = {"rs": "rtcd-rs", "rs-budget": "rtcd-rs-budget", "rs-nopace": "rtcd-rs-nopace"}
 # The leg that runs rtcd-rs as it ships (`camera_budget` is on by default in rtcd-sfu's config).
 SHIPPED = "rs-budget"
 

@@ -60,6 +60,19 @@ Everything is JSONL, one object per line with `ts` (unix ms), `impl`, `arch` (`x
 
 * `recv`, every 5 s per received track, counters since the start: `frames`, `freezes`, `freeze_ms`,
   `packets`, `bytes`, `duplicates`, `lost`, `nack`, `pli`, `jitter_ms`, `rtt_ms`, `audio_gap_ms`, `stalled`; Chromium rows of voices also carry `playout_delay_ms` (its mean jitter buffer delay).
+  `delay_p50_ms` and `delay_p95_ms` are the one-way delay over the interval (null when there is none): of
+  the synthetic receivers, from the sender's RTP clock (each sender says where each of its layers' clocks
+  stands on the wall clock, in `rtp_clock` events and in `rtp.clocks` next to the output, which the lesson
+  processes of the run share: one host, one wall clock, so the impaired group has delays too) to the arrival of each audio packet and of each frame's marker packet; of Chromium, from
+  `getSynchronizationSources()` once a second (the playout time of the RTP timestamp it last played,
+  mapped to the sender's clock by the relay; the jitter buffer's delay plus half the round trip when
+  Chromium gives no timestamp), so it includes the jitter buffer. A group on another machine (`remote`)
+  has no sender clock and writes null. Chromium rows of voices also carry `concealed_samples`,
+  `concealment_events` and `fec_packets` (the interval's counts), and each page logs an `sdp_codecs`
+  event with the audio `rtpmap` lines it negotiated and the audio codecs the browser can receive
+  (`receiver capabilities`, to see that it has `audio/red`). A synthetic receiver started with `--red` negotiates
+  redundant audio (`recovered` counts the voice packets it made up for, and a silence they fill is not an
+  audio gap); `PROFILE=lossy` gives it to every second impaired student, the others take plain Opus.
   `packets` counts every arrival; `lost` is what the sequence numbers say never came, after the
   retransmissions and without the duplicates, so a copy never hides a loss.
   `impl` is `rtcd-rs` or `rtcd-go` for the synthetic receivers (`lms_sim::stats`) and `rtcd-rs/chrome` or
@@ -73,11 +86,15 @@ Everything is JSONL, one object per line with `ts` (unix ms), `impl`, `arch` (`x
     is its own `nackCount`. They are alike in kind, not in value.
 * `proc`, every 5 s for the SFU process, read from outside the container (`sample.py`, with
   `--pid=host`) so it is the same for the distroless Go image and for ours: `rss_mb`, `cpu_pct` (of one
-  core), `threads`, `fds`, `udp_rcvbuf_err`, `udp_sndbuf_err`.
+  core), `threads`, `fds`, `udp_rcvbuf_err`, `udp_sndbuf_err`. The same sampler writes a `proc` row with
+  the id `client:<container>` for every client container (the lessons, the browsers, the load): `cpu_pct`
+  of the whole container (its cgroup) and `cores`, its CPU limit, so that a run whose clients starved
+  can be told from one whose SFU did.
 * `quality`, every 5 s per Chromium: the picture score of the teacher's camera, PSNR and SSIM against
   the clip (see Picture quality).
 * `event`: `ice_state`, `wrap`, `join`, `leave`, `rejoin`, `error`, each with the participant's
-  `group`. `phase` comes from `netem.sh`.
+  `group`. `phase` comes from `netem.sh`; `sfu_restart` (detail: its number) from `run.sh`, at the moment
+  it restarts the SFU (the restart profile).
 
 ## Rules
 
@@ -129,7 +146,9 @@ On a Mac the architecture is aarch64; x64 is exercised by CI.
 `lesson` profile and the `abuse` profile (below) for `rs`, `rs-budget` and `go` in parallel: weekly on
 Saturday, by hand (`minutes`, default 120; `budget`: `both`, the default, `on` for rs-budget and go, `off` for
 rs and go) and on pull requests that touch `crates/lms-sim`, this directory or the
-workflow (10 minutes, 5-minute cycle, a short calibration ramp). `rs` and `rs-budget` are the same image with `RTCD_RTC_CAMERABUDGET` set to `false` and `true` (always set, so
+workflow (10 minutes, 5-minute cycle, a short calibration ramp). By hand `profile` picks what runs (`all`, the default,
+or one of `lesson`, `abuse`, `lossy`, `restart`, `big`) and `nopace` adds the `rs-nopace` leg; the Meet-style
+profiles (below) run weekly and by hand, never on pull requests. `rs` and `rs-budget` are the same image with `RTCD_RTC_CAMERABUDGET` set to `false` and `true` (always set, so
 a change of the service's default moves neither), labelled `rtcd-rs` and `rtcd-rs-budget`; every leg uses one `SEED`
 (the run id). One `report` job per architecture and
 profile runs `report.py` over the files of the services that ran (`rules.json` for `lesson`, `rules-abuse.json`
@@ -139,6 +158,44 @@ with `budget: off` rtcd-rs is gated against Go), writes `summary.md` to the run'
 when rtcd-rs-budget (rtcd-rs when the budget legs are off) broke a rule, when a soak job failed (an SFU crash fails `run.sh`) or when a soak left no
 measurements. Both services run on the same runner type for each architecture. Artifacts are named
 `lesson-soak-<profile>-<impl>-<arch>`.
+
+## Meet-style profiles
+
+Three short profiles hold the SFU to what a video-meeting service promises, beside the same service
+as the Go baseline (`rules-lossy.json`, `rules-restart.json` and `rules-big.json`: the pairs of
+`rules.json` at the same 1.25 ratio plus slack, and a list of absolute `targets` that are not gated, shown
+in the report as PASS or MISS, except the one hard limit of the restart profile). Each is `run.sh` with
+`PROFILE=` and runs as its own `meet` job of the workflow.
+
+| `PROFILE` | What it does | In CI | Meet targets (not gated) |
+|---|---|---|---|
+| `lossy` | the impaired group's random loss goes through `clean`, `loss10`, `loss20`, `loss30` and `recover` (`NETEM_PROFILE=loss-sweep`; one sweep is one cycle, so `minutes` and `cycle` are the same) | 25 minutes | audio gap and concealed audio at `loss20` at most 5 %; audio delay p95 at most 250 ms (clean group) |
+| `restart` | the SFU's container is killed (SIGKILL) and started again at 30 % and at 70 % of the lesson (3 and 7 minutes of 10) on a network that is not shaped; each logs an `sfu_restart` event at the kill and an `sfu_up` event when the SFU answers | 10 minutes | every track receives again within 30 s; audio delay p95 at most 250 ms; gated: within 180 s (a track that does not come back in the report's 150 s window counts as never) |
+| `big` | `STUDENTS_CLEAN=80`, `STUDENTS_IMPAIRED=12`, 25 cameras, the teacher's screen share, a speaker every 20 s (`TALK_SECS=20`) and `--watch-max 12`: each student receives the teacher and the first 11 other cameras, what lms-web's stage policy receives on a wide screen | 30 minutes | audio delay p95 at most 250 ms (clean group) |
+
+```bash
+PROFILE=lossy scripts/lesson-soak/run.sh rs-budget 25 25 ~/soak
+PROFILE=restart scripts/lesson-soak/run.sh rs-budget 10 10 ~/soak
+PROFILE=big scripts/lesson-soak/run.sh rs-budget 30 15 ~/soak
+python3 scripts/lesson-soak/pairs.py scripts/lesson-soak/rules-restart.json ~/soak/pairs.json rs-budget go
+```
+
+The restart is abrupt, the same for both services (a crash or a reboot): the container is killed and started again with the same address
+(`restart_sfu` in `lib.sh`). Its network namespace is made anew, so the segmentation offload is turned
+off again, the sampler follows the SFU to its new process (`sfu.pid`), and `run.sh` does not take
+the absence for a crash: the health check ignores the restarts that `restarts.jsonl` says were made. The
+browser's recovery is lms-web's (`call-client.ts`): an ICE restart after 4 s of "disconnected" or at
+once on "failed" (with 25 s to come back), an offer the SFU does not answer sent again after 10 s and
+the seat given up after the second wait; with `--chrome-recovery` (`run.sh` sets it, and the page's `recovery=1`, for these three profiles only) the page's signaling websocket stays open and the relay opens a
+session on the SFU for each `join`, as the LMS server does; the lesson and abuse profiles keep the older page. The synthetic students rejoin as they do in
+the abuse profile.
+
+A run is invalid (the report says so) when a client container was above 90 % of its CPU limit in more
+than 5 % of its samples, or when more than 1 % of the delay samples fall outside 0 to 2000 ms (the clock
+mapping is broken); the `big` profile is the one that needs a runner with CPUs to spare.
+
+`rs-nopace` (by hand only) is `rs-budget` with `RTCD_RTC_PACING=false`: the video is sent as each frame
+is produced, as the Go service does. It is in the report only.
 
 ## Abuse profile
 

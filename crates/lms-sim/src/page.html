@@ -56,13 +56,24 @@ function decodeSdp(bytes) {
 }
 
 // ---- the call ----
-let pc, dc, pollTimer, failTimer;
+let pc, dc, pollTimer, failTimer, disconnectTimer, answerTimer, retryTimer;
 // Taking the seat back after the SFU or the signaling dropped it, as lms-web does (rejoin.ts): pauses
 // of 1, 3, 8, 15 and 30 s, and no new try later than 180 s after the drop. Each try is a series of
 // its own (the counters start again), told by `#epoch` in the ids.
 const BACKOFF = [1000, 3000, 8000, 15000, 30000];
 const PATIENCE = 180000;
+// With `recovery=1` the media path's recovery is lms-web's (call-client.ts): a path that stays
+// "disconnected" is rebuilt (ICE restart) after 4 s; one that failed is rebuilt at once and given 25 s
+// to come back; an offer the SFU does not answer in 10 s is sent again once, and the seat is given up
+// if that is not answered either. The websocket to the relay stays open throughout (the relay opens a
+// session on the SFU for each `join`, as the LMS server does for lms-web). Without it a path that
+// failed is given 25 s and then the websocket, and with it the session, is closed and made again.
+const recovery = q.get('recovery') === '1';
+const ICE_DISCONNECTED_RESTART = 4000;
 const ICE_FAIL_GRACE = 25000;
+const ANSWER_TIMEOUT = 10000;
+const ANSWER_TRIES = 2;
+let unanswered = 0, codecsLogged = false;
 let epoch = 0, lostAt = null, tries = 0, joinedOnce = false;
 let chain = Promise.resolve();
 const queue = (fn) => (chain = chain.then(fn).catch((e) => event('error', e)));
@@ -72,6 +83,9 @@ async function onDescription(json, viaDc) {
 	const desc = JSON.parse(json);
 	if (desc.type === 'answer') {
 		await pc.setRemoteDescription(desc);
+		clearTimeout(answerTimer);
+		unanswered = 0;
+		logCodecs();
 	} else if (desc.type === 'offer' && pc.signalingState === 'stable') {
 		await pc.setRemoteDescription(desc);
 		await pc.setLocalDescription(await pc.createAnswer());
@@ -106,30 +120,71 @@ function show(e) {
 	el.play().catch(() => {});
 }
 
+// The audio codecs the SFU's description offers, once per try, and the ones this browser can receive:
+// the formats a loss can be concealed or recovered by (red, opus's in-band FEC) show in what was
+// negotiated, and whether the browser has red at all in what it can receive.
+function logCodecs() {
+	if (codecsLogged) return;
+	codecsLogged = true;
+	const audio = (pc.remoteDescription?.sdp ?? '').split(/\r?\nm=/).slice(1).find((m) => m.startsWith('audio'));
+	const lines = (audio ?? '').split(/\r?\n/).filter((l) => l.startsWith('a=rtpmap:'));
+	const capable = (RTCRtpReceiver.getCapabilities('audio')?.codecs ?? []).map((c) => c.mimeType);
+	event('sdp_codecs', `${lines.join('; ')} | receiver capabilities: ${capable.join(', ')}`);
+}
+
+// Our own offer (the first, and an ICE restart's) goes out by the websocket, and is sent again once
+// if the SFU does not answer.
+function sendOffer() {
+	send({ t: 'sdp', data: JSON.stringify(pc.localDescription) });
+	const mine = pc;
+	clearTimeout(answerTimer);
+	answerTimer = setTimeout(() => queue(async () => {
+		if (pc !== mine || pc.signalingState !== 'have-local-offer') return;
+		if (unanswered >= ANSWER_TRIES - 1) return fail('the SFU did not answer');
+		unanswered++;
+		sendOffer();
+	}), ANSWER_TIMEOUT);
+}
+
+async function negotiate() {
+	if (pc.signalingState !== 'stable') return;
+	await pc.setLocalDescription(await pc.createOffer());
+	sendOffer();
+}
+
 document.getElementById('tap').onclick = (e) => {
 	for (const el of document.querySelectorAll('video, audio')) el.play().catch(() => {});
 	e.currentTarget.hidden = true;
 };
 
 async function start() {
-	pc = new RTCPeerConnection({ iceServers: [], bundlePolicy: 'max-bundle' });
+	if (recovery) send({ t: 'join' });
+	codecsLogged = false;
+	const mine = (pc = new RTCPeerConnection({ iceServers: [], bundlePolicy: 'max-bundle' }));
 	dc = pc.createDataChannel('calls-dc');
 	dc.binaryType = 'arraybuffer';
 	// The microphone slot: a student listening has it muted, so it sends nothing.
 	pc.addTransceiver('audio', { direction: 'sendonly' });
 	pc.onicecandidate = (e) => e.candidate && send({ t: 'ice', data: JSON.stringify(e.candidate.toJSON()) });
+	if (recovery) pc.onnegotiationneeded = () => queue(negotiate);
 	pc.onconnectionstatechange = () => {
+		if (pc !== mine) return;
 		event('ice_state', `connection:${pc.connectionState}`);
 		clearTimeout(failTimer);
+		clearTimeout(disconnectTimer);
 		if (pc.connectionState === 'failed') {
 			// The websocket still works: a new media path first, and the seat is given up if it does not come back.
 			pc.restartIce();
-			const mine = ws;
 			failTimer = setTimeout(() => {
-				if (ws !== mine || pc.connectionState === 'connected') return;
+				if (pc !== mine || pc.connectionState === 'connected') return;
+				if (recovery) return fail('the media path stayed down');
 				event('error', 'the media path stayed down');
 				ws.close();
 			}, ICE_FAIL_GRACE);
+		} else if (recovery && pc.connectionState === 'disconnected') {
+			disconnectTimer = setTimeout(() => {
+				if (pc === mine && pc.connectionState === 'disconnected') pc.restartIce();
+			}, ICE_DISCONNECTED_RESTART);
 		}
 	};
 	pc.oniceconnectionstatechange = () => event('ice_state', `ice:${pc.iceConnectionState}`);
@@ -146,9 +201,53 @@ async function start() {
 		const json = decodeSdp(new Uint8Array(e.data));
 		if (json) queue(async () => onDescription(await inflate(json), true));
 	};
-	await pc.setLocalDescription(await pc.createOffer());
-	send({ t: 'sdp', data: JSON.stringify(pc.localDescription) });
+	if (recovery) {
+		await negotiate();
+	} else {
+		await pc.setLocalDescription(await pc.createOffer());
+		send({ t: 'sdp', data: JSON.stringify(pc.localDescription) });
+	}
 	pollTimer = setInterval(poll, 1000);
+}
+
+// The media path is gone for good: the seat is given up (the relay leaves the SFU's session) and taken
+// back after a pause, over the same websocket.
+function fail(reason) {
+	event('error', reason);
+	send({ t: 'leave' });
+	teardown();
+	rejoin(() => queue(start));
+}
+
+function teardown() {
+	clearInterval(pollTimer);
+	for (const t of [failTimer, disconnectTimer, answerTimer, retryTimer]) clearTimeout(t);
+	unanswered = 0;
+	try { pc.close(); } catch {}
+	for (const el of document.querySelectorAll('video, audio')) el.remove();
+	seen = new Map();
+	els = new Map();
+	delays = new Map();
+	ticks = 0;
+}
+
+// A pause, then `again` (a join, or a new websocket), unless the patience is spent.
+function rejoin(again) {
+	if (joinedOnce) {
+		lostAt = Date.now();
+		tries = 0;
+		joinedOnce = false;
+	} else if (lostAt === null) {
+		lostAt = Date.now();
+	}
+	const pause = BACKOFF[Math.min(tries, BACKOFF.length - 1)];
+	if (Date.now() - lostAt + pause > PATIENCE) {
+		console.log('gave up rejoining');
+		return;
+	}
+	tries++;
+	epoch++;
+	retryTimer = setTimeout(again, pause);
 }
 
 // Whose stream each mid carries now, from the SFU's last description. Chrome names a
@@ -167,6 +266,48 @@ function owners() {
 // ---- what Chrome measures, once a second, written every fifth ----
 let seen = new Map();
 let ticks = 0;
+// Per stream: the delay samples of the interval (see sampleDelay).
+let delays = new Map();
+const jitterBuffer = new Map();
+
+// One sample a second of the one-way delay of each stream the page is measuring. Chrome says when it
+// played the packet with the RTP timestamp it last played out (getSynchronizationSources, in the
+// jitter buffer's time too); the relay maps that timestamp to the sender's clock, which only lms-sim
+// knows, and takes the difference. A browser that gives no timestamp is given the jitter buffer's
+// own delay over the interval plus half the round trip. A browser on another machine has no sender
+// clock to map to: it writes none.
+function sampleDelay(report, owner, rtt) {
+	const inbound = new Map();
+	report.forEach((r) => r.type === 'inbound-rtp' && inbound.set(r.mid, r));
+	for (const t of pc.getTransceivers()) {
+		const [kind, session] = String(owner.get(t.mid) ?? '').split('_');
+		if (!['video', 'screen', 'voice'].includes(kind) || !session) continue;
+		if (kind === 'voice' && session !== teacher) continue;
+		const key = `${kind}:${session.replace(/^session-/, '')}`;
+		if (!delays.has(key)) delays.set(key, { sync: [], ms: [], last: null });
+		const slot = delays.get(key);
+		const r = inbound.get(t.mid);
+		// The latest source of this receiver's own stream (its SSRC is the inbound-rtp's).
+		const source = t.receiver
+			.getSynchronizationSources()
+			.filter((s) => typeof s.rtpTimestamp === 'number' && s.source === r?.ssrc)
+			.reduce((a, s) => (!a || s.timestamp > a.timestamp ? s : a), null);
+		if (source) {
+			if (source.rtpTimestamp === slot.last) continue;
+			slot.last = source.rtpTimestamp;
+			// Chrome gives the time as unix milliseconds; one from the page's time origin is made one.
+			const at = source.timestamp < 1e12 ? performance.timeOrigin + source.timestamp : source.timestamp;
+			slot.sync.push({ rtp: source.rtpTimestamp, at });
+			continue;
+		}
+		if (!r || !(r.jitterBufferEmittedCount > 0)) continue;
+		const before = jitterBuffer.get(t.mid) ?? { delay: 0, emitted: 0 };
+		const emitted = r.jitterBufferEmittedCount - before.emitted;
+		if (emitted > 0) slot.ms.push(((r.jitterBufferDelay - before.delay) / emitted) * 1000 + (rtt ?? 0) / 2);
+		jitterBuffer.set(t.mid, { delay: r.jitterBufferDelay, emitted: r.jitterBufferEmittedCount });
+	}
+}
+
 async function poll() {
 	const report = await pc.getStats();
 	const now = performance.now();
@@ -177,6 +318,7 @@ async function poll() {
 		}
 	});
 	const owner = owners();
+	if (group !== 'remote') sampleDelay(report, owner, rtt);
 	report.forEach((r) => {
 		if (r.type !== 'inbound-rtp') return;
 		const [kind, session] = String(owner.get(r.mid) ?? r.trackIdentifier ?? '').split('_');
@@ -210,10 +352,20 @@ async function poll() {
 				freezeMs += Math.round(open);
 			}
 		}
+		const samples = delays.get(key);
+		delays.delete(key);
 		send({
 			t: 'recv',
 			id: `chrome-${group}${epoch ? `#${epoch}` : ''}/${key}`,
+			sync: samples?.sync ?? [],
+			ms: samples?.ms ?? [],
 			fields: {
+				...(audio ? {
+					// Running totals, as the counters above are (the report takes the differences).
+					concealed_samples: r.concealedSamples ?? 0,
+					concealment_events: r.concealmentEvents ?? 0,
+					fec_packets: r.fecPacketsReceived ?? 0,
+				} : {}),
 				media: audio ? 'audio' : 'video',
 				group,
 				frames: r.framesDecoded ?? 0,
@@ -358,32 +510,18 @@ function connect() {
 	mine.onopen = () => queue(start);
 	mine.onclose = () => {
 		if (ws !== mine) return;
-		clearInterval(pollTimer);
-		clearTimeout(failTimer);
-		try { pc.close(); } catch {}
-		seen = new Map();
-		els = new Map();
-		ticks = 0;
-		if (joinedOnce) {
-			lostAt = Date.now();
-			tries = 0;
-			joinedOnce = false;
-		} else if (lostAt === null) {
-			lostAt = Date.now();
-		}
-		const pause = BACKOFF[Math.min(tries, BACKOFF.length - 1)];
-		if (Date.now() - lostAt + pause > PATIENCE) {
-			console.log('gave up rejoining');
-			return;
-		}
-		tries++;
-		epoch++;
-		setTimeout(connect, pause);
+		teardown();
+		rejoin(connect);
 	};
 	mine.onmessage = (e) => {
 		const m = JSON.parse(e.data);
 		if (m.t === 'sdp') queue(() => onDescription(m.data, false));
 		else if (m.t === 'ice') queue(() => onIce(m.data));
+		else if (m.t === 'closed') queue(async () => {
+			// The SFU ended the session or would not open one: a try of the same kind as a failed media path.
+			teardown();
+			rejoin(() => queue(start));
+		});
 	};
 }
 connect();
