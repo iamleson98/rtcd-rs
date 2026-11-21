@@ -181,8 +181,9 @@ pub(crate) struct Video {
     pub(crate) tl0: Vec<u8>,
     pub(crate) next: Vec<Instant>,
     pub(crate) step: Vec<Duration>,
-    /// Whether the payload descriptor carries a 15-bit picture id, TL0PICIDX and the temporal layer
-    /// (frame `n` of a clip in layer 0, 2, 1, 2 for `n` mod 4 = 0, 1, 2, 3, as its encoder made it).
+    /// Whether the payload descriptor carries TL0PICIDX and the temporal layer (frame `n` of a clip
+    /// in layer 0, 2, 1, 2 for `n` mod 4 = 0, 1, 2, 3, as its encoder made it). The picture id is 15
+    /// bits either way, as a browser's is.
     pub(crate) temporal: bool,
     pub(crate) mid: Option<String>,
 }
@@ -1311,8 +1312,7 @@ fn send_frame(pc: &mut RTCPeerConnection, v: &mut Video, l: usize, on: bool) {
     let (frame, key) = clip.frames[v.pos[l] % clip.frames.len()].clone();
     v.pos[l] = (v.pos[l] + 1) % clip.frames.len();
     v.ts[l] = v.ts[l].wrapping_add(90_000 / clip.fps);
-    // A browser's picture id is 15 bits with temporal layers; the plain stream's is 7.
-    v.picture_id[l] = v.picture_id[l].wrapping_add(1) & if v.temporal { 0x7fff } else { 0x7f };
+    v.picture_id[l] = v.picture_id[l].wrapping_add(1) & 0x7fff;
     let tid = TEMPORAL_PATTERN[step];
     if v.temporal && tid == 0 {
         v.tl0[l] = v.tl0[l].wrapping_add(1);
@@ -1324,15 +1324,8 @@ fn send_frame(pc: &mut RTCPeerConnection, v: &mut Video, l: usize, on: bool) {
     let pid = v.picture_id[l];
     let chunks: Vec<&[u8]> = frame.chunks(MTU_PAYLOAD).collect();
     for (n, chunk) in chunks.iter().enumerate() {
-        let first = n == 0;
-        let mut payload = vec![0x80 | if first { 0x10 } else { 0 }];
-        if v.temporal {
-            // I, L and T set, as libwebrtc does (no key index).
-            payload.extend_from_slice(&[0xe0, 0x80 | (pid >> 8) as u8, pid as u8, v.tl0[l]]);
-            payload.push(tid << 6 | u8::from(sync) << 5);
-        } else {
-            payload.extend_from_slice(&[0x80, pid as u8]);
-        }
+        let layer = v.temporal.then_some((v.tl0[l], tid, sync));
+        let mut payload = vp8_descriptor(n == 0, pid, layer);
         payload.extend_from_slice(chunk);
         let mut header = rtc::rtp::header::Header {
             version: 2,
@@ -1362,9 +1355,43 @@ fn send_frame(pc: &mut RTCPeerConnection, v: &mut Video, l: usize, on: bool) {
     }
 }
 
+/// The VP8 payload descriptor (RFC 7741) of one packet: the start-of-partition bit on the first
+/// packet of a frame, a 15-bit picture id, and with `layer` (TL0PICIDX, temporal layer, layer
+/// sync) the temporal fields, as libwebrtc writes them (no key index). Chrome reads a 7-bit id
+/// wrapping from 127 to 0 as a jump backwards and drops frames until the next keyframe, which
+/// browsers never cause: they always send 15 bits.
+fn vp8_descriptor(first: bool, pid: u16, layer: Option<(u8, u8, bool)>) -> Vec<u8> {
+    let start = if first { 0x10 } else { 0 };
+    let pid = [0x80 | (pid >> 8) as u8 & 0x7f, pid as u8];
+    match layer {
+        Some((tl0, tid, sync)) => vec![
+            0x80 | start,
+            0xe0,
+            pid[0],
+            pid[1],
+            tl0,
+            tid << 6 | u8::from(sync) << 5,
+        ],
+        None => vec![0x80 | start, 0x80, pid[0], pid[1]],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_vp8_stream_sends_a_15_bit_picture_id() {
+        // A plain stream (a screen, or a single-layer camera): X and I set, M set, no wrap at 127.
+        assert_eq!(vp8_descriptor(true, 127, None), vec![0x90, 0x80, 0x80, 127]);
+        assert_eq!(vp8_descriptor(false, 128, None), vec![0x80, 0x80, 0x80, 128]);
+        assert_eq!(vp8_descriptor(true, 0x7fff, None), vec![0x90, 0x80, 0xff, 0xff]);
+        // With temporal layers: I, L and T set, then TL0PICIDX and TID/Y.
+        assert_eq!(
+            vp8_descriptor(false, 300, Some((7, 2, true))),
+            vec![0x80, 0xe0, 0x81, 0x2c, 7, 0xa0]
+        );
+    }
 
     #[test]
     fn a_simulcast_camera_has_two_layers_and_a_temporal_pattern() {
