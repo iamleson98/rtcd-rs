@@ -19,6 +19,7 @@ pub(crate) use record::WAIT_FOR_CALL;
 mod route;
 mod session;
 mod signaling;
+mod turn_trace;
 mod types;
 mod video;
 
@@ -41,6 +42,7 @@ pub use types::{CloseReason, Command, Event, Proto, Transmit};
 
 use self::route::Routes;
 use self::session::{OfferTurn, SessionKey, Sessions, SourceKey};
+use self::turn_trace::TurnTrace;
 use crate::config::EngineConfig;
 use crate::ids::Rng;
 use crate::loudest::Selector;
@@ -125,6 +127,8 @@ pub struct Engine {
     /// When the turn began, which is when the engine wants to be called again while
     /// `negotiations` is not empty.
     turn_began: Instant,
+    /// Finds the passes of the loop that were slow (see [`TurnTrace`]).
+    trace: TurnTrace,
     out: VecDeque<Transmit>,
     events: VecDeque<Event>,
 }
@@ -164,6 +168,7 @@ impl Engine {
             negotiations: VecDeque::new(),
             offers_left: MAX_OFFERS_PER_TURN,
             turn_began: Instant::now(),
+            trace: TurnTrace::new(),
             out: VecDeque::new(),
             events: VecDeque::new(),
         }
@@ -300,6 +305,18 @@ impl Engine {
     pub fn begin_turn(&mut self, now: Instant) {
         self.turn_began = now;
         self.offers_left = MAX_OFFERS_PER_TURN;
+    }
+
+    /// Ends the turn of shard `shard` that began at `began`. It reads the clock itself: the
+    /// measurement is of real time, which the engine's own `now` (virtual in tests) is not.
+    pub fn end_turn(&mut self, shard: usize, began: Instant) {
+        let now = Instant::now();
+        self.trace.end_turn(
+            shard,
+            self.sessions.len(),
+            now.saturating_duration_since(began),
+            now,
+        );
     }
 
     fn mark_dirty(&mut self, key: SessionKey) {
