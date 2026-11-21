@@ -67,6 +67,8 @@ pub struct Service {
     pub recordings: Recordings,
     /// What is told to the server about recordings, on whichever of its connections is up.
     reports: Arc<Reports>,
+    /// Names this process on every connection's hello (see `Hello::instance_id`).
+    instance_id: String,
     conns: Mutex<HashMap<String, ConnHandle>>,
     /// The connection each session's messages go to.
     session_conn: Mutex<HashMap<String, String>>,
@@ -135,6 +137,7 @@ impl Service {
             system: SystemMonitor::default(),
             recordings,
             reports,
+            instance_id: crate::ws::new_conn_id(),
             conns: Mutex::new(HashMap::new()),
             session_conn: Mutex::new(HashMap::new()),
             closed: Mutex::new(HashMap::new()),
@@ -213,6 +216,7 @@ impl Service {
         let hello = ClientMessage::Hello(Hello {
             client_id: handle.client_id.clone(),
             conn_id: conn_id.to_owned(),
+            instance_id: self.instance_id.clone(),
         });
         if handle.send(&hello) {
             self.metrics.ws_message(&handle.client_id, "hello", "out");
