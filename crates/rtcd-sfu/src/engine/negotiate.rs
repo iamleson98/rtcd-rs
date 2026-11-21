@@ -636,7 +636,7 @@ pub(crate) fn with_audio_ptime(sdp: &str, ms: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{with_audio_ptime, with_opus_dtx};
+    use super::{answered_red, with_audio_ptime, with_opus_dtx};
 
     #[test]
     fn dtx_is_added_to_opus_only() {
