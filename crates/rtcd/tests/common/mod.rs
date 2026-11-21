@@ -108,6 +108,7 @@ impl TestServer {
             stream,
             conn_id: String::new(),
             client_id: String::new(),
+            instance_id: String::new(),
             reports: Vec::new(),
         };
         let ClientMessage::Hello(h) = client.next_message().await else {
@@ -115,6 +116,7 @@ impl TestServer {
         };
         client.conn_id = h.conn_id;
         client.client_id = h.client_id;
+        client.instance_id = h.instance_id;
         Ok(client)
     }
 
@@ -138,6 +140,7 @@ pub struct WsClient {
     >,
     pub conn_id: String,
     pub client_id: String,
+    pub instance_id: String,
     /// The recording reports (`record_file`, `record_ended`) a participant's pass read past, in
     /// the order they came.
     pub reports: Vec<ClientMessage>,
