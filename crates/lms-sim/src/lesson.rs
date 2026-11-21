@@ -29,6 +29,11 @@
 //! student of an impaired group changes its UDP source port now and then) and `--mtu` (an impaired
 //! group sends datagrams of MTU size and over).
 //!
+//! `--watch-max K` (default 12, what lms-web's `stage-policy.ts` receives on a wide screen) is the most
+//! cameras a student receives: the teacher's, and the K - 1 first of the others (those who have been
+//! in the call longest, as the stage policy ranks them when nobody speaks or raises a hand), so a class
+//! of 25 cameras costs each student what it costs in the browser.
+//!
 //! `--camera-layers single|simulcast` (default `simulcast`) sets how cameras are sent: the browser's
 //! two layers with three temporal layers each, or one plain stream.
 //!
@@ -60,6 +65,7 @@ struct Args {
     students: u32,
     total: u32,
     cameras: u32,
+    watch_max: usize,
     measure: u32,
     talk_secs: u64,
     chrome: Option<u16>,
@@ -87,6 +93,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
         students: 17,
         total: 25,
         cameras: 4,
+        watch_max: 12,
         measure: 6,
         talk_secs: 30,
         chrome: None,
@@ -137,6 +144,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--students" => a.students = n()? as u32,
             "--total" => a.total = n()?.max(1) as u32,
             "--cameras" => a.cameras = n()? as u32,
+            "--watch-max" => a.watch_max = n()?.max(1) as usize,
             "--measure" => a.measure = n()? as u32,
             "--talk-secs" => a.talk_secs = n()?.max(1),
             "--chrome" => a.chrome = Some(n()? as u16),
@@ -161,6 +169,18 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
         return Err("--mtu, --nat-rebind-every and --teacher-reconnect-every need --seed".into());
     }
     Ok(a)
+}
+
+fn camera_names(cameras: u32) -> Vec<String> {
+    (0..cameras).map(|i| format!("s{i:02}")).collect()
+}
+
+/// The cameras `name` receives: the teacher's and the first of the others, `max` in all.
+fn watch_list(name: &str, cameras: &[String], max: usize) -> Vec<String> {
+    std::iter::once("teacher".to_owned())
+        .chain(cameras.iter().filter(|c| *c != name).cloned())
+        .take(max)
+        .collect()
 }
 
 pub async fn run(args: impl Iterator<Item = String>, assets: PathBuf) {
@@ -200,8 +220,8 @@ pub async fn run(args: impl Iterator<Item = String>, assets: PathBuf) {
             rtcd.clone(),
             a.call.clone(),
             chrome_probe,
-            std::iter::once("teacher".to_owned())
-                .chain((0..a.cameras).map(|i| format!("s{i:02}")))
+            watch_list("", &camera_names(a.cameras), a.watch_max)
+                .into_iter()
                 .map(|n| format!("session-{n}"))
                 .collect(),
             chrome::Page {
@@ -266,11 +286,10 @@ pub async fn run(args: impl Iterator<Item = String>, assets: PathBuf) {
             class::join(&rtcd, assets.clone(), &a.call, spec, 0).await,
         ));
     }
-    let cameras: Vec<String> = (0..a.cameras).map(|i| format!("s{i:02}")).collect();
+    let cameras = camera_names(a.cameras);
     for i in a.first..a.first + a.students {
         let name = format!("s{i:02}");
-        let mut watch = vec!["teacher".to_owned()];
-        watch.extend(cameras.iter().filter(|c| **c != name).cloned());
+        let watch = watch_list(&name, &cameras, a.watch_max);
         let spec = Spec {
             name,
             voice: false,
@@ -336,5 +355,26 @@ pub async fn run(args: impl Iterator<Item = String>, assets: PathBuf) {
     }
     for (_, p) in people {
         p.leave().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_student_watches_the_teacher_and_at_most_watch_max_minus_one_others() {
+        let cameras = camera_names(25);
+        let all = watch_list("s30", &cameras, 100);
+        assert_eq!(all.len(), 26);
+        let few = watch_list("s30", &cameras, 12);
+        assert_eq!(few.len(), 12);
+        assert_eq!(few[0], "teacher");
+        assert_eq!(few[11], "s10");
+        // Never its own camera: the next one takes its place.
+        let own = watch_list("s02", &cameras, 12);
+        assert!(!own.contains(&"s02".to_owned()));
+        assert_eq!(own[11], "s11");
+        assert_eq!(watch_list("s00", &cameras, 1), ["teacher"]);
     }
 }
