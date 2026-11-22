@@ -480,25 +480,29 @@ impl Engine {
 
     /// A source a stream was fed from or waiting for has ended.
     fn source_gone(&mut self, sub: SubRef, source: u32) {
+        let Some(ds) = self
+            .sessions
+            .get(sub.session)
+            .and_then(|r| r.down.get(sub.stream))
+        else {
+            return;
+        };
+        let (publisher, ty) = (ds.publisher, ds.ty);
+        let offered = ty == TrackType::Voice
+            && self
+                .sessions
+                .get(publisher)
+                .is_some_and(|p| p.up.voice_offered);
         let Some(r) = self.sessions.get_mut(sub.session) else {
             return;
         };
         let Some(ds) = r.down.get_mut(sub.stream) else {
             return;
         };
-        if ds.source == Some(source) {
-            ds.source = None;
-        }
-        if ds.target == Some(source) {
-            ds.target = None;
-        }
         // Another source may take over, which `sync_call_stream` arranges; until then a stream with
-        // nothing to send stays in the connection, silent.
-        if ds.source.is_none() && ds.target.is_none() {
-            let publisher = ds.publisher;
-            let ty = ds.ty;
+        // nothing to send stays in the connection, silent (a voice still offered, as a reservation).
+        if ds.source_ended(source, offered) {
             r.down.drop_stream(sub.stream);
-            let _ = (publisher, ty);
         }
         self.mark_dirty(sub.session);
     }
@@ -560,15 +564,11 @@ impl Engine {
                 self.attach_stream(receiver, publisher, ty, src, now)
             }
             (None, Some(Want::Reserved)) => self.attach_reserved(receiver, publisher),
-            // The reservation is kept until the first packet gives it a source.
-            (Some((_, _, _, _, true)), Some(Want::Reserved)) => {}
+            // The reservation is kept until the first packet gives it a source. (A stream whose
+            // source ended becomes one again in `source_gone`.)
+            (Some(_), Some(Want::Reserved)) => {}
             (Some((id, _, _, mime, true)), Some(Want::Source(src))) => {
                 self.fill_reserved(receiver, publisher, id, src, &mime, now)
-            }
-            // A stream that had a source it no longer has: replaced by a reservation.
-            (Some((id, ..)), Some(Want::Reserved)) => {
-                self.detach_stream(receiver, id);
-                self.attach_reserved(receiver, publisher);
             }
             (Some((id, source, target, mime, false)), Some(Want::Source(src))) => {
                 if target.or(source) == Some(src) {
@@ -654,6 +654,13 @@ impl Engine {
             self.attach_stream(receiver, publisher, TrackType::Voice, source, now);
             return;
         }
+        let sk = SourceKey {
+            session: publisher,
+            source,
+        };
+        if !self.fanout.contains_key(&sk) {
+            return;
+        }
         let Some(ds) = self
             .sessions
             .get_mut(receiver)
@@ -663,16 +670,16 @@ impl Engine {
         };
         ds.reserved = false;
         ds.source = Some(source);
-        let Some(fan) = self.fanout.get_mut(&SourceKey {
-            session: publisher,
-            source,
-        }) else {
-            return;
-        };
-        fan.serving.push(SubRef {
-            session: receiver,
-            stream,
-        });
+        // A stream that was fed before (its source ended, and this is the next) carries on its
+        // sequence numbers from where they were.
+        let carry_on = ds.rewrite.started();
+        if let Some(fan) = self.fanout.get_mut(&sk) {
+            fan.serving.push(SubRef {
+                session: receiver,
+                stream,
+            });
+            fan.resume |= carry_on;
+        }
     }
 
     fn attach_stream(
@@ -987,7 +994,7 @@ impl Engine {
     }
 
     /// The participant starts a screen share on the stream `data` names.
-    pub(super) fn screen_on(&mut self, key: SessionKey, data: &[u8], _now: Instant) {
+    pub(super) fn screen_on(&mut self, key: SessionKey, data: &[u8], now: Instant) {
         let Ok(ann) = serde_json::from_slice::<ScreenAnnouncement>(data) else {
             warn!(session = %self.session_id(key), "unreadable screen announcement");
             return;
@@ -1006,6 +1013,8 @@ impl Engine {
         if let Some(s) = self.sessions.get_mut(key) {
             s.up.screen_stream_id = ann.screen_stream_id;
         }
+        // The sound of the screen, if offered already, is not the microphone.
+        self.refresh_voice(key, now);
     }
 
     /// The participant ends its screen share.
@@ -1021,7 +1030,11 @@ impl Engine {
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
-        s.up.screen_stream_id.clear();
+        // The sound of the screen goes with it: it must not read as a microphone from now on.
+        let stream = std::mem::take(&mut s.up.screen_stream_id);
+        if !stream.is_empty() {
+            s.up.audio_streams.retain(|x| *x != stream);
+        }
         let ended: Vec<u32> =
             s.up.sources
                 .iter()
@@ -1038,6 +1051,7 @@ impl Engine {
         for ty in [TrackType::Screen, TrackType::ScreenAudio] {
             self.sync_call_stream(key, ty, now);
         }
+        self.refresh_voice(key, now);
     }
 
     /// The participant announces the stream its camera uses.

@@ -40,39 +40,48 @@ fn answered_red(sdp: &str, mid: &str) -> bool {
         })
 }
 
-/// Whether the offer `sdp` has an audio section its sender sends its voice in: one that is not
-/// rejected, is not receive-only or inactive, and carries a stream other than the screen share's
-/// (`screen_stream_id`, empty when none is announced), so it is the microphone and not the sound of
-/// a shared screen.
-fn offers_voice(sdp: &str, screen_stream_id: &str) -> bool {
-    sdp.split("\nm=").skip(1).any(|section| {
-        let mut lines = section.lines().map(str::trim_end);
-        let mut head = lines.next().unwrap_or_default().split_whitespace();
-        if head.next() != Some("audio") || head.next() == Some("0") {
-            return false;
-        }
-        let lines: Vec<&str> = lines.collect();
-        if lines
-            .iter()
-            .any(|l| matches!(*l, "a=recvonly" | "a=inactive"))
-        {
-            return false;
-        }
-        // A stream the section names in `a=msid`, or failing that in its `a=ssrc` lines; one that
-        // names none is not the screen's, as when a track is opened.
-        let stream = lines
-            .iter()
-            .find_map(|l| l.strip_prefix("a=msid:"))
-            .or_else(|| {
-                lines
-                    .iter()
-                    .filter(|l| l.starts_with("a=ssrc:"))
-                    .find_map(|l| l.split_once(" msid:").map(|(_, m)| m))
-            })
-            .and_then(|m| m.split_whitespace().next())
-            .unwrap_or_default();
-        screen_stream_id.is_empty() || stream != screen_stream_id
-    })
+/// The stream ids of the audio sections of the offer `sdp` that its sender sends in: sections that
+/// are not rejected and not receive-only or inactive. A section names its stream in `a=msid`, or
+/// failing that in its `a=ssrc` lines; one that names none has the empty id, which is not the
+/// screen's, as when a track is opened.
+fn sent_audio_streams(sdp: &str) -> Vec<String> {
+    sdp.split("\nm=")
+        .skip(1)
+        .filter_map(|section| {
+            let mut lines = section.lines().map(str::trim_end);
+            let mut head = lines.next().unwrap_or_default().split_whitespace();
+            if head.next() != Some("audio") || head.next() == Some("0") {
+                return None;
+            }
+            let lines: Vec<&str> = lines.collect();
+            if lines
+                .iter()
+                .any(|l| matches!(*l, "a=recvonly" | "a=inactive"))
+            {
+                return None;
+            }
+            let stream = lines
+                .iter()
+                .find_map(|l| l.strip_prefix("a=msid:"))
+                .or_else(|| {
+                    lines
+                        .iter()
+                        .filter(|l| l.starts_with("a=ssrc:"))
+                        .find_map(|l| l.split_once(" msid:").map(|(_, m)| m))
+                })
+                .and_then(|m| m.split_whitespace().next())
+                .unwrap_or_default();
+            Some(stream.to_owned())
+        })
+        .collect()
+}
+
+/// Whether one of the audio `streams` an offer sends in is a microphone, and not the sound of a
+/// shared screen (`screen_stream_id`, empty when none is announced).
+fn voice_among(streams: &[String], screen_stream_id: &str) -> bool {
+    streams
+        .iter()
+        .any(|s| screen_stream_id.is_empty() || s != screen_stream_id)
 }
 
 /// A hostile client can send unreadable descriptions by the thousand; one is logged per session
@@ -191,7 +200,7 @@ impl Engine {
             debug!(session = %s.cfg.session_id, "signaling conflict, ignoring offer");
             return;
         }
-        let voice = offers_voice(&offer.sdp, &s.up.screen_stream_id);
+        let audio = sent_audio_streams(&offer.sdp);
         let result = (|| -> rtc::shared::error::Result<()> {
             s.pc.set_remote_description(now, offer)?;
             Ok(())
@@ -219,18 +228,30 @@ impl Engine {
         }
         self.register_ufrag(key);
         self.send_local_description(key, via, now);
-        self.voice_announced(key, voice, now);
+        self.voice_announced(key, audio, now);
         self.mark_dirty(key);
     }
 
-    /// Notes whether the participant's latest offer has an audio section for its voice. While it
-    /// has, every receiver holds a reserved stream for the voice (see `DownStream::reserved`), so
-    /// that its first packet, the first time it unmutes, renegotiates nobody; when the section goes
-    /// the reservations are taken back.
-    fn voice_announced(&mut self, key: SessionKey, offered: bool, now: Instant) {
+    /// Notes the audio sections the participant's latest offer sends in.
+    fn voice_announced(&mut self, key: SessionKey, audio: Vec<String>, now: Instant) {
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
+        s.up.audio_streams = audio;
+        self.refresh_voice(key, now);
+    }
+
+    /// Works out whether the participant offers a microphone: an audio section it sends in that is
+    /// not the screen share's sound. Done when its offer arrives and when its screen share starts
+    /// or ends, as the screen's stream is announced apart from the offer. While a microphone is
+    /// offered every receiver holds a reserved stream for the voice (see `DownStream::reserved`),
+    /// so that its first packet, the first time it unmutes, renegotiates nobody; when it is not the
+    /// reservations are taken back.
+    pub(super) fn refresh_voice(&mut self, key: SessionKey, now: Instant) {
+        let Some(s) = self.sessions.get_mut(key) else {
+            return;
+        };
+        let offered = voice_among(&s.up.audio_streams, &s.up.screen_stream_id);
         if s.up.voice_offered == offered {
             return;
         }
@@ -240,6 +261,9 @@ impl Engine {
             s.up.out_ids
                 .entry(TrackType::Voice)
                 .or_insert_with(|| track_id(TrackType::Voice, &s.cfg.session_id, entropy));
+        } else if !s.up.sources.iter().any(|x| x.ty == TrackType::Voice) {
+            // The id may still be on a stream being removed: a later offer starts afresh.
+            s.up.out_ids.remove(&TrackType::Voice);
         }
         self.sync_call_stream(key, TrackType::Voice, now);
     }
@@ -705,7 +729,7 @@ pub(crate) fn with_audio_ptime(sdp: &str, ms: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{answered_red, offers_voice, with_audio_ptime, with_opus_dtx};
+    use super::{answered_red, sent_audio_streams, voice_among, with_audio_ptime, with_opus_dtx};
 
     #[test]
     fn dtx_is_added_to_opus_only() {
@@ -768,6 +792,10 @@ mod tests {
         assert_eq!(with_audio_ptime(BROWSER_ANSWER, 0), BROWSER_ANSWER);
     }
 
+    fn offers_voice(sdp: &str, screen_stream_id: &str) -> bool {
+        voice_among(&sent_audio_streams(sdp), screen_stream_id)
+    }
+
     fn audio(attrs: &str) -> String {
         format!(
             "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\n{attrs}a=rtpmap:111 opus/48000/2\r\n"
@@ -798,6 +826,21 @@ mod tests {
         let video = "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=sendrecv\r\na=msid:stream cam\r\n";
         assert!(!offers_voice(&format!("v=0\r\n{video}"), ""));
         assert!(!offers_voice("v=0\r\n", ""));
+    }
+
+    #[test]
+    fn the_streams_an_offer_sends_audio_in_are_kept_to_tell_the_screen_by_later() {
+        let sdp = format!(
+            "v=0\r\n{}{}",
+            audio("a=sendonly\r\na=msid:screen sound\r\n"),
+            audio("a=recvonly\r\na=msid:other x\r\n")
+        );
+        let streams = sent_audio_streams(&sdp);
+        assert_eq!(streams, vec!["screen".to_owned()]);
+        // The screen was announced after the offer: until then its sound reads as a microphone.
+        assert!(voice_among(&streams, ""));
+        assert!(!voice_among(&streams, "screen"));
+        assert!(!voice_among(&[], "screen"));
     }
 
     #[test]

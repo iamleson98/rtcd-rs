@@ -164,6 +164,10 @@ pub(crate) struct Uplink {
     /// packet of it has arrived: receivers are given a reserved stream for it at once, so the
     /// first word of the class renegotiates nobody (see `DownStream::reserved`).
     pub voice_offered: bool,
+    /// The stream ids of the audio sections the participant's last offer sends in (an empty id for
+    /// a section that names none): which of them is the microphone depends on the screen share's
+    /// stream, announced separately, so it is worked out again when that changes.
+    pub audio_streams: Vec<String>,
     pub vad: Option<Monitor>,
     pub audio_level_ext: Option<u8>,
     /// Whether the large layer of the camera has stopped while the small one flows.
@@ -261,6 +265,29 @@ pub(crate) struct Downlink {
     pub budget_hold: BudgetHold,
     /// The highest rate the screen share was sent at lately: what the cameras' room is split by.
     pub screen_peak: RecentPeak,
+}
+
+impl DownStream {
+    /// The source `source` ended. Returns whether the stream is over with it: nothing is left to
+    /// feed it, and it is not a voice whose publisher still offers its microphone. That one goes
+    /// back to being a reservation, in the connection as it is, so the next source (or the same
+    /// microphone's next packet) takes it over without an offer.
+    pub fn source_ended(&mut self, source: u32, voice_offered: bool) -> bool {
+        if self.source == Some(source) {
+            self.source = None;
+        }
+        if self.target == Some(source) {
+            self.target = None;
+        }
+        if self.source.is_some() || self.target.is_some() {
+            return false;
+        }
+        if self.ty == TrackType::Voice && voice_offered {
+            self.reserved = true;
+            return false;
+        }
+        true
+    }
 }
 
 impl Downlink {
@@ -493,6 +520,67 @@ impl Sessions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peer::opus_codec;
+
+    fn voice_stream(source: u32) -> DownStream {
+        DownStream {
+            publisher: SessionKey {
+                idx: 0,
+                generation: 0,
+            },
+            publisher_session_id: "alice".to_owned(),
+            ty: TrackType::Voice,
+            out_track_id: "voice_alice_abc".to_owned(),
+            ssrc: 7,
+            codec: opus_codec().rtp_codec,
+            phase: DownPhase::Active,
+            sender: None,
+            payload_type_known: false,
+            red_payload_type: None,
+            red_hold: 0,
+            reserved: false,
+            source: Some(source),
+            target: None,
+            rewrite: Rewriter::new(7, 0, false),
+            temporal: Default::default(),
+            paused: false,
+            paused_at: None,
+            pausing: false,
+            budget_small: false,
+        }
+    }
+
+    #[test]
+    fn a_voice_whose_source_ends_while_still_offered_becomes_a_reservation_in_place() {
+        let mut down = Downlink::default();
+        let id = down.insert(voice_stream(3));
+        down.changed = false;
+        let ds = down.get_mut(id).unwrap();
+        assert!(!ds.source_ended(3, true), "the stream stays");
+        assert!(ds.reserved && ds.source.is_none() && ds.target.is_none());
+        assert_eq!(ds.out_track_id, "voice_alice_abc", "under the same id");
+        assert_eq!(ds.ssrc, 7);
+        assert_eq!(ds.phase, DownPhase::Active, "still in the connection");
+        assert!(!down.has_pending(), "no removal, no addition, no offer");
+        assert!(!down.changed);
+    }
+
+    #[test]
+    fn a_voice_whose_publisher_no_longer_offers_it_is_over_with_its_source() {
+        let mut ds = voice_stream(3);
+        assert!(ds.source_ended(3, false));
+    }
+
+    #[test]
+    fn only_the_source_feeding_a_stream_ends_it() {
+        let mut ds = voice_stream(3);
+        assert!(!ds.source_ended(4, false), "another source ended");
+        assert_eq!(ds.source, Some(3));
+        assert!(!ds.reserved);
+        let mut camera = voice_stream(3);
+        camera.ty = TrackType::Video;
+        assert!(camera.source_ended(3, true), "only a voice is held");
+    }
 
     #[test]
     fn the_base_layer_pace_is_the_gap_between_its_frames_or_how_long_it_has_been() {

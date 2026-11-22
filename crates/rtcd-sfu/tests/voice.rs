@@ -374,6 +374,36 @@ fn the_sound_of_a_screen_is_not_a_voice() {
 }
 
 #[test]
+fn the_sound_of_a_screen_announced_after_the_offer_is_not_taken_for_a_voice() {
+    let mut w = World::new();
+    let a = w.join("alice", "call1");
+    let b = w.join("bob", "call1");
+    w.stop_microphone(a);
+    w.run_for(Duration::from_secs(1));
+
+    // The offer comes first: until the screen is announced its sound looks like a microphone.
+    w.offer_screen_audio(a);
+    w.run_for(Duration::from_secs(1));
+    let offers = w.browsers[b].offers_received;
+    w.announce_screen(a);
+    w.run_for(Duration::from_secs(1));
+    assert!(
+        w.browsers[b].offers_received > offers,
+        "the stream held for it was taken back"
+    );
+    let late = w.join("late", "call1");
+    w.run_for(Duration::from_secs(1));
+    assert!(
+        w.browsers[late]
+            .media_maps
+            .iter()
+            .all(|m| m.values().all(|i| i.sender_id != "session-alice")),
+        "{:?}",
+        w.browsers[late].media_maps
+    );
+}
+
+#[test]
 fn a_microphone_that_leaves_the_connection_gives_its_stream_back() {
     let mut w = World::new();
     let members: Vec<usize> = ["a", "b", "c"].iter().map(|n| w.join(n, "call1")).collect();

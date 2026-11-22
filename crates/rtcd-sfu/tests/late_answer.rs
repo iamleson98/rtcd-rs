@@ -229,18 +229,22 @@ fn an_offer_is_sent_by_the_websocket_when_its_channel_is_gone() {
     w.stream_video(b, false, 0.5, 30, &[Layer::Low, Layer::High]);
     assert_eq!(w.browsers[a].offers.len(), 0, "the data channel is shut");
 
-    // Bob's microphone is offered first, and his camera in the offer after it: each by the
-    // websocket, once.
+    // Bob's microphone is offered first, and his camera in the same offer or the one after it
+    // (which of the two depends on whether the first is still waiting for its answer when the
+    // camera's packets come): each by the websocket, once.
     assert!(
-        w.run_until(Duration::from_secs(12), |w| w.browsers[a].offers.len() == 1),
+        w.run_until(Duration::from_secs(12), |w| !w.browsers[a]
+            .offers
+            .is_empty()),
         "the offer never came by the websocket"
     );
-    assert!(
-        w.run_until(Duration::from_secs(30), |w| w.browsers[a].offers.len() == 2),
-        "the second offer never came by the websocket"
-    );
     w.run_for(Duration::from_secs(60));
-    assert_eq!(w.browsers[a].offers.len(), 2, "once each, not twice");
+    let offers = &w.browsers[a].offers;
+    assert!(offers.len() <= 2, "once each, not twice: {}", offers.len());
+    assert!(
+        offers.last().unwrap().1.contains("\r\nm=video"),
+        "Bob's camera was never offered"
+    );
     assert!(
         !w.browsers[b].keyframe_requests.is_empty(),
         "the answer was applied"

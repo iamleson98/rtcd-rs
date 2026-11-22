@@ -1121,12 +1121,23 @@ impl World {
     /// Browser `i` shares the sound of its screen: announces the screen's stream and offers an
     /// audio section in it, as the client does (the sound is not the microphone).
     pub fn share_screen_audio(&mut self, i: usize) {
+        self.announce_screen(i);
+        self.offer_screen_audio(i);
+    }
+
+    /// Browser `i` announces its screen's stream (see [`share_screen`](Self::share_screen)).
+    pub fn announce_screen(&mut self, i: usize) {
         let stream_id = format!("screen-stream-{}", self.browsers[i].name);
         self.signal(
             i,
             MessageType::ScreenOn,
             serde_json::to_vec(&serde_json::json!({ "screenStreamID": stream_id })).unwrap(),
         );
+    }
+
+    /// Browser `i` offers an audio section in its screen's stream, announced or not.
+    pub fn offer_screen_audio(&mut self, i: usize) {
+        let stream_id = format!("screen-stream-{}", self.browsers[i].name);
         let name = self.browsers[i].name.clone();
         let track = MediaStreamTrack::new(
             stream_id,
