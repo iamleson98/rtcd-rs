@@ -49,6 +49,15 @@ struct Subscription {
     session_ids: Vec<String>,
     #[serde(default, deserialize_with = "null_as_empty")]
     low: Vec<String>,
+    /// Whether the receiver wants screen shares; absent means yes, so older clients keep them.
+    /// A browser whose page is hidden says no: nobody sees the share and its bandwidth is the
+    /// largest a receiver takes.
+    #[serde(default = "yes")]
+    screen: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// A JSON `null` where a list belongs reads as the empty list, which is how Go encodes a nil slice.
@@ -92,6 +101,9 @@ impl Engine {
                 self.pick_layer(&mut candidates, preferred)
             }
             TrackType::Screen => {
+                if r.down.no_screen {
+                    return None;
+                }
                 let preferred = if r.down.squeezed || p.up.screen_stall.stalled() {
                     Layer::Low
                 } else {
@@ -262,7 +274,7 @@ impl Engine {
     }
 
     /// The receiver names the cameras it wants (JSON: `session_ids`, and `low` for those it wants
-    /// at the small size).
+    /// at the small size), and whether it wants screen shares (`screen`, yes when absent).
     pub(super) fn video_subscribe(&mut self, key: SessionKey, data: &[u8], now: Instant) {
         let sub: Subscription = match serde_json::from_slice(data) {
             Ok(s) => s,
@@ -287,6 +299,8 @@ impl Engine {
         };
         s.down.wanted_video = Some(wanted);
         s.down.low_video = low;
+        let screen_changed = s.down.no_screen == sub.screen;
+        s.down.no_screen = !sub.screen;
         // A receiver still connecting gets its cameras when it becomes ready.
         if !s.down.ready {
             return;
@@ -294,6 +308,9 @@ impl Engine {
         for member in self.call_members(key) {
             if member != key {
                 self.sync_stream(key, member, TrackType::Video, now);
+                if screen_changed {
+                    self.sync_stream(key, member, TrackType::Screen, now);
+                }
             }
         }
     }

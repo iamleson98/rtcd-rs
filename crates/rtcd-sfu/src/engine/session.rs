@@ -240,6 +240,8 @@ pub(crate) struct Downlink {
     pub wanted_video: Option<HashSet<String>>,
     /// Of those, whose it wants small.
     pub low_video: HashSet<String>,
+    /// It asked for no screen shares (its page is hidden).
+    pub no_screen: bool,
     /// Streams were added or removed since the last offer.
     pub changed: bool,
     /// Which layer of a screen share this receiver is sent.
