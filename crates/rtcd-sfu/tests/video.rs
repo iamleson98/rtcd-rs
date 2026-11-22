@@ -333,7 +333,11 @@ fn a_receiver_can_turn_screen_shares_off_and_on() {
 
     let offers = w.browsers[b].offers_received;
     let off = serde_json::json!({ "session_ids": [], "low": [], "screen": false });
-    w.signal(b, MessageType::VideoSubscribe, serde_json::to_vec(&off).unwrap());
+    w.signal(
+        b,
+        MessageType::VideoSubscribe,
+        serde_json::to_vec(&off).unwrap(),
+    );
     w.run_for(Duration::from_secs(1));
     assert!(
         w.browsers[b].offers_received > offers,
@@ -341,7 +345,11 @@ fn a_receiver_can_turn_screen_shares_off_and_on() {
     );
     let seen = video_of(&w, b, "screen_").len();
     w.stream_video(a, true, 1.0, 30, &BOTH);
-    assert_eq!(video_of(&w, b, "screen_").len(), seen, "nothing more arrives");
+    assert_eq!(
+        video_of(&w, b, "screen_").len(),
+        seen,
+        "nothing more arrives"
+    );
 
     // A subscription without the field brings it back: older clients keep their shares.
     subscribe(&mut w, b, &[], &[]);
