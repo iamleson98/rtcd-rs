@@ -1198,7 +1198,7 @@ mod tests {
         r.count_bytes(track, 1000);
         r.count_bytes(track, 200);
         r.count_bytes("video_session-nobody_abcdefgh", 5);
-        r.write(&probe, "s17", now, None);
+        r.write(&probe, "s17", now, None, &mut Worst::default());
         probe.rejoined("s17", 4200, 2);
         let lines: Vec<Value> = std::fs::read_to_string(&path)
             .unwrap()
