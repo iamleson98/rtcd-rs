@@ -714,6 +714,7 @@ impl Engine {
             paused_at: None,
             pausing: false,
             budget_small: false,
+            reserved: false,
         };
         let Some(r) = self.sessions.get_mut(receiver) else {
             return;
