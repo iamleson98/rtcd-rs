@@ -9,7 +9,7 @@ use std::time::Duration;
 use rtcd_proto::MessageType;
 use rtcd_proto::dc::DcMessage;
 use rtcd_sfu::config::EngineConfig;
-use rtcd_sfu::engine::{CloseReason, Load};
+use rtcd_sfu::engine::{CloseReason, Load, QUIET_OFFER_DELAY};
 use rtcd_sfu::ids::{TrackType, parse_track_id};
 use rtcd_sfu::metrics::{Metrics, ReceiverQuality};
 use rtcd_sfu::red;
@@ -23,6 +23,12 @@ fn wait_tracks(w: &mut World, i: usize, n: usize) {
         w.browsers[i].name,
         w.browsers[i].tracks.len()
     );
+}
+
+/// Lets the silent voice streams that wait for company (see `QUIET_OFFER_DELAY`) be offered: the
+/// delay, a second of upkeep and the share of a second a session adds to it.
+fn settle_offers(w: &mut World) {
+    w.run_for(QUIET_OFFER_DELAY + Duration::from_secs(2));
 }
 
 /// Browser `i` speaks for a second and everyone else lets it arrive.
@@ -298,7 +304,7 @@ fn a_first_voice_renegotiates_nobody_and_is_forwarded_at_once() {
     let members: Vec<usize> = (0..20).map(|n| w.join(&format!("m{n}"), "call1")).collect();
     // Every microphone was offered at the join: the streams are in place, silent, once the
     // negotiation has settled.
-    w.run_for(Duration::from_secs(2));
+    settle_offers(&mut w);
     let before = offers_of(&w, &members);
     assert!(before.iter().all(|&n| n > 0), "{before:?}");
 
@@ -351,8 +357,9 @@ fn the_sound_of_a_screen_is_not_a_voice() {
     let mut w = World::new();
     let a = w.join("alice", "call1");
     let b = w.join("bob", "call1");
+    settle_offers(&mut w);
     w.stop_microphone(a);
-    w.run_for(Duration::from_secs(1));
+    settle_offers(&mut w);
     let offers = w.browsers[b].offers_received;
 
     w.share_screen_audio(a);
@@ -378,18 +385,20 @@ fn the_sound_of_a_screen_announced_after_the_offer_is_not_taken_for_a_voice() {
     let mut w = World::new();
     let a = w.join("alice", "call1");
     let b = w.join("bob", "call1");
+    settle_offers(&mut w);
     w.stop_microphone(a);
-    w.run_for(Duration::from_secs(1));
+    settle_offers(&mut w);
+    let offers = w.browsers[b].offers_received;
 
-    // The offer comes first: until the screen is announced its sound looks like a microphone.
+    // The offer comes first: until the screen is announced its sound looks like a microphone, and
+    // a stream is held for it, which the announcement takes back before it was ever offered.
     w.offer_screen_audio(a);
     w.run_for(Duration::from_secs(1));
-    let offers = w.browsers[b].offers_received;
     w.announce_screen(a);
-    w.run_for(Duration::from_secs(1));
-    assert!(
-        w.browsers[b].offers_received > offers,
-        "the stream held for it was taken back"
+    settle_offers(&mut w);
+    assert_eq!(
+        w.browsers[b].offers_received, offers,
+        "no stream is offered for sound that is not a microphone"
     );
     let late = w.join("late", "call1");
     w.run_for(Duration::from_secs(1));
@@ -407,11 +416,11 @@ fn the_sound_of_a_screen_announced_after_the_offer_is_not_taken_for_a_voice() {
 fn a_microphone_that_leaves_the_connection_gives_its_stream_back() {
     let mut w = World::new();
     let members: Vec<usize> = ["a", "b", "c"].iter().map(|n| w.join(n, "call1")).collect();
-    w.run_for(Duration::from_secs(1));
+    settle_offers(&mut w);
     let before = offers_of(&w, &members[..2]);
 
     w.stop_microphone(members[2]);
-    w.run_for(Duration::from_secs(1));
+    settle_offers(&mut w);
     let after = offers_of(&w, &members[..2]);
     assert!(
         before.iter().zip(&after).all(|(b, a)| a == &(b + 1)),
@@ -425,6 +434,61 @@ fn a_microphone_that_leaves_the_connection_gives_its_stream_back() {
         2,
         "the one without a microphone is not offered"
     );
+}
+
+#[test]
+fn members_joining_a_second_apart_cost_each_receiver_one_offer_per_window() {
+    let mut w = World::new();
+    let began = w.now;
+    let members: Vec<usize> = (0..20)
+        .map(|n| {
+            let i = w.join(&format!("m{n}"), "call1");
+            w.run_for(Duration::from_secs(1));
+            i
+        })
+        .collect();
+    settle_offers(&mut w);
+    let span = w.now.duration_since(began);
+    // One offer when it is first offered anything, and one for every window of joins after it.
+    let most = 2 + (span.as_secs_f64() / QUIET_OFFER_DELAY.as_secs_f64()) as usize;
+    for (&i, offers) in members.iter().zip(offers_of(&w, &members)) {
+        assert!(
+            (1..=most).contains(&offers),
+            "{} was sent {offers} offers in {span:?} (at most {most})",
+            w.browsers[i].name
+        );
+    }
+    // Nothing was left out for it: the last to join is heard by everyone, with no offer.
+    let before = offers_of(&w, &members);
+    let speaker = members[19];
+    talk(&mut w, speaker);
+    for &l in &members[..19] {
+        let b = &w.browsers[l];
+        assert!(b.received_on("voice_session-m19") > 40, "{}", b.name);
+    }
+    assert_eq!(offers_of(&w, &members), before);
+}
+
+#[test]
+fn a_voice_that_starts_inside_the_window_is_offered_at_once() {
+    let mut w = World::new();
+    let a = w.join("a", "call1");
+    let b = w.join("b", "call1");
+    settle_offers(&mut w);
+    // The newcomer's silent stream would wait for the window: its first words do not.
+    let c = w.join("c", "call1");
+    let joined = w.now;
+    talk(&mut w, c);
+    assert!(w.now.duration_since(joined) < QUIET_OFFER_DELAY);
+    for l in [a, b] {
+        let heard = &w.browsers[l];
+        assert!(
+            heard.received_on("voice_session-c") > 40,
+            "{} heard {} packets",
+            heard.name,
+            heard.received_on("voice_session-c")
+        );
+    }
 }
 
 #[test]
@@ -507,7 +571,7 @@ fn leaving_removes_the_track_from_the_others() {
     let offers = w.browsers[b].offers_received;
 
     w.leave(a);
-    w.run_for(Duration::from_secs(2));
+    settle_offers(&mut w);
     assert!(
         w.closed
             .contains(&("session-alice".to_owned(), CloseReason::Left))

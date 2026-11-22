@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use rtcd_proto::MessageType;
 use rtcd_sfu::config::EngineConfig;
+use rtcd_sfu::engine::QUIET_OFFER_DELAY;
 use rtcd_sfu::ids::{TrackType, parse_track_id};
 use rtcd_sfu::metrics::Metrics;
 use support::{Layer, World, describe, engine_config};
@@ -121,6 +122,9 @@ impl Rig {
             .enumerate()
             .map(|(n, &kbps)| w.join_with_budget(&format!("viewer{n}"), "call1", kbps))
             .collect();
+        // The voice streams the joins reserved are offered once their wait is over (see
+        // `QUIET_OFFER_DELAY`), before anything is measured.
+        w.run_for(QUIET_OFFER_DELAY + Duration::from_secs(2));
         // The senders watch nobody: only the viewers' downlinks are under test.
         for &s in &senders {
             let none = serde_json::json!({ "session_ids": [], "low": [] });

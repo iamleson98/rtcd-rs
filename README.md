@@ -146,6 +146,14 @@ stream has no source yet; the first packet only gives it one. Audio that is not 
 sound of a screen, announced with the screen share) is not reserved, and a stream is taken back
 when the offer that removes the microphone's section arrives, or the participant leaves.
 
+Adding or removing a silent voice stream does not make an offer by itself: it waits
+(`QUIET_OFFER_DELAY`, 3 s, plus up to 0.9 s that depends on the session, as the upkeep that looks at
+it runs once a second) so that one offer per listener carries every join of the window, where an
+offer per join cost a big class most of a second of the shard's every second while it filled. The
+wait ends at once for anything else that needs an offer (a camera, a screen share, a voice that has
+started to send, which carry what is waiting), and a session that has not been offered anything yet
+(a latecomer) is brought up to date in its first offer.
+
 ## Large calls: the loudest voices
 
 Every open microphone is a stream to every listener, so a call of `n` people with `m` microphones

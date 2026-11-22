@@ -26,7 +26,7 @@ mod video;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use rtc::sansio::Protocol;
@@ -67,6 +67,15 @@ pub enum Load {
 /// sockets for as long as all of them take, and the media already flowing would arrive late, in a
 /// bunch. The sessions that do not fit wait in a queue that the next turns work through, in order.
 pub const MAX_OFFERS_PER_TURN: usize = 2;
+
+/// How long an offer that only adds or removes a silent voice stream waits for company: a join gives
+/// every other member of the call a reserved stream for the newcomer's microphone, and in a class
+/// that fills up over a few minutes one offer per member for all the joins of a window costs far
+/// less than one offer per join (the engine spent most of a second in every second of a ramp on
+/// them). Anything else that needs an offer, a voice that starts speaking included, goes out at
+/// once and carries what was waiting. Each session adds up to 0.9 s of its own (see
+/// `Downlink::quiet_due`) so the receivers of a big call do not fall due in the same second.
+pub const QUIET_OFFER_DELAY: Duration = Duration::from_secs(3);
 
 /// A call: the sessions that hear each other.
 #[derive(Debug)]

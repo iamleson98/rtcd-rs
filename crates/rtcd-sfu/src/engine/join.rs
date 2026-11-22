@@ -216,7 +216,7 @@ impl Engine {
                 }
                 for sub in fan.serving.into_iter().chain(fan.waiting) {
                     if let Some(r) = self.sessions.get_mut(sub.session) {
-                        r.down.drop_stream(sub.stream);
+                        r.down.drop_stream(sub.stream, now);
                     }
                     self.mark_dirty(sub.session);
                 }
@@ -238,7 +238,7 @@ impl Engine {
                 continue;
             }
             for id in reserved {
-                r.down.drop_stream(id);
+                r.down.drop_stream(id, now);
             }
             self.mark_dirty(member);
         }

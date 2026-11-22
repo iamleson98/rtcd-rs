@@ -468,7 +468,7 @@ impl Engine {
             source,
         }) {
             for sub in fan.serving.into_iter().chain(fan.waiting) {
-                self.source_gone(sub, source);
+                self.source_gone(sub, source, now);
             }
             // Another layer of it takes its place in the recording at the next upkeep.
             if let Some(tap) = fan.tap {
@@ -479,7 +479,7 @@ impl Engine {
     }
 
     /// A source a stream was fed from or waiting for has ended.
-    fn source_gone(&mut self, sub: SubRef, source: u32) {
+    fn source_gone(&mut self, sub: SubRef, source: u32, now: Instant) {
         let Some(ds) = self
             .sessions
             .get(sub.session)
@@ -502,7 +502,7 @@ impl Engine {
         // Another source may take over, which `sync_call_stream` arranges; until then a stream with
         // nothing to send stays in the connection, silent (a voice still offered, as a reservation).
         if ds.source_ended(source, offered) {
-            r.down.drop_stream(sub.stream);
+            r.down.drop_stream(sub.stream, now);
         }
         self.mark_dirty(sub.session);
     }
@@ -559,11 +559,11 @@ impl Engine {
             });
         match (have, want) {
             (None, None) => {}
-            (Some((id, ..)), None) => self.detach_stream(receiver, id),
+            (Some((id, ..)), None) => self.detach_stream(receiver, id, now),
             (None, Some(Want::Source(src))) => {
                 self.attach_stream(receiver, publisher, ty, src, now)
             }
-            (None, Some(Want::Reserved)) => self.attach_reserved(receiver, publisher),
+            (None, Some(Want::Reserved)) => self.attach_reserved(receiver, publisher, now),
             // The reservation is kept until the first packet gives it a source. (A stream whose
             // source ended becomes one again in `source_gone`.)
             (Some(_), Some(Want::Reserved)) => {}
@@ -583,7 +583,7 @@ impl Engine {
                     self.begin_switch(receiver, id, publisher, src, now);
                 } else {
                     // A different codec cannot continue the stream: replace it.
-                    self.detach_stream(receiver, id);
+                    self.detach_stream(receiver, id, now);
                     self.attach_stream(receiver, publisher, ty, src, now);
                 }
             }
@@ -592,7 +592,7 @@ impl Engine {
 
     /// Adds a voice stream that has no source yet: the publisher offered audio to send its voice
     /// in, so the stream goes into the connection now and the first packet needs no offer.
-    fn attach_reserved(&mut self, receiver: SessionKey, publisher: SessionKey) {
+    fn attach_reserved(&mut self, receiver: SessionKey, publisher: SessionKey, now: Instant) {
         let ssrc = self.rng.ssrc();
         let Some(p) = self.sessions.get(publisher) else {
             return;
@@ -626,6 +626,9 @@ impl Engine {
             return;
         };
         r.down.insert(stream);
+        // Added with the next offer there is, or when this one has waited long enough (see
+        // `QUIET_OFFER_DELAY`).
+        r.down.quiet_since.get_or_insert(now);
         self.mark_dirty(receiver);
     }
 
@@ -650,7 +653,7 @@ impl Engine {
         };
         if !codec.eq_ignore_ascii_case(mime) {
             // Not the codec the stream was reserved for: replace it.
-            self.detach_stream(receiver, stream);
+            self.detach_stream(receiver, stream, now);
             self.attach_stream(receiver, publisher, TrackType::Voice, source, now);
             return;
         }
@@ -673,12 +676,18 @@ impl Engine {
         // A stream that was fed before (its source ended, and this is the next) carries on its
         // sequence numbers from where they were.
         let carry_on = ds.rewrite.started();
+        // A stream not in an offer yet has a voice to send now: it is no longer a quiet change, and
+        // is offered at once.
+        let unoffered = ds.phase == DownPhase::PendingAdd;
         if let Some(fan) = self.fanout.get_mut(&sk) {
             fan.serving.push(SubRef {
                 session: receiver,
                 stream,
             });
             fan.resume |= carry_on;
+        }
+        if unoffered {
+            self.mark_dirty(receiver);
         }
     }
 
@@ -748,7 +757,7 @@ impl Engine {
     }
 
     /// Stops sending a receiver one of its streams.
-    pub(super) fn detach_stream(&mut self, receiver: SessionKey, stream: u32) {
+    pub(super) fn detach_stream(&mut self, receiver: SessionKey, stream: u32, now: Instant) {
         let Some(r) = self.sessions.get_mut(receiver) else {
             return;
         };
@@ -765,7 +774,7 @@ impl Engine {
                     .retain(|s| !(s.session == receiver && s.stream == stream));
             }
         }
-        r.down.drop_stream(stream);
+        r.down.drop_stream(stream, now);
         self.mark_dirty(receiver);
     }
 

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rtcd_sfu::engine::MAX_OFFERS_PER_TURN;
+use rtcd_sfu::engine::{MAX_OFFERS_PER_TURN, QUIET_OFFER_DELAY};
 use rtcd_sfu::metrics::Metrics;
 use support::{World, engine_config};
 
@@ -63,40 +63,31 @@ fn a_newcomer_is_offered_to_a_class_a_few_sessions_per_turn() {
             w.browsers[l].name
         );
     }
-    w.run_for(Duration::from_secs(2));
-    MOST_IN_A_TURN.store(0, Ordering::Relaxed);
+    w.run_for(QUIET_OFFER_DELAY + Duration::from_secs(2));
 
-    // The newcomer's offer is the moment every listener needs an offer, for its microphone.
+    // The newcomer's silent stream waits for the window, but its first words are offered at once to
+    // every listener, whose streams for it are not in any offer yet.
     let newcomer = w.start("newcomer", "call1");
-    let mut sent: Vec<(u32, Instant)> = Vec::new();
-    for n in 0..FRAMES {
-        sent.push((n, w.now));
-        w.send_voice(teacher, n);
-        w.run_for(Duration::from_millis(20));
-    }
     assert!(
         w.run_until(Duration::from_secs(20), |w| w.browsers[newcomer].connected
             && w.browsers[newcomer].dc.is_some()),
         "the newcomer never connected"
     );
+    MOST_IN_A_TURN.store(0, Ordering::Relaxed);
+    let mut sent: Vec<(u32, Instant)> = Vec::new();
+    for n in 0..FRAMES {
+        sent.push((n, w.now));
+        w.send_voice(teacher, n);
+        w.send_voice(newcomer, NEWCOMER + n);
+        w.run_for(Duration::from_millis(20));
+    }
     let most = MOST_IN_A_TURN.load(Ordering::Relaxed);
     assert!(
         (1..=MAX_OFFERS_PER_TURN).contains(&most),
         "one turn made {most} offers"
     );
-    let offered: Vec<usize> = listeners
-        .iter()
-        .map(|&l| w.browsers[l].offers_received)
-        .collect();
-
-    // Its first words need no offer.
-    for n in 0..50 {
-        w.send_voice(newcomer, NEWCOMER + n);
-        w.run_for(Duration::from_millis(20));
-    }
-    for (&l, &was) in listeners.iter().zip(&offered) {
+    for &l in &listeners {
         let b = &w.browsers[l];
-        assert_eq!(b.offers_received, was, "{} was offered again", b.name);
         for &(n, at) in &sent {
             assert_eq!(
                 b.voice_heard.get(&n),
@@ -125,7 +116,7 @@ fn newcomers_in_many_calls_in_one_turn_are_offered_a_few_at_a_time() {
         listeners.push(w.join(&format!("first{c}"), &call));
         listeners.push(w.join(&format!("second{c}"), &call));
     }
-    w.run_for(Duration::from_secs(2));
+    w.run_for(QUIET_OFFER_DELAY + Duration::from_secs(2));
     MOST_IN_A_TURN.store(0, Ordering::Relaxed);
 
     // Every call's newcomer reaches the engine in the same turn: 12 offers are wanted, each call's

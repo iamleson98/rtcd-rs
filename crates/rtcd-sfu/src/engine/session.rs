@@ -13,10 +13,10 @@ use rtc::rtp_transceiver::{RTCRtpReceiverId, RTCRtpSenderId};
 use rtcd_proto::SessionConfig;
 use rtcd_proto::dc::DcMessage;
 
-use super::CallId;
 use super::route::AddrBudget;
 use super::signaling::{Phase, SignalingLock};
 use super::types::Proto;
+use super::{CallId, QUIET_OFFER_DELAY};
 use crate::bwe::Estimate;
 use crate::camera_budget::{CameraBudget, CameraSteps};
 use crate::ids::TrackType;
@@ -254,6 +254,11 @@ pub(crate) struct Downlink {
     pub low_video: HashSet<String>,
     /// Streams were added or removed since the last offer.
     pub changed: bool,
+    /// Since when a silent voice stream has been waiting to be added or removed (see
+    /// `QUIET_OFFER_DELAY`); cleared by an offer.
+    pub quiet_since: Option<Instant>,
+    /// The SFU has made an offer to this session: before the first, everything pending is due.
+    pub offered: bool,
     /// Which layer of a screen share this receiver is sent.
     pub screen_level: ScreenLevel,
     /// When the screen share's layer was last decided.
@@ -318,27 +323,54 @@ impl Downlink {
     }
 
     /// Ends a stream: one that never reached the connection just disappears, one in the
-    /// connection is removed at the next offer.
-    pub fn drop_stream(&mut self, id: u32) {
+    /// connection is removed at the next offer (a voice's, when its quiet time is over).
+    pub fn drop_stream(&mut self, id: u32, now: Instant) {
         let Some(ds) = self.get_mut(id) else { return };
         ds.source = None;
         ds.target = None;
+        let voice = ds.ty == TrackType::Voice;
         match ds.phase {
             DownPhase::PendingAdd => self.streams[id as usize] = None,
             DownPhase::Adding | DownPhase::Active => {
                 ds.phase = DownPhase::PendingRemove;
                 self.changed = true;
+                if voice {
+                    self.quiet_since.get_or_insert(now);
+                }
             }
             DownPhase::PendingRemove | DownPhase::Removing => {}
         }
     }
 
-    /// Whether anything waits for an offer.
-    pub fn has_pending(&self) -> bool {
-        self.streams
-            .iter()
-            .flatten()
-            .any(|s| matches!(s.phase, DownPhase::PendingAdd | DownPhase::PendingRemove))
+    /// Whether something waits for an offer that must not wait: a stream to add or remove that is
+    /// not a silent voice (a reservation, or the removal of a voice).
+    pub fn has_urgent(&self) -> bool {
+        self.streams.iter().flatten().any(|s| match s.phase {
+            DownPhase::PendingAdd => !s.reserved,
+            DownPhase::PendingRemove => s.ty != TrackType::Voice,
+            _ => false,
+        })
+    }
+
+    /// Whether the only thing waiting is a silent voice stream to add (reserved) or to remove.
+    fn has_quiet(&self) -> bool {
+        self.streams.iter().flatten().any(|s| match s.phase {
+            DownPhase::PendingAdd => s.reserved,
+            DownPhase::PendingRemove => s.ty == TrackType::Voice,
+            _ => false,
+        })
+    }
+
+    /// Whether the silent voice changes waiting are due for an offer: before the first offer to
+    /// the session (a latecomer is brought up to date in one), or once they have waited
+    /// [`QUIET_OFFER_DELAY`] and a share of a second that depends on the session `key`.
+    pub fn quiet_due(&self, key: SessionKey, now: Instant) -> bool {
+        let delay = QUIET_OFFER_DELAY + Duration::from_millis(100 * u64::from(key.idx % 10));
+        self.has_quiet()
+            && (!self.offered
+                || self
+                    .quiet_since
+                    .is_none_or(|t| now.saturating_duration_since(t) >= delay))
     }
 }
 
@@ -522,6 +554,11 @@ mod tests {
     use super::*;
     use crate::peer::opus_codec;
 
+    const KEY: SessionKey = SessionKey {
+        idx: 3,
+        generation: 0,
+    };
+
     fn voice_stream(source: u32) -> DownStream {
         DownStream {
             publisher: SessionKey {
@@ -561,8 +598,53 @@ mod tests {
         assert_eq!(ds.out_track_id, "voice_alice_abc", "under the same id");
         assert_eq!(ds.ssrc, 7);
         assert_eq!(ds.phase, DownPhase::Active, "still in the connection");
-        assert!(!down.has_pending(), "no removal, no addition, no offer");
+        assert!(
+            !down.has_urgent() && !down.quiet_due(KEY, Instant::now()),
+            "no removal, no addition, no offer"
+        );
         assert!(!down.changed);
+    }
+
+    #[test]
+    fn a_silent_voice_waits_for_company_and_anything_else_does_not() {
+        let t0 = Instant::now();
+        let mut down = Downlink::default();
+        let mut reserved = voice_stream(1);
+        reserved.phase = DownPhase::PendingAdd;
+        reserved.reserved = true;
+        reserved.source = None;
+        down.insert(reserved);
+        down.quiet_since = Some(t0);
+        assert!(!down.has_urgent());
+        assert!(down.quiet_due(KEY, t0), "before the first offer all is due");
+
+        down.offered = true;
+        assert!(!down.quiet_due(KEY, t0 + Duration::from_secs(2)));
+        let due = QUIET_OFFER_DELAY + Duration::from_millis(300);
+        assert!(!down.quiet_due(KEY, t0 + due - Duration::from_millis(1)));
+        assert!(down.quiet_due(KEY, t0 + due), "three seconds and its share");
+
+        // A voice that has a source to send is urgent, so is a camera's removal.
+        down.get_mut(0).unwrap().reserved = false;
+        assert!(down.has_urgent());
+        let mut camera = voice_stream(2);
+        camera.ty = TrackType::Video;
+        camera.phase = DownPhase::PendingRemove;
+        let mut quiet = Downlink::default();
+        quiet.insert(camera);
+        assert!(quiet.has_urgent());
+    }
+
+    #[test]
+    fn dropping_an_active_voice_queues_a_quiet_removal() {
+        let t0 = Instant::now();
+        let mut down = Downlink::default();
+        let id = down.insert(voice_stream(3));
+        down.offered = true;
+        down.drop_stream(id, t0);
+        assert_eq!(down.quiet_since, Some(t0));
+        assert!(!down.has_urgent());
+        assert!(down.quiet_due(KEY, t0 + Duration::from_secs(4)));
     }
 
     #[test]

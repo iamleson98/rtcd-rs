@@ -479,7 +479,9 @@ impl Engine {
         if s.phase != Phase::Idle || !s.down.ready {
             return;
         }
-        if !s.down.has_pending() {
+        // Nothing that cannot wait, and no silent voice change whose wait is over (see
+        // `QUIET_OFFER_DELAY`): the session is not offered anything yet.
+        if !s.down.has_urgent() && !s.down.quiet_due(key, now) {
             s.wants_offer_since = None;
             return;
         }
@@ -504,6 +506,9 @@ impl Engine {
             self.offers_left -= 1;
         }
         s.wants_offer_since = None;
+        // Everything pending goes into this offer, the quiet changes with it.
+        s.down.offered = true;
+        s.down.quiet_since = None;
         let began = Instant::now();
         self.metrics.signaling_lock_grab_time(
             &s.cfg.group_id,
