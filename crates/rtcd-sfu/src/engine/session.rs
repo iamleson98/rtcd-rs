@@ -160,6 +160,10 @@ pub(crate) struct Uplink {
     pub out_ids: HashMap<TrackType, String>,
     /// The participant is muted: its voice is dropped.
     pub muted: bool,
+    /// An offer of the participant has an audio section it sends its voice in, whether or not a
+    /// packet of it has arrived: receivers are given a reserved stream for it at once, so the
+    /// first word of the class renegotiates nobody (see `DownStream::reserved`).
+    pub voice_offered: bool,
     pub vad: Option<Monitor>,
     pub audio_level_ext: Option<u8>,
     /// Whether the large layer of the camera has stopped while the small one flows.
@@ -205,6 +209,10 @@ pub(crate) struct DownStream {
     /// How many packets are still to be sent alone, because the ones before them are not what the
     /// receiver was sent (the stream switched source or went on after a gap).
     pub red_hold: usize,
+    /// A voice stream that is in the connection ahead of its sender's first packet: it has no
+    /// source and is in no fan yet. The first packet only gives it a source (`Engine::sync_stream`),
+    /// no offer is needed.
+    pub reserved: bool,
     /// The source currently feeding the stream.
     pub source: Option<u32>,
     /// The source the stream is waiting to be moved onto, at its next keyframe.

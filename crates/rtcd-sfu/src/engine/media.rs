@@ -20,6 +20,7 @@ use super::record::Tap;
 use super::session::SessionKey;
 use super::session::{DownPhase, DownStream, Lifecycle, Session, Source, SourceKey, SubRef};
 use super::types::CloseReason;
+use super::video::Want;
 use crate::ids::{TrackType, track_id};
 use crate::layers::Layer;
 use crate::metrics::Direction;
@@ -437,7 +438,9 @@ impl Engine {
             return;
         };
         for ty in &types {
-            if !s.up.sources.iter().any(|x| x.ty == *ty) {
+            // A voice still offered keeps its id: its receivers hold a reserved stream under it.
+            let reserved = *ty == TrackType::Voice && s.up.voice_offered;
+            if !reserved && !s.up.sources.iter().any(|x| x.ty == *ty) {
                 s.up.out_ids.remove(ty);
             }
         }
@@ -541,12 +544,33 @@ impl Engine {
                     && d.ty == ty
                     && !matches!(d.phase, DownPhase::PendingRemove | DownPhase::Removing)
             })
-            .map(|(id, d)| (id, d.source, d.target, d.codec.mime_type.clone()));
+            .map(|(id, d)| {
+                (
+                    id,
+                    d.source,
+                    d.target,
+                    d.codec.mime_type.clone(),
+                    d.reserved,
+                )
+            });
         match (have, want) {
             (None, None) => {}
             (Some((id, ..)), None) => self.detach_stream(receiver, id),
-            (None, Some(src)) => self.attach_stream(receiver, publisher, ty, src, now),
-            (Some((id, source, target, mime)), Some(src)) => {
+            (None, Some(Want::Source(src))) => {
+                self.attach_stream(receiver, publisher, ty, src, now)
+            }
+            (None, Some(Want::Reserved)) => self.attach_reserved(receiver, publisher),
+            // The reservation is kept until the first packet gives it a source.
+            (Some((_, _, _, _, true)), Some(Want::Reserved)) => {}
+            (Some((id, _, _, mime, true)), Some(Want::Source(src))) => {
+                self.fill_reserved(receiver, publisher, id, src, &mime, now)
+            }
+            // A stream that had a source it no longer has: replaced by a reservation.
+            (Some((id, ..)), Some(Want::Reserved)) => {
+                self.detach_stream(receiver, id);
+                self.attach_reserved(receiver, publisher);
+            }
+            (Some((id, source, target, mime, false)), Some(Want::Source(src))) => {
                 if target.or(source) == Some(src) {
                     return;
                 }
@@ -564,6 +588,91 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Adds a voice stream that has no source yet: the publisher offered audio to send its voice
+    /// in, so the stream goes into the connection now and the first packet needs no offer.
+    fn attach_reserved(&mut self, receiver: SessionKey, publisher: SessionKey) {
+        let ssrc = self.rng.ssrc();
+        let Some(p) = self.sessions.get(publisher) else {
+            return;
+        };
+        let Some(out_track_id) = p.up.out_ids.get(&TrackType::Voice).cloned() else {
+            return;
+        };
+        let stream = DownStream {
+            publisher,
+            publisher_session_id: p.cfg.session_id.clone(),
+            ty: TrackType::Voice,
+            out_track_id,
+            ssrc,
+            codec: opus_codec().rtp_codec,
+            phase: DownPhase::PendingAdd,
+            sender: None,
+            payload_type_known: false,
+            red_payload_type: None,
+            red_hold: red::MAX_REDUNDANT,
+            reserved: true,
+            source: None,
+            target: None,
+            rewrite: Rewriter::new(ssrc, 0, false),
+            temporal: Default::default(),
+            paused: false,
+            paused_at: None,
+            pausing: false,
+            budget_small: false,
+        };
+        let Some(r) = self.sessions.get_mut(receiver) else {
+            return;
+        };
+        r.down.insert(stream);
+        self.mark_dirty(receiver);
+    }
+
+    /// The first packet of a voice arrived: its reserved stream is fed from it. Nothing is
+    /// offered: the stream is, or is about to be, in the connection as it was reserved.
+    fn fill_reserved(
+        &mut self,
+        receiver: SessionKey,
+        publisher: SessionKey,
+        stream: u32,
+        source: u32,
+        mime: &str,
+        now: Instant,
+    ) {
+        let Some(codec) = self
+            .sessions
+            .get(publisher)
+            .and_then(|p| p.up.sources.iter().find(|x| x.id == source))
+            .map(|x| x.codec.mime_type.clone())
+        else {
+            return;
+        };
+        if !codec.eq_ignore_ascii_case(mime) {
+            // Not the codec the stream was reserved for: replace it.
+            self.detach_stream(receiver, stream);
+            self.attach_stream(receiver, publisher, TrackType::Voice, source, now);
+            return;
+        }
+        let Some(ds) = self
+            .sessions
+            .get_mut(receiver)
+            .and_then(|r| r.down.get_mut(stream))
+        else {
+            return;
+        };
+        ds.reserved = false;
+        ds.source = Some(source);
+        let Some(fan) = self.fanout.get_mut(&SourceKey {
+            session: publisher,
+            source,
+        }) else {
+            return;
+        };
+        fan.serving.push(SubRef {
+            session: receiver,
+            stream,
+        });
     }
 
     fn attach_stream(

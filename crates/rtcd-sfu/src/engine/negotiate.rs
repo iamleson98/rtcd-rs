@@ -20,7 +20,7 @@ use super::Engine;
 use super::session::{DownPhase, OfferTurn, SessionKey};
 use super::signaling::{Channel, Phase};
 use super::types::CloseReason;
-use crate::ids::{TrackType, parse_track_id};
+use crate::ids::{TrackType, parse_track_id, track_id};
 use crate::metrics::Direction;
 use crate::peer::{opus_codec, red_codec};
 use crate::red::RED_PAYLOAD_TYPE;
@@ -38,6 +38,41 @@ fn answered_red(sdp: &str, mid: &str) -> bool {
                 .skip(3)
                 .any(|pt| pt.parse() == Ok(RED_PAYLOAD_TYPE))
         })
+}
+
+/// Whether the offer `sdp` has an audio section its sender sends its voice in: one that is not
+/// rejected, is not receive-only or inactive, and carries a stream other than the screen share's
+/// (`screen_stream_id`, empty when none is announced), so it is the microphone and not the sound of
+/// a shared screen.
+fn offers_voice(sdp: &str, screen_stream_id: &str) -> bool {
+    sdp.split("\nm=").skip(1).any(|section| {
+        let mut lines = section.lines().map(str::trim_end);
+        let mut head = lines.next().unwrap_or_default().split_whitespace();
+        if head.next() != Some("audio") || head.next() == Some("0") {
+            return false;
+        }
+        let lines: Vec<&str> = lines.collect();
+        if lines
+            .iter()
+            .any(|l| matches!(*l, "a=recvonly" | "a=inactive"))
+        {
+            return false;
+        }
+        // A stream the section names in `a=msid`, or failing that in its `a=ssrc` lines; one that
+        // names none is not the screen's, as when a track is opened.
+        let stream = lines
+            .iter()
+            .find_map(|l| l.strip_prefix("a=msid:"))
+            .or_else(|| {
+                lines
+                    .iter()
+                    .filter(|l| l.starts_with("a=ssrc:"))
+                    .find_map(|l| l.split_once(" msid:").map(|(_, m)| m))
+            })
+            .and_then(|m| m.split_whitespace().next())
+            .unwrap_or_default();
+        screen_stream_id.is_empty() || stream != screen_stream_id
+    })
 }
 
 /// A hostile client can send unreadable descriptions by the thousand; one is logged per session
@@ -156,6 +191,7 @@ impl Engine {
             debug!(session = %s.cfg.session_id, "signaling conflict, ignoring offer");
             return;
         }
+        let voice = offers_voice(&offer.sdp, &s.up.screen_stream_id);
         let result = (|| -> rtc::shared::error::Result<()> {
             s.pc.set_remote_description(now, offer)?;
             Ok(())
@@ -183,7 +219,29 @@ impl Engine {
         }
         self.register_ufrag(key);
         self.send_local_description(key, via, now);
+        self.voice_announced(key, voice, now);
         self.mark_dirty(key);
+    }
+
+    /// Notes whether the participant's latest offer has an audio section for its voice. While it
+    /// has, every receiver holds a reserved stream for the voice (see `DownStream::reserved`), so
+    /// that its first packet, the first time it unmutes, renegotiates nobody; when the section goes
+    /// the reservations are taken back.
+    fn voice_announced(&mut self, key: SessionKey, offered: bool, now: Instant) {
+        let Some(s) = self.sessions.get_mut(key) else {
+            return;
+        };
+        if s.up.voice_offered == offered {
+            return;
+        }
+        s.up.voice_offered = offered;
+        if offered {
+            let entropy = self.rng.next_u64();
+            s.up.out_ids
+                .entry(TrackType::Voice)
+                .or_insert_with(|| track_id(TrackType::Voice, &s.cfg.session_id, entropy));
+        }
+        self.sync_call_stream(key, TrackType::Voice, now);
     }
 
     fn on_answer(&mut self, key: SessionKey, answer: RTCSessionDescription, now: Instant) {
@@ -647,7 +705,7 @@ pub(crate) fn with_audio_ptime(sdp: &str, ms: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{answered_red, with_audio_ptime, with_opus_dtx};
+    use super::{answered_red, offers_voice, with_audio_ptime, with_opus_dtx};
 
     #[test]
     fn dtx_is_added_to_opus_only() {
@@ -708,6 +766,48 @@ mod tests {
         let sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=recvonly\r\na=ptime:20\r\n";
         assert_eq!(with_audio_ptime(sdp, 40), sdp);
         assert_eq!(with_audio_ptime(BROWSER_ANSWER, 0), BROWSER_ANSWER);
+    }
+
+    fn audio(attrs: &str) -> String {
+        format!(
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\n{attrs}a=rtpmap:111 opus/48000/2\r\n"
+        )
+    }
+
+    #[test]
+    fn a_microphone_section_is_a_voice_offered() {
+        let mic = audio("a=sendrecv\r\na=msid:stream mic\r\n");
+        assert!(offers_voice(&format!("v=0\r\n{mic}"), ""));
+        assert!(offers_voice(&format!("v=0\r\n{mic}"), "screen"));
+        let ssrc_only = audio("a=sendonly\r\na=ssrc:1 msid:stream mic\r\n");
+        assert!(offers_voice(&format!("v=0\r\n{ssrc_only}"), "screen"));
+        let none_named = audio("");
+        assert!(offers_voice(&format!("v=0\r\n{none_named}"), "screen"));
+    }
+
+    #[test]
+    fn sound_of_the_screen_and_sections_that_do_not_send_are_not() {
+        let screen = audio("a=sendonly\r\na=msid:screen sound\r\n");
+        assert!(!offers_voice(&format!("v=0\r\n{screen}"), "screen"));
+        let receiving = audio("a=recvonly\r\na=msid:stream mic\r\n");
+        assert!(!offers_voice(&format!("v=0\r\n{receiving}"), ""));
+        let inactive = audio("a=inactive\r\na=msid:stream mic\r\n");
+        assert!(!offers_voice(&format!("v=0\r\n{inactive}"), ""));
+        let rejected = "m=audio 0 UDP/TLS/RTP/SAVPF 111\r\na=sendrecv\r\n";
+        assert!(!offers_voice(&format!("v=0\r\n{rejected}"), ""));
+        let video = "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=sendrecv\r\na=msid:stream cam\r\n";
+        assert!(!offers_voice(&format!("v=0\r\n{video}"), ""));
+        assert!(!offers_voice("v=0\r\n", ""));
+    }
+
+    #[test]
+    fn a_microphone_beside_the_sound_of_the_screen_is_still_a_voice() {
+        let sdp = format!(
+            "v=0\r\n{}{}",
+            audio("a=sendonly\r\na=msid:screen sound\r\n"),
+            audio("a=sendrecv\r\na=msid:stream mic\r\n")
+        );
+        assert!(offers_voice(&sdp, "screen"));
     }
 
     #[test]

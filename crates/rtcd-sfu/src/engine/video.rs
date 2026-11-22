@@ -56,19 +56,33 @@ fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, 
     Ok(Option::<Vec<String>>::deserialize(d)?.unwrap_or_default())
 }
 
+/// What a receiver should get of one of a publisher's stream types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Want {
+    /// A stream fed from this source.
+    Source(u32),
+    /// A voice stream with no source yet: the publisher offered audio to send its voice in, and
+    /// its first packet has not come.
+    Reserved,
+}
+
 impl Engine {
-    /// The source `receiver` should be fed of `publisher`'s streams of type `ty`, if any.
+    /// What `receiver` should get of `publisher`'s streams of type `ty`, if anything.
     pub(super) fn desired_source(
         &self,
         receiver: SessionKey,
         publisher: SessionKey,
         ty: TrackType,
-    ) -> Option<u32> {
+    ) -> Option<Want> {
         let p = self.sessions.get(publisher)?;
         let r = self.sessions.get(receiver)?;
         let mut candidates = p.up.sources.iter().filter(|x| x.ty == ty);
         match ty {
-            TrackType::Voice | TrackType::ScreenAudio => candidates.next().map(|x| x.id),
+            TrackType::Voice => candidates
+                .next()
+                .map(|x| Want::Source(x.id))
+                .or_else(|| p.up.voice_offered.then_some(Want::Reserved)),
+            TrackType::ScreenAudio => candidates.next().map(|x| Want::Source(x.id)),
             TrackType::Video => {
                 if r.down
                     .wanted_video
@@ -90,6 +104,7 @@ impl Engine {
                     });
                 let preferred = if small { Layer::Low } else { Layer::High };
                 self.pick_layer(&mut candidates, preferred)
+                    .map(Want::Source)
             }
             TrackType::Screen => {
                 let preferred = if r.down.squeezed || p.up.screen_stall.stalled() {
@@ -98,6 +113,7 @@ impl Engine {
                     r.down.screen_level.level()
                 };
                 self.pick_layer(&mut candidates, preferred)
+                    .map(Want::Source)
             }
         }
     }

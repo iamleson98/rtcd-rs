@@ -10,16 +10,22 @@ use rtcd_proto::dc::DcMessage;
 use rtcd_sfu::engine::CloseReason;
 use support::{Layer, World};
 
-/// Alice is connected and ignores offers; Bob joins with a camera and streams, which makes the SFU
-/// offer his tracks to Alice. Returns Alice's and Bob's indexes, once the offer has reached Alice.
+/// The offer Alice ignores is her second: the first, for Bob's microphone, came when he joined and
+/// she answered it.
+const HELD: usize = 1;
+
+/// Alice is connected; Bob joins with a camera and streams, which makes the SFU offer his camera to
+/// Alice, who ignores that offer. Returns Alice's and Bob's indexes, once the offer has reached her.
 fn alice_ignores_the_offer(w: &mut World) -> (usize, usize) {
     let a = w.join("alice", "call1");
-    w.browsers[a].hold_answers = true;
     let b = w.join_with_camera("bob", "call1");
+    w.run_for(Duration::from_secs(1));
+    assert_eq!(w.browsers[a].offers.len(), HELD, "Bob's microphone");
+    w.browsers[a].hold_answers = true;
     w.stream_video(b, false, 0.5, 30, &[Layer::Low, Layer::High]);
     assert!(
         w.run_until(Duration::from_secs(5), |w| w.browsers[a].offers_received
-            >= 1),
+            > HELD),
         "no offer reached Alice"
     );
     (a, b)
@@ -101,7 +107,11 @@ fn an_offer_nobody_answers_is_waited_for_and_the_session_stays() {
     assert!(!w.request_lock(a), "and still does");
     assert!(w.closed.is_empty(), "{:?}", w.closed);
     assert_eq!(w.engine.session_count(), 2);
-    assert_eq!(w.browsers[a].offers.len(), 1, "one offer, not sent again");
+    assert_eq!(
+        w.browsers[a].offers.len(),
+        HELD + 1,
+        "one offer, not sent again"
+    );
     assert!(w.browsers[b].keyframe_requests.is_empty(), "not live yet");
 
     // The answer comes after all: it is applied, and Bob's video starts at a keyframe.
@@ -138,7 +148,11 @@ fn a_second_late_answer_is_ignored() {
     assert_eq!(w.browsers[b].keyframe_requests.len(), keyframes);
     assert!(w.closed.is_empty(), "{:?}", w.closed);
     w.run_for(Duration::from_secs(200));
-    assert_eq!(w.browsers[a].offers.len(), 1, "nothing is offered again");
+    assert_eq!(
+        w.browsers[a].offers.len(),
+        HELD + 1,
+        "nothing is offered again"
+    );
     assert!(w.closed.is_empty(), "{:?}", w.closed);
 }
 
@@ -197,7 +211,7 @@ fn an_offer_of_the_participants_crossing_the_sfus_is_answered() {
     );
     assert_eq!(w.browsers[a].signaling_conflicts, 0);
     let (first, again) = (
-        w.browsers[a].offers[0].1.clone(),
+        w.browsers[a].offers[HELD].1.clone(),
         w.browsers[a].offers[before].1.clone(),
     );
     assert_offered_again_as_before(&first, &again);
@@ -215,12 +229,18 @@ fn an_offer_is_sent_by_the_websocket_when_its_channel_is_gone() {
     w.stream_video(b, false, 0.5, 30, &[Layer::Low, Layer::High]);
     assert_eq!(w.browsers[a].offers.len(), 0, "the data channel is shut");
 
+    // Bob's microphone is offered first, and his camera in the offer after it: each by the
+    // websocket, once.
     assert!(
         w.run_until(Duration::from_secs(12), |w| w.browsers[a].offers.len() == 1),
         "the offer never came by the websocket"
     );
+    assert!(
+        w.run_until(Duration::from_secs(30), |w| w.browsers[a].offers.len() == 2),
+        "the second offer never came by the websocket"
+    );
     w.run_for(Duration::from_secs(60));
-    assert_eq!(w.browsers[a].offers.len(), 1, "once, not twice");
+    assert_eq!(w.browsers[a].offers.len(), 2, "once each, not twice");
     assert!(
         !w.browsers[b].keyframe_requests.is_empty(),
         "the answer was applied"
@@ -235,17 +255,17 @@ fn an_offer_unanswered_for_good_is_given_up_on_and_the_session_rejoins_by_droppi
 
     // 10 + 20 + 40 + 60 + 60 seconds, then the offer is withdrawn and made again.
     w.run_for(Duration::from_secs(185));
-    assert_eq!(w.browsers[a].offers.len(), 1);
+    assert_eq!(w.browsers[a].offers.len(), HELD + 1);
     w.run_for(Duration::from_secs(10));
     assert_eq!(
         w.browsers[a].offers.len(),
-        2,
+        HELD + 2,
         "offered again after giving up"
     );
     assert!(w.closed.is_empty(), "{:?}", w.closed);
     let (first, again) = (
-        w.browsers[a].offers[0].1.clone(),
-        w.browsers[a].offers[1].1.clone(),
+        w.browsers[a].offers[HELD].1.clone(),
+        w.browsers[a].offers[HELD + 1].1.clone(),
     );
     assert_offered_again_as_before(&first, &again);
 
@@ -262,11 +282,11 @@ fn an_offer_given_up_on_leaves_no_ghost_when_the_stream_ends() {
     let mut w = World::new();
     let (a, b) = alice_ignores_the_offer(&mut w);
     w.run_for(Duration::from_secs(195));
-    assert_eq!(w.browsers[a].offers.len(), 2);
+    assert_eq!(w.browsers[a].offers.len(), HELD + 2);
 
     w.answer_late(a);
     w.run_for(Duration::from_secs(1));
-    let first = w.browsers[a].offers[0].1.clone();
+    let first = w.browsers[a].offers[HELD].1.clone();
     assert_no_ghost_after_leaving(&mut w, a, b, &first);
     assert_eq!(w.closed, only_bob_left());
 }

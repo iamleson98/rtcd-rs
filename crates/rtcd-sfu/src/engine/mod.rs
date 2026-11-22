@@ -61,8 +61,9 @@ pub enum Load {
 }
 
 /// How many offers the engine makes per turn (see [`Engine::begin_turn`]). An offer costs about a
-/// millisecond (applying the tracks, the description, its rewrites), and when a voice starts every
-/// other session of its call needs one: made in one turn, they would hold the shard away from its
+/// millisecond (applying the tracks, the description, its rewrites), and when a microphone joins
+/// (a voice is announced by the participant's offer, not by its first packet) every other session
+/// of its call needs one: made in one turn, they would hold the shard away from its
 /// sockets for as long as all of them take, and the media already flowing would arrive late, in a
 /// bunch. The sessions that do not fit wait in a queue that the next turns work through, in order.
 pub const MAX_OFFERS_PER_TURN: usize = 2;

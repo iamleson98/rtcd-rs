@@ -267,7 +267,8 @@ fn a_newcomer_gets_everyone_in_one_offer() {
     for info in late_browser.media_maps[0].values() {
         assert_eq!(info.kind, "voice");
     }
-    // The others each get one more offer, for the newcomer's microphone, once it sends.
+    // The others each got one more offer, for the newcomer's microphone, when it joined: its first
+    // words need no other.
     talk(&mut w, late);
     for i in 0..4 {
         talk(&mut w, i);
@@ -281,6 +282,119 @@ fn a_newcomer_gets_everyone_in_one_offer() {
             w.browsers[i].name
         );
     }
+}
+
+/// How many offers each browser of `members` has been sent.
+fn offers_of(w: &World, members: &[usize]) -> Vec<usize> {
+    members
+        .iter()
+        .map(|&i| w.browsers[i].offers_received)
+        .collect()
+}
+
+#[test]
+fn a_first_voice_renegotiates_nobody_and_is_forwarded_at_once() {
+    let mut w = World::new();
+    let members: Vec<usize> = (0..20).map(|n| w.join(&format!("m{n}"), "call1")).collect();
+    // Every microphone was offered at the join: the streams are in place, silent, once the
+    // negotiation has settled.
+    w.run_for(Duration::from_secs(2));
+    let before = offers_of(&w, &members);
+    assert!(before.iter().all(|&n| n > 0), "{before:?}");
+
+    let speaker = members[0];
+    let mut sent = Vec::new();
+    for n in 0..50u32 {
+        sent.push((n, w.now));
+        w.send_voice(speaker, n);
+        w.run_for(Duration::from_millis(20));
+    }
+    assert_eq!(
+        offers_of(&w, &members),
+        before,
+        "the first voice made no offer"
+    );
+    for &l in &members[1..] {
+        let b = &w.browsers[l];
+        for &(n, at) in &sent {
+            assert_eq!(
+                b.voice_heard.get(&n),
+                Some(&at),
+                "{} did not hear frame {n} when it was sent",
+                b.name
+            );
+        }
+        assert_eq!(b.tracks.len(), 1, "{} opened the voice once", b.name);
+    }
+}
+
+#[test]
+fn a_latecomer_is_offered_every_voice_in_its_first_offer_whether_or_not_it_has_spoken() {
+    let mut w = World::new();
+    for name in ["a", "b", "c"] {
+        w.join(name, "call1");
+    }
+    w.run_for(Duration::from_secs(1));
+    let late = w.join("late", "call1");
+    w.run_for(Duration::from_secs(1));
+    let b = &w.browsers[late];
+    assert_eq!(b.offers_received, 1, "three voices, one round trip");
+    assert_eq!(b.media_maps.len(), 1);
+    assert_eq!(b.media_maps[0].len(), 3);
+    for info in b.media_maps[0].values() {
+        assert_eq!(info.kind, "voice");
+    }
+}
+
+#[test]
+fn the_sound_of_a_screen_is_not_a_voice() {
+    let mut w = World::new();
+    let a = w.join("alice", "call1");
+    let b = w.join("bob", "call1");
+    w.stop_microphone(a);
+    w.run_for(Duration::from_secs(1));
+    let offers = w.browsers[b].offers_received;
+
+    w.share_screen_audio(a);
+    w.run_for(Duration::from_secs(1));
+    assert_eq!(
+        w.browsers[b].offers_received, offers,
+        "no stream is held for sound that is not a microphone"
+    );
+    let late = w.join("late", "call1");
+    w.run_for(Duration::from_secs(1));
+    assert!(
+        w.browsers[late]
+            .media_maps
+            .iter()
+            .all(|m| m.values().all(|i| i.sender_id != "session-alice")),
+        "{:?}",
+        w.browsers[late].media_maps
+    );
+}
+
+#[test]
+fn a_microphone_that_leaves_the_connection_gives_its_stream_back() {
+    let mut w = World::new();
+    let members: Vec<usize> = ["a", "b", "c"].iter().map(|n| w.join(n, "call1")).collect();
+    w.run_for(Duration::from_secs(1));
+    let before = offers_of(&w, &members[..2]);
+
+    w.stop_microphone(members[2]);
+    w.run_for(Duration::from_secs(1));
+    let after = offers_of(&w, &members[..2]);
+    assert!(
+        before.iter().zip(&after).all(|(b, a)| a == &(b + 1)),
+        "the others were offered the removal once: {before:?} -> {after:?}"
+    );
+
+    let late = w.join("late", "call1");
+    w.run_for(Duration::from_secs(1));
+    assert_eq!(
+        w.browsers[late].media_maps[0].len(),
+        2,
+        "the one without a microphone is not offered"
+    );
 }
 
 #[test]
@@ -443,11 +557,13 @@ fn the_sfu_waits_for_a_participant_holding_the_lock_before_offering() {
 #[test]
 fn a_participant_that_never_unlocks_does_not_block_the_sfu_forever() {
     let mut w = World::new();
-    let a = w.join("alice", "call1");
+    w.join("alice", "call1");
     let b = w.join("bob", "call1");
     let offers = w.browsers[b].offers_received;
     assert!(w.request_lock(b));
-    talk(&mut w, a);
+    // A newcomer's microphone is something Bob is owed an offer for.
+    w.start("carol", "call1");
+    w.run_for(Duration::from_secs(1));
     // Bob vanishes with the lock; the hold runs out and the offer goes out.
     w.run_for(Duration::from_secs(7));
     assert_eq!(w.browsers[b].offers_received, offers, "still held");

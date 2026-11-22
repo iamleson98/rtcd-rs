@@ -1118,6 +1118,60 @@ impl World {
         self.renegotiate(i);
     }
 
+    /// Browser `i` shares the sound of its screen: announces the screen's stream and offers an
+    /// audio section in it, as the client does (the sound is not the microphone).
+    pub fn share_screen_audio(&mut self, i: usize) {
+        let stream_id = format!("screen-stream-{}", self.browsers[i].name);
+        self.signal(
+            i,
+            MessageType::ScreenOn,
+            serde_json::to_vec(&serde_json::json!({ "screenStreamID": stream_id })).unwrap(),
+        );
+        let name = self.browsers[i].name.clone();
+        let track = MediaStreamTrack::new(
+            stream_id,
+            format!("screen-audio-{name}"),
+            format!("screen-audio-{name}"),
+            RtpCodecKind::Audio,
+            vec![RTCRtpEncodingParameters {
+                rtp_coding_parameters: RTCRtpCodingParameters {
+                    ssrc: Some(4000 + i as u32),
+                    ..Default::default()
+                },
+                codec: RTCRtpCodec {
+                    mime_type: "audio/opus".into(),
+                    clock_rate: 48000,
+                    channels: 2,
+                    sdp_fmtp_line: "minptime=10;useinbandfec=1".into(),
+                    rtcp_feedback: vec![],
+                },
+                ..Default::default()
+            }],
+        );
+        self.browsers[i]
+            .pc
+            .add_transceiver_from_track(
+                track,
+                Some(RTCRtpTransceiverInit {
+                    direction: RTCRtpTransceiverDirection::Sendonly,
+                    streams: vec![],
+                    send_encodings: vec![],
+                }),
+            )
+            .expect("an audio transceiver");
+        self.renegotiate(i);
+    }
+
+    /// Browser `i` takes its microphone off the connection and offers, so it no longer sends audio.
+    pub fn stop_microphone(&mut self, i: usize) {
+        let mic = self.browsers[i].mic;
+        self.browsers[i]
+            .pc
+            .remove_track(mic)
+            .expect("the microphone is removed");
+        self.renegotiate(i);
+    }
+
     /// Browser `i` offers, as the client does: it takes the signaling lock, sends the offer over the
     /// data channel, applies the answer and releases the lock.
     pub fn renegotiate(&mut self, i: usize) {
