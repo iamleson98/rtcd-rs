@@ -410,3 +410,15 @@ async fn the_metrics_endpoint_serves_prometheus_text() {
     }
     s.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_connection_is_greeted_with_the_same_instance_id() {
+    let s = TestServer::start().await;
+    s.register("lms").await;
+    let first = s.connect("lms").await;
+    let second = s.connect("lms").await;
+    assert!(!first.instance_id.is_empty());
+    assert_eq!(first.instance_id, second.instance_id);
+    assert_ne!(first.conn_id, second.conn_id);
+    s.shutdown().await;
+}

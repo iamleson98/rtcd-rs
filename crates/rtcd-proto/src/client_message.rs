@@ -7,11 +7,15 @@ use crate::pack::{
 };
 
 /// The first message on a connection, from the service to the client: who it is and which
-/// connection this is (the id a reconnect refers to).
+/// connection this is (the id a reconnect refers to), and which process answers it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hello {
     pub client_id: String,
     pub conn_id: String,
+    /// Names the service process, the same on every connection until it restarts: a client that
+    /// sees it change knows every session it had here is gone. Empty from a service that does not
+    /// say (the Go one).
+    pub instance_id: String,
 }
 
 /// A request to start a session, from the client (the Mattermost side) to the service.
@@ -177,7 +181,11 @@ impl ClientMessage {
         match self {
             Self::Hello(h) => write_str_map(
                 &mut out,
-                &[("clientID", &h.client_id), ("connID", &h.conn_id)],
+                &[
+                    ("clientID", &h.client_id),
+                    ("connID", &h.conn_id),
+                    ("instanceID", &h.instance_id),
+                ],
             ),
             Self::Join(j) => {
                 rmp::encode::write_map_len(&mut out, 9).expect("vec write");
@@ -257,6 +265,7 @@ impl ClientMessage {
                 Self::Hello(Hello {
                     client_id: lookup_string(map, "clientID"),
                     conn_id: lookup_string(map, "connID"),
+                    instance_id: lookup_string(map, "instanceID"),
                 })
             }
             "join" => {
@@ -388,6 +397,7 @@ mod tests {
             ClientMessage::Hello(Hello {
                 client_id: "a".into(),
                 conn_id: "b".into(),
+                instance_id: "i".into(),
             }),
             ClientMessage::Join(JoinRequest {
                 call_id: "c".into(),

@@ -321,6 +321,42 @@ fn a_screen_share_reaches_everyone_and_ends_cleanly() {
     );
 }
 
+#[test]
+fn a_receiver_can_turn_screen_shares_off_and_on() {
+    let mut w = World::new();
+    let a = w.join("alice", "call1");
+    let b = w.join("bob", "call1");
+    w.share_screen(a);
+    w.run_for(Duration::from_secs(1));
+    w.stream_video(a, true, 1.0, 30, &BOTH);
+    assert!(!video_of(&w, b, "screen_").is_empty());
+
+    let offers = w.browsers[b].offers_received;
+    let off = serde_json::json!({ "session_ids": [], "low": [], "screen": false });
+    w.signal(
+        b,
+        MessageType::VideoSubscribe,
+        serde_json::to_vec(&off).unwrap(),
+    );
+    w.run_for(Duration::from_secs(1));
+    assert!(
+        w.browsers[b].offers_received > offers,
+        "the share is taken back in an offer"
+    );
+    let seen = video_of(&w, b, "screen_").len();
+    w.stream_video(a, true, 1.0, 30, &BOTH);
+    assert_eq!(
+        video_of(&w, b, "screen_").len(),
+        seen,
+        "nothing more arrives"
+    );
+
+    // A subscription without the field brings it back: older clients keep their shares.
+    subscribe(&mut w, b, &[], &[]);
+    w.stream_video(a, true, 1.0, 30, &BOTH);
+    assert!(video_of(&w, b, "screen_").len() > seen);
+}
+
 /// A retransmission comes a round trip after the packet it replaces, and a screen share sends
 /// hundreds of packets a second: by then the SFU has seen many packets of the stream. The packet
 /// must still be accepted, or a hole never closes and a receiver of the stream is left on a frame
