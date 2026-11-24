@@ -16,7 +16,6 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use rtcd_sfu::engine::QUIET_OFFER_DELAY;
 use support::watch::{Playback, quantile};
 use support::{Path, ScreenPlan, World, engine_config};
 
@@ -143,6 +142,16 @@ fn bottleneck(rate_bps: u64, loss: f64) -> Path {
 /// `change` may alter as the run goes (it is given the time shared so far).
 fn lesson(
     paths: &[Path],
+    change: impl FnMut(&mut World, &[usize], Duration),
+) -> (World, Vec<usize>, Vec<Instant>, Instant) {
+    lesson_after(Duration::ZERO, paths, change)
+}
+
+/// [`lesson`], started `wait` after everyone has joined: the moment within a second at which the
+/// screen is shared moves against the timers of the rig and of the engine.
+fn lesson_after(
+    wait: Duration,
+    paths: &[Path],
     mut change: impl FnMut(&mut World, &[usize], Duration),
 ) -> (World, Vec<usize>, Vec<Instant>, Instant) {
     let mut w = World::with_config(engine_config());
@@ -152,9 +161,7 @@ fn lesson(
     let viewers: Vec<usize> = (0..paths.len())
         .map(|n| w.join(&format!("viewer{n}"), "call1"))
         .collect();
-    // The voice streams the joins reserved are offered once their wait is over (see
-    // `QUIET_OFFER_DELAY`), before anything is measured.
-    w.run_for(QUIET_OFFER_DELAY + Duration::from_secs(2));
+    w.run_for(wait);
     for (&v, &p) in viewers.iter().zip(paths) {
         w.set_path(v, p);
     }
@@ -330,4 +337,73 @@ fn a_link_that_slows_down_mid_lesson_is_followed_within_seconds() {
     let s = seen(&w, viewers[0], &voice, after, judged(start).1);
     s.print("4 then 1.2 Mbit/s, from 10 s after the change");
     assert_served(&s, "4 then 1.2 Mbit/s");
+}
+
+/// Runs `check` (a set of asserts) and names `name` in `failures` if one of them fails, so that
+/// one run of the sweep says at which starts the slow link did not settle.
+fn note_failure(failures: &mut Vec<String>, name: &str, check: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)).is_err() {
+        failures.push(name.to_owned());
+    }
+}
+
+#[test]
+fn a_slow_link_settles_whenever_in_the_second_the_lesson_starts() {
+    let fast = Path {
+        loss: 0.0,
+        jitter: Duration::ZERO,
+        delay: Duration::from_millis(20),
+        rate_bps: None,
+        queue: Duration::ZERO,
+    };
+    let mut failures = Vec::new();
+    for wait_ms in (0..=12_000).step_by(1_000) {
+        let wait = Duration::from_millis(wait_ms);
+        let name = format!("one viewer, started {wait_ms} ms after the joins");
+        let (w, viewers, voice, start) =
+            lesson_after(wait, &[bottleneck(1_500_000, 0.02)], |_, _, _| {});
+        let (from, to) = judged(start);
+        let s = seen(&w, viewers[0], &voice, from, to);
+        s.print(&name);
+        note_failure(&mut failures, &name, || {
+            assert_served(&s, &name);
+            assert!(
+                s.queue.1 <= 0.10,
+                "{name}: the queue's 95th percentile is {:.3} s",
+                s.queue.1
+            );
+            assert!(
+                s.buffered.frames >= 120,
+                "{name}: only {} frames shown in a minute",
+                s.buffered.frames
+            );
+            assert!(
+                s.large_frames() as f64 >= 0.9 * s.buffered.frames as f64,
+                "{name}: the large layer is what is shown: {:?}",
+                s.layers
+            );
+        });
+
+        let name = format!("slow and fast viewer, started {wait_ms} ms after the joins");
+        let (w, viewers, voice, start) =
+            lesson_after(wait, &[bottleneck(1_500_000, 0.02), fast], |_, _, _| {});
+        let (from, to) = judged(start);
+        let slow = seen(&w, viewers[0], &voice, from, to);
+        let quick = seen(&w, viewers[1], &voice, from, to);
+        slow.print(&format!("{name}, slow"));
+        note_failure(&mut failures, &name, || {
+            assert_served(&slow, &name);
+            assert!(
+                slow.queue.1 <= 0.10,
+                "{name}: the slow viewer's queue's 95th percentile is {:.3} s",
+                slow.queue.1
+            );
+            assert!(
+                quick.large_frames() >= 15 * 60 * 95 / 100,
+                "{name}: the fast viewer gets the whole large layer: {:?}",
+                quick.layers
+            );
+        });
+    }
+    assert!(failures.is_empty(), "did not settle: {failures:#?}");
 }
