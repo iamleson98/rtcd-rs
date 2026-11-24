@@ -15,15 +15,15 @@ use rtcd_proto::dc::DcMessage;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use super::session::{DownPhase, SessionKey, Source, SourceKey, SubRef};
+use super::session::{DownPhase, DownStream, Session, SessionKey, Source, SourceKey, SubRef};
 use super::{Engine, Load};
 use crate::camera_budget::{
     self, Camera, CameraSteps, RANK_HOST, RANK_LOUD, RANK_SMALL, RANK_WATCHED,
 };
 use crate::ids::TrackType;
 use crate::layers::{
-    Ladder, Layer, LayerRates, Rung, SCREEN_STALL_AFTER, STALL_AFTER, ScreenInputs, WATCH_EVERY,
-    limit_for_pace, split_budget,
+    Ladder, Layer, LayerRates, NOMINAL_HIGH_RATE, NOMINAL_KEYFRAME_SECONDS, NOMINAL_LOW_RATE, Rung,
+    SCREEN_STALL_AFTER, STALL_AFTER, ScreenInputs, WATCH_EVERY, limit_for_pace, split_budget,
 };
 
 /// The most cameras one receiver may name.
@@ -31,6 +31,24 @@ pub const MAX_VIDEO_SUBSCRIPTIONS: usize = 100;
 /// At most one keyframe request per stream per this long: a sender asked too often spends its
 /// bandwidth on keyframes.
 const KEYFRAME_INTERVAL: Duration = Duration::from_secs(1);
+/// What a keyframe that was sent still needs, once its bits have crossed the receiver's path, to
+/// be whole at the receiver: the viewer's 250 ms timer for asking again for a lost packet, that
+/// one resend through the queue, and some margin.
+const KEYFRAME_REPAIR: Duration = Duration::from_millis(750);
+/// The longest a receiver is left to wait for a keyframe on its way before it is asked for again:
+/// about what a browser's decoder waits before it first asks.
+const KEYFRAME_TRANSIT_MAX: Duration = Duration::from_secs(3);
+/// The round trip taken for a receiver whose path has not measured one.
+const DEFAULT_RTT: f64 = 0.1;
+
+/// How long a keyframe of `keyframe_bits` takes to reach a receiver whose path carries `capacity`
+/// bits per second, at a round trip of `rtt` seconds: the time to cross, a round trip each for the
+/// feedback and the resend, and [`KEYFRAME_REPAIR`], at most [`KEYFRAME_TRANSIT_MAX`]. A receiver
+/// that asks again before this has run out is asking for what is on its way.
+fn keyframe_transit(keyframe_bits: f64, capacity: f64, rtt: f64) -> Duration {
+    let seconds = keyframe_bits / capacity + 2.0 * rtt + KEYFRAME_REPAIR.as_secs_f64();
+    Duration::from_secs_f64(seconds.max(0.0).min(KEYFRAME_TRANSIT_MAX.as_secs_f64()))
+}
 /// A layer that brought a packet this recently flows, for what a camera costs.
 const FLOWING_WITHIN: Duration = Duration::from_secs(2);
 /// Between the once-a-second reviews, a receiver's screen share is looked at again as soon as its
@@ -257,20 +275,65 @@ impl Engine {
         let Some(s) = self.sessions.get(key) else {
             return;
         };
-        let wanted: Vec<_> = s
+        let mut wanted = Vec::new();
+        let mut dropped = 0;
+        for (_, d) in s
             .down
             .iter()
             .filter(|(_, d)| asked.contains(&d.ssrc) && !d.paused)
-            .flat_map(|(_, d)| {
+        {
+            if self.keyframe_in_flight(s, d, now) {
+                dropped += 1;
+                continue;
+            }
+            wanted.extend(
                 [d.source, d.target]
                     .into_iter()
                     .flatten()
-                    .map(|src| (d.publisher, src))
-            })
-            .collect();
+                    .map(|src| (d.publisher, src)),
+            );
+        }
+        for _ in 0..dropped {
+            self.metrics.keyframe_request(false);
+        }
         for (publisher, source) in wanted {
             self.request_keyframe(publisher, source, now, false);
         }
+    }
+
+    /// Whether the keyframe a receiver asks for is already on its way to it: one was sent to the
+    /// stream not longer ago than it takes to cross a path that carries what the receiver's
+    /// estimate says (see [`keyframe_transit`]). Another would queue behind it on the same path and
+    /// only slow it. Never where the stream waits on a switch, or the path's capacity is not
+    /// known, or the size of a keyframe of the source is not (a camera's is, once it has sent one).
+    fn keyframe_in_flight(&self, s: &Session, d: &DownStream, now: Instant) -> bool {
+        let (Some(sent), None, Some(source)) = (d.keyframe_at, d.target, d.source) else {
+            return false;
+        };
+        let estimate = s.estimate.snapshot();
+        let Some(capacity) = estimate.capacity.filter(|&c| c > 0.0) else {
+            return false;
+        };
+        let Some(src) = self
+            .sessions
+            .get(d.publisher)
+            .and_then(|p| p.up.sources.iter().find(|x| x.id == source))
+        else {
+            return false;
+        };
+        let bits = match src.temporal_rates.as_ref().and_then(|t| t.keyframe_bytes) {
+            Some(bytes) => bytes as f64 * 8.0,
+            None if d.ty == TrackType::Screen => {
+                let nominal = match src.layer {
+                    Layer::High => NOMINAL_HIGH_RATE,
+                    Layer::Low => NOMINAL_LOW_RATE,
+                };
+                nominal as f64 * NOMINAL_KEYFRAME_SECONDS
+            }
+            None => return false,
+        };
+        let transit = keyframe_transit(bits, capacity, estimate.rtt.unwrap_or(DEFAULT_RTT));
+        now.saturating_duration_since(sent) < transit
     }
 
     /// The receiver names the cameras it wants (JSON: `session_ids`, and `low` for those it wants
@@ -575,7 +638,7 @@ impl Engine {
     }
 
     /// What the sharer `p` offers of its screen share, rung by rung.
-    fn screen_ladder(p: &super::session::Session, now: Instant) -> Ladder {
+    fn screen_ladder(p: &Session, now: Instant) -> Ladder {
         let rates = |layer: Layer| {
             let src =
                 p.up.sources
@@ -1081,4 +1144,27 @@ fn camera_steps(sources: &[Source], now: Instant) -> CameraSteps {
         single => single,
     };
     CameraSteps::of(low.map(rates), high.map(rates))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_keyframe_takes_its_time_across_the_path_and_a_round_trip_each_way_and_a_repair() {
+        // A megabit over 1.458 Mbit/s is 0.69 s, a round trip of 0.25 s counts twice, and the
+        // repair is 0.75 s.
+        let transit = keyframe_transit(1_000_000.0, 1_458_000.0, 0.25).as_secs_f64();
+        assert!((transit - 1.936).abs() < 0.005, "{transit}");
+        let quick = keyframe_transit(1_000_000.0, 1_458_000.0, 0.1).as_secs_f64();
+        assert!((quick - 1.636).abs() < 0.005, "{quick}");
+    }
+
+    #[test]
+    fn a_keyframe_is_waited_for_no_longer_than_a_browser_is() {
+        assert_eq!(
+            keyframe_transit(1_000_000.0, 100_000.0, 0.1),
+            KEYFRAME_TRANSIT_MAX
+        );
+    }
 }

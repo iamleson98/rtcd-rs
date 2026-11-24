@@ -225,6 +225,10 @@ pub(crate) struct DownStream {
     /// the large one is flowing (see `Engine::apply_camera_level`): `Engine::desired_source` keeps
     /// the stream there until the budget takes it up.
     pub budget_small: bool,
+    /// When the stream was last sent the first packet of a keyframe: that keyframe is still
+    /// crossing the receiver's path for a while, and asking for another meanwhile only adds to
+    /// the queue (see `Engine::receiver_feedback`).
+    pub keyframe_at: Option<Instant>,
 }
 
 /// What the SFU sends a participant.

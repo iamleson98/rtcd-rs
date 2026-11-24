@@ -63,6 +63,9 @@ pub(crate) const QUEUE_SHRINKING: f64 = -0.02;
 /// keyframe sets a queue all at once.
 pub(crate) const QUEUE_SURGING: f64 = 0.15;
 pub(crate) const KEYFRAME_GRACE: Duration = Duration::from_secs(2);
+/// How long after a keyframe was sent its queue is not yet expected to show: the feedback that
+/// reports it is a round trip late, and the pacer spreads the keyframe over a third of a second.
+pub(crate) const KEYFRAME_LAG: Duration = Duration::from_millis(500);
 /// For a few seconds after a temporal layer is added (which costs no keyframe), a queue that grows
 /// past this means the layer did not fit.
 const TRIAL_QUEUE: f64 = 0.08;
@@ -439,6 +442,8 @@ pub struct ScreenLevel {
     /// Until when the queue the large layer's keyframe sets is expected (a keyframe is on its way
     /// to the receiver), or a temporal layer just added is on trial.
     keyframe_grace: Option<Instant>,
+    /// When the keyframe whose queue is explained (see [`ScreenLevel::keyframe_sent`]) was sent.
+    keyframe: Option<Instant>,
     /// Whether the last reading was a queue growing as fast as [`QUEUE_SURGING`] says: one
     /// reading is a burst (a keyframe's first packets), two in a row are a path fed too much.
     surging: bool,
@@ -461,6 +466,7 @@ impl ScreenLevel {
             hold_until: None,
             queued_since: None,
             keyframe_grace: None,
+            keyframe: None,
             surging: false,
             trial_until: None,
             calm_since: None,
@@ -470,8 +476,15 @@ impl ScreenLevel {
 
     /// Whether the path carries less than the receiver is sent (see [`QUEUE_HIGH`]). `room`: the
     /// narrowest link is known to carry far more than is sent (see [`LOSS_ROOM`]), so loss alone,
-    /// with nothing queued, is not congestion.
-    fn congested(&mut self, now: Instant, inputs: &ScreenInputs, room: bool) -> bool {
+    /// with nothing queued, is not congestion. `explained`: seconds of the queue that a keyframe
+    /// the path carries accounts for (see [`ScreenLevel::explained`]); the rest is judged.
+    fn congested(
+        &mut self,
+        now: Instant,
+        inputs: &ScreenInputs,
+        room: bool,
+        explained: f64,
+    ) -> bool {
         let trend = inputs.queue_trend.unwrap_or(0.0);
         if self.trial_until.is_some_and(|t| now < t)
             && inputs.queue.is_some_and(|q| q >= TRIAL_QUEUE)
@@ -479,7 +492,7 @@ impl ScreenLevel {
         {
             return true;
         }
-        let Some(q) = inputs.queue.filter(|&q| q >= QUEUE_HIGH) else {
+        let Some(q) = inputs.queue.filter(|&q| q - explained >= QUEUE_HIGH) else {
             self.queued_since = None;
             self.surging = false;
             return inputs.dropping() && !room;
@@ -500,6 +513,48 @@ impl ScreenLevel {
     pub fn expect_keyframe(&mut self, now: Instant) {
         let until = now + KEYFRAME_GRACE;
         self.keyframe_grace = Some(self.keyframe_grace.map_or(until, |t| t.max(until)));
+    }
+
+    /// A keyframe of the screen was sent to the receiver. Where the path carries the rung it is
+    /// sent on, the queue it leaves is not congestion (see [`ScreenLevel::explained`]): it earns
+    /// that only once, a second one inside the time the first is allowed for earns nothing.
+    pub fn keyframe_sent(&mut self, now: Instant) {
+        let window = Duration::from_secs_f64(KEYFRAME_DRAIN) + KEYFRAME_LAG;
+        if self
+            .keyframe
+            .is_none_or(|t| now.saturating_duration_since(t) >= window)
+        {
+            self.keyframe = Some(now);
+        }
+    }
+
+    /// Seconds of the queue the last keyframe accounts for on rung `current`: nothing unless the
+    /// path's narrowest link is known to carry the rung (and what else is sent). The keyframe
+    /// takes `K / C` seconds to cross, and is not looked for in the first [`KEYFRAME_LAG`]; what
+    /// it leaves drains at what the link carries beyond the load, so the allowance shrinks to
+    /// nothing over that time, at most [`KEYFRAME_DRAIN`]. A queue standing past it is not the
+    /// keyframe's.
+    fn explained(
+        &self,
+        now: Instant,
+        inputs: &ScreenInputs,
+        ladder: &Ladder,
+        current: usize,
+    ) -> f64 {
+        let (Some(capacity), Some(sent)) = (inputs.capacity, self.keyframe) else {
+            return 0.0;
+        };
+        let spare = capacity - (ladder.rate(current) + inputs.other);
+        let keyframe = ladder.keyframe_bits[ladder.rungs[current].0.layer as usize];
+        if spare <= 0.0 || keyframe <= 0.0 {
+            return 0.0;
+        }
+        let drain = (keyframe / spare).min(KEYFRAME_DRAIN);
+        let late = now
+            .saturating_duration_since(sent)
+            .saturating_sub(KEYFRAME_LAG)
+            .as_secs_f64();
+        (keyframe / capacity * (1.0 - late / drain)).max(0.0)
     }
 
     /// Starts the receiver on the top rung from the next decision (the sharp picture it asked
@@ -588,7 +643,8 @@ impl ScreenLevel {
         let room = inputs.link.is_some_and(|c| {
             c * CAPACITY_SHARE >= (ladder.rate(current) + inputs.other) * LOSS_ROOM
         });
-        if self.congested(now, &inputs, room) {
+        let explained = self.explained(now, &inputs, ladder, current);
+        if self.congested(now, &inputs, room, explained) {
             let carried = inputs.acked.map(|a| a - inputs.other);
             let share = HEADROOM
                 .min(1.0 - inputs.queue.unwrap_or(0.0) / DRAIN_SECONDS)
@@ -1687,5 +1743,109 @@ mod tests {
             "ten seconds on, still in it"
         );
         assert_eq!(p.record(at(11), 200.0), 200.0, "and then it is gone");
+    }
+
+    /// A path of 1.458 Mbit/s, which carries the large layer of [`keyframe_ladder`] (1 Mbit/s).
+    const SLOW_LINK: f64 = 1_458_000.0;
+
+    /// A sharer whose large layer (1 Mbit/s, keyframes of 0.4 s of it) a 1.458 Mbit/s path carries.
+    fn keyframe_ladder() -> Ladder {
+        let layer = |total: u64| LayerRates {
+            total: Some(total),
+            temporal: Some([Some(total * 2 / 5), Some(total / 5)]),
+            keyframe_bits: Some(total as f64 * 0.4),
+        };
+        Ladder::new(Some(layer(500_000)), Some(layer(1_000_000)))
+    }
+
+    /// `queue` seconds on the slow link, which carries the rung it is sent, with the trend given.
+    fn slow(queue: f64, trend: f64) -> ScreenInputs {
+        ScreenInputs {
+            queue: Some(queue),
+            queue_trend: Some(trend),
+            capacity: Some(SLOW_LINK),
+            ..clear(1_000_000.0)
+        }
+    }
+
+    /// A receiver pinned to the large layer, a keyframe of which is sent at the returned time.
+    fn keyframed(capacity: Option<f64>) -> (ScreenLevel, Instant) {
+        let mut s = ScreenLevel::new();
+        s.pin_high(true);
+        let t = Instant::now();
+        let inputs = ScreenInputs {
+            capacity,
+            ..slow(0.01, 0.0)
+        };
+        assert_eq!(
+            s.decide(t, inputs, &keyframe_ladder()),
+            rung(Layer::High, None)
+        );
+        s.keyframe_sent(t);
+        (s, t)
+    }
+
+    fn after(t: Instant, ms: u64) -> Instant {
+        t + Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn the_queue_of_a_keyframe_on_a_rung_the_link_carries_is_kept() {
+        let (mut s, t) = keyframed(Some(SLOW_LINK));
+        let l = keyframe_ladder();
+        let top = rung(Layer::High, None);
+        assert_eq!(s.decide(after(t, 1_000), slow(0.23, 0.05), &l), top);
+        assert_eq!(s.decide(after(t, 2_000), slow(0.23, 0.0), &l), top);
+        assert_eq!(s.decide(after(t, 3_000), slow(0.02, -0.1), &l), top);
+    }
+
+    #[test]
+    fn a_queue_above_what_the_keyframe_explains_is_cut() {
+        let (mut s, t) = keyframed(Some(SLOW_LINK));
+        let l = keyframe_ladder();
+        s.decide(after(t, 1_000), slow(0.9, 0.05), &l);
+        assert_ne!(
+            s.decide(after(t, 2_000), slow(0.9, 0.05), &l),
+            rung(Layer::High, None)
+        );
+    }
+
+    #[test]
+    fn a_queue_standing_past_the_drain_is_cut() {
+        let (mut s, t) = keyframed(Some(SLOW_LINK));
+        let l = keyframe_ladder();
+        s.decide(after(t, 3_500), slow(0.3, 0.0), &l);
+        assert_ne!(
+            s.decide(after(t, 4_500), slow(0.3, 0.0), &l),
+            rung(Layer::High, None)
+        );
+    }
+
+    #[test]
+    fn a_second_keyframe_earns_no_allowance() {
+        let (mut s, t) = keyframed(Some(SLOW_LINK));
+        let l = keyframe_ladder();
+        s.keyframe_sent(after(t, 1_000));
+        s.decide(after(t, 2_000), slow(0.23, 0.0), &l);
+        assert_ne!(
+            s.decide(after(t, 3_000), slow(0.23, 0.0), &l),
+            rung(Layer::High, None),
+            "the queue the first explained has drained by now"
+        );
+    }
+
+    #[test]
+    fn a_keyframe_explains_nothing_where_the_link_is_unknown() {
+        let (mut s, t) = keyframed(None);
+        let l = keyframe_ladder();
+        let unknown = |queue, trend| ScreenInputs {
+            capacity: None,
+            ..slow(queue, trend)
+        };
+        s.decide(after(t, 1_000), unknown(0.23, 0.05), &l);
+        assert_ne!(
+            s.decide(after(t, 2_000), unknown(0.23, 0.0), &l),
+            rung(Layer::High, None)
+        );
     }
 }

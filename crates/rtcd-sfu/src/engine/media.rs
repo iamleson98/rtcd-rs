@@ -605,6 +605,7 @@ impl Engine {
             paused_at: None,
             pausing: false,
             budget_small: false,
+            keyframe_at: None,
         };
         let Some(r) = self.sessions.get_mut(receiver) else {
             return;
@@ -1050,6 +1051,14 @@ fn write_down(
     }
     let size = out.marshal_size() as u64;
     let ok = sender.write_rtp(now, out).is_ok();
+    // A keyframe is on its way to the receiver from now: it is not asked for again meanwhile
+    // (see `Engine::receiver_feedback`).
+    if ok && frame.is_some_and(|f| f.key && f.newest) {
+        ds.keyframe_at = Some(now);
+        if ds.ty == TrackType::Screen {
+            r.down.screen_level.keyframe_sent(now);
+        }
+    }
     if ok && !r.dirty {
         r.dirty = true;
         dirty.push(sub.session);
