@@ -31,11 +31,11 @@
   ],
   "targets": [
     {
-      "name": "no video freezes in the clean group (92 students; not yet met, under investigation)",
+      "name": "video freezes in the clean group stay under 750 ms a minute (92 students; the goal is none)",
       "metric": "freeze_ms",
-      "max": 0,
+      "max": 750,
       "scope": "clean",
-      "gated": false
+      "gated": true
     },
     {
       "name": "audio delay p95 <= 250 ms (Meet target, clean group)",

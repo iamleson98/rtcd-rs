@@ -189,8 +189,10 @@ impl Engine {
             call: s.cfg.call_id.clone(),
         };
         let mut recording_over = None;
+        let mut others = Vec::new();
         if let Some(call) = self.calls.get_mut(&call_id) {
             call.members.retain(|&m| m != key);
+            others.clone_from(&call.members);
             call.voices.remove(key);
             if call.screen == Some(key) {
                 call.screen = None;
@@ -214,11 +216,31 @@ impl Engine {
                 }
                 for sub in fan.serving.into_iter().chain(fan.waiting) {
                     if let Some(r) = self.sessions.get_mut(sub.session) {
-                        r.down.drop_stream(sub.stream);
+                        r.down.drop_stream(sub.stream, now);
                     }
                     self.mark_dirty(sub.session);
                 }
             }
+        }
+        // A voice that never sent a packet has no source to find its receivers by: they hold a
+        // reserved stream for it, which ends too.
+        for member in others {
+            let Some(r) = self.sessions.get_mut(member) else {
+                continue;
+            };
+            let reserved: Vec<u32> = r
+                .down
+                .iter()
+                .filter(|(_, d)| d.publisher == key && d.reserved)
+                .map(|(id, _)| id)
+                .collect();
+            if reserved.is_empty() {
+                continue;
+            }
+            for id in reserved {
+                r.down.drop_stream(id, now);
+            }
+            self.mark_dirty(member);
         }
         // The last one out ends the call's recording, after the streams it ended.
         if let Some(rec) = recording_over {

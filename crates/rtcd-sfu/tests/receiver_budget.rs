@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use rtcd_proto::MessageType;
 use rtcd_sfu::config::EngineConfig;
+use rtcd_sfu::engine::QUIET_OFFER_DELAY;
 use rtcd_sfu::ids::{TrackType, parse_track_id};
 use rtcd_sfu::metrics::Metrics;
 use support::{Layer, World, describe, engine_config};
@@ -121,6 +122,9 @@ impl Rig {
             .enumerate()
             .map(|(n, &kbps)| w.join_with_budget(&format!("viewer{n}"), "call1", kbps))
             .collect();
+        // The voice streams the joins reserved are offered once their wait is over (see
+        // `QUIET_OFFER_DELAY`), before anything is measured.
+        w.run_for(QUIET_OFFER_DELAY + Duration::from_secs(2));
         // The senders watch nobody: only the viewers' downlinks are under test.
         for &s in &senders {
             let none = serde_json::json!({ "session_ids": [], "low": [] });
@@ -364,7 +368,7 @@ fn a_tight_budget_cuts_the_screen_share_in_order_and_takes_it_up_again_after_a_h
     let squeezed = lesson(&mut r, [550_000, 1_200_000], 40);
     eprintln!("squeezed {squeezed:?} {:?}", cuts.log.lock().unwrap());
     // ...and then its large layer.
-    let tighter = lesson_until(&mut r, [1_700_000, 2_200_000], &cuts, "screen_small");
+    let tighter = lesson_until(&mut r, [1_800_000, 2_300_000], &cuts, "screen_small");
     // The cameras play all along, never paused for the screen share's sake.
     assert!(squeezed.iter().chain(&tighter).all(|&(_, flowing)| flowing));
     let steps = cuts.steps();

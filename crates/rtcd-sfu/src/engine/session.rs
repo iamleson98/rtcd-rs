@@ -13,10 +13,10 @@ use rtc::rtp_transceiver::{RTCRtpReceiverId, RTCRtpSenderId};
 use rtcd_proto::SessionConfig;
 use rtcd_proto::dc::DcMessage;
 
-use super::CallId;
 use super::route::AddrBudget;
 use super::signaling::{Phase, SignalingLock};
 use super::types::Proto;
+use super::{CallId, QUIET_OFFER_DELAY};
 use crate::bwe::Estimate;
 use crate::camera_budget::{CameraBudget, CameraSteps};
 use crate::ids::TrackType;
@@ -160,6 +160,14 @@ pub(crate) struct Uplink {
     pub out_ids: HashMap<TrackType, String>,
     /// The participant is muted: its voice is dropped.
     pub muted: bool,
+    /// An offer of the participant has an audio section it sends its voice in, whether or not a
+    /// packet of it has arrived: receivers are given a reserved stream for it at once, so the
+    /// first word of the class renegotiates nobody (see `DownStream::reserved`).
+    pub voice_offered: bool,
+    /// The stream ids of the audio sections the participant's last offer sends in (an empty id for
+    /// a section that names none): which of them is the microphone depends on the screen share's
+    /// stream, announced separately, so it is worked out again when that changes.
+    pub audio_streams: Vec<String>,
     pub vad: Option<Monitor>,
     pub audio_level_ext: Option<u8>,
     /// Whether the large layer of the camera has stopped while the small one flows.
@@ -205,6 +213,10 @@ pub(crate) struct DownStream {
     /// How many packets are still to be sent alone, because the ones before them are not what the
     /// receiver was sent (the stream switched source or went on after a gap).
     pub red_hold: usize,
+    /// A voice stream that is in the connection ahead of its sender's first packet: it has no
+    /// source and is in no fan yet. The first packet only gives it a source (`Engine::sync_stream`),
+    /// no offer is needed.
+    pub reserved: bool,
     /// The source currently feeding the stream.
     pub source: Option<u32>,
     /// The source the stream is waiting to be moved onto, at its next keyframe.
@@ -244,6 +256,11 @@ pub(crate) struct Downlink {
     pub no_screen: bool,
     /// Streams were added or removed since the last offer.
     pub changed: bool,
+    /// Since when a silent voice stream has been waiting to be added or removed (see
+    /// `QUIET_OFFER_DELAY`); cleared by an offer.
+    pub quiet_since: Option<Instant>,
+    /// The SFU has made an offer to this session: before the first, everything pending is due.
+    pub offered: bool,
     /// Which layer of a screen share this receiver is sent.
     pub screen_level: ScreenLevel,
     /// When the screen share's layer was last decided.
@@ -255,6 +272,29 @@ pub(crate) struct Downlink {
     pub budget_hold: BudgetHold,
     /// The highest rate the screen share was sent at lately: what the cameras' room is split by.
     pub screen_peak: RecentPeak,
+}
+
+impl DownStream {
+    /// The source `source` ended. Returns whether the stream is over with it: nothing is left to
+    /// feed it, and it is not a voice whose publisher still offers its microphone. That one goes
+    /// back to being a reservation, in the connection as it is, so the next source (or the same
+    /// microphone's next packet) takes it over without an offer.
+    pub fn source_ended(&mut self, source: u32, voice_offered: bool) -> bool {
+        if self.source == Some(source) {
+            self.source = None;
+        }
+        if self.target == Some(source) {
+            self.target = None;
+        }
+        if self.source.is_some() || self.target.is_some() {
+            return false;
+        }
+        if self.ty == TrackType::Voice && voice_offered {
+            self.reserved = true;
+            return false;
+        }
+        true
+    }
 }
 
 impl Downlink {
@@ -285,27 +325,54 @@ impl Downlink {
     }
 
     /// Ends a stream: one that never reached the connection just disappears, one in the
-    /// connection is removed at the next offer.
-    pub fn drop_stream(&mut self, id: u32) {
+    /// connection is removed at the next offer (a voice's, when its quiet time is over).
+    pub fn drop_stream(&mut self, id: u32, now: Instant) {
         let Some(ds) = self.get_mut(id) else { return };
         ds.source = None;
         ds.target = None;
+        let voice = ds.ty == TrackType::Voice;
         match ds.phase {
             DownPhase::PendingAdd => self.streams[id as usize] = None,
             DownPhase::Adding | DownPhase::Active => {
                 ds.phase = DownPhase::PendingRemove;
                 self.changed = true;
+                if voice {
+                    self.quiet_since.get_or_insert(now);
+                }
             }
             DownPhase::PendingRemove | DownPhase::Removing => {}
         }
     }
 
-    /// Whether anything waits for an offer.
-    pub fn has_pending(&self) -> bool {
-        self.streams
-            .iter()
-            .flatten()
-            .any(|s| matches!(s.phase, DownPhase::PendingAdd | DownPhase::PendingRemove))
+    /// Whether something waits for an offer that must not wait: a stream to add or remove that is
+    /// not a silent voice (a reservation, or the removal of a voice).
+    pub fn has_urgent(&self) -> bool {
+        self.streams.iter().flatten().any(|s| match s.phase {
+            DownPhase::PendingAdd => !s.reserved,
+            DownPhase::PendingRemove => s.ty != TrackType::Voice,
+            _ => false,
+        })
+    }
+
+    /// Whether the only thing waiting is a silent voice stream to add (reserved) or to remove.
+    fn has_quiet(&self) -> bool {
+        self.streams.iter().flatten().any(|s| match s.phase {
+            DownPhase::PendingAdd => s.reserved,
+            DownPhase::PendingRemove => s.ty == TrackType::Voice,
+            _ => false,
+        })
+    }
+
+    /// Whether the silent voice changes waiting are due for an offer: before the first offer to
+    /// the session (a latecomer is brought up to date in one), or once they have waited
+    /// [`QUIET_OFFER_DELAY`] and a share of a second that depends on the session `key`.
+    pub fn quiet_due(&self, key: SessionKey, now: Instant) -> bool {
+        let delay = QUIET_OFFER_DELAY + Duration::from_millis(100 * u64::from(key.idx % 10));
+        self.has_quiet()
+            && (!self.offered
+                || self
+                    .quiet_since
+                    .is_none_or(|t| now.saturating_duration_since(t) >= delay))
     }
 }
 
@@ -487,6 +554,117 @@ impl Sessions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peer::opus_codec;
+
+    const KEY: SessionKey = SessionKey {
+        idx: 3,
+        generation: 0,
+    };
+
+    fn voice_stream(source: u32) -> DownStream {
+        DownStream {
+            publisher: SessionKey {
+                idx: 0,
+                generation: 0,
+            },
+            publisher_session_id: "alice".to_owned(),
+            ty: TrackType::Voice,
+            out_track_id: "voice_alice_abc".to_owned(),
+            ssrc: 7,
+            codec: opus_codec().rtp_codec,
+            phase: DownPhase::Active,
+            sender: None,
+            payload_type_known: false,
+            red_payload_type: None,
+            red_hold: 0,
+            reserved: false,
+            source: Some(source),
+            target: None,
+            rewrite: Rewriter::new(7, 0, false),
+            temporal: Default::default(),
+            paused: false,
+            paused_at: None,
+            pausing: false,
+            budget_small: false,
+        }
+    }
+
+    #[test]
+    fn a_voice_whose_source_ends_while_still_offered_becomes_a_reservation_in_place() {
+        let mut down = Downlink::default();
+        let id = down.insert(voice_stream(3));
+        down.changed = false;
+        let ds = down.get_mut(id).unwrap();
+        assert!(!ds.source_ended(3, true), "the stream stays");
+        assert!(ds.reserved && ds.source.is_none() && ds.target.is_none());
+        assert_eq!(ds.out_track_id, "voice_alice_abc", "under the same id");
+        assert_eq!(ds.ssrc, 7);
+        assert_eq!(ds.phase, DownPhase::Active, "still in the connection");
+        assert!(
+            !down.has_urgent() && !down.quiet_due(KEY, Instant::now()),
+            "no removal, no addition, no offer"
+        );
+        assert!(!down.changed);
+    }
+
+    #[test]
+    fn a_silent_voice_waits_for_company_and_anything_else_does_not() {
+        let t0 = Instant::now();
+        let mut down = Downlink::default();
+        let mut reserved = voice_stream(1);
+        reserved.phase = DownPhase::PendingAdd;
+        reserved.reserved = true;
+        reserved.source = None;
+        down.insert(reserved);
+        down.quiet_since = Some(t0);
+        assert!(!down.has_urgent());
+        assert!(down.quiet_due(KEY, t0), "before the first offer all is due");
+
+        down.offered = true;
+        assert!(!down.quiet_due(KEY, t0 + Duration::from_secs(2)));
+        let due = QUIET_OFFER_DELAY + Duration::from_millis(300);
+        assert!(!down.quiet_due(KEY, t0 + due - Duration::from_millis(1)));
+        assert!(down.quiet_due(KEY, t0 + due), "three seconds and its share");
+
+        // A voice that has a source to send is urgent, so is a camera's removal.
+        down.get_mut(0).unwrap().reserved = false;
+        assert!(down.has_urgent());
+        let mut camera = voice_stream(2);
+        camera.ty = TrackType::Video;
+        camera.phase = DownPhase::PendingRemove;
+        let mut quiet = Downlink::default();
+        quiet.insert(camera);
+        assert!(quiet.has_urgent());
+    }
+
+    #[test]
+    fn dropping_an_active_voice_queues_a_quiet_removal() {
+        let t0 = Instant::now();
+        let mut down = Downlink::default();
+        let id = down.insert(voice_stream(3));
+        down.offered = true;
+        down.drop_stream(id, t0);
+        assert_eq!(down.quiet_since, Some(t0));
+        assert!(!down.has_urgent());
+        assert!(down.quiet_due(KEY, t0 + Duration::from_secs(4)));
+    }
+
+    #[test]
+    fn a_voice_whose_publisher_no_longer_offers_it_is_over_with_its_source() {
+        let mut ds = voice_stream(3);
+        assert!(ds.source_ended(3, false));
+    }
+
+    #[test]
+    fn only_the_source_feeding_a_stream_ends_it() {
+        let mut ds = voice_stream(3);
+        assert!(!ds.source_ended(4, false), "another source ended");
+        assert_eq!(ds.source, Some(3));
+        assert!(!ds.reserved);
+        let mut camera = voice_stream(3);
+        camera.ty = TrackType::Video;
+        assert!(camera.source_ended(3, true), "only a voice is held");
+    }
 
     #[test]
     fn the_base_layer_pace_is_the_gap_between_its_frames_or_how_long_it_has_been() {

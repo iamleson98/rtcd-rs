@@ -136,6 +136,24 @@ not its own passes it on. Once a shard has learned a participant's address it op
 connected to that address, bound to the same port, which the kernel serves directly: after the first
 packets almost nothing takes the detour (`rtcd_net_forwarded_packets_total` shows how much does).
 
+## Voice streams are reserved at the join
+
+A participant's offer carries its microphone, so the SFU puts a silent voice stream for it into
+every listener's connection when the offer arrives (and a late joiner is offered every one in its
+first offer), instead of waiting for the first packet: a microphone that was muted at the join and
+is opened later renegotiates nobody, and its first packet is forwarded at once. The reserved
+stream has no source yet; the first packet only gives it one. Audio that is not the microphone (the
+sound of a screen, announced with the screen share) is not reserved, and a stream is taken back
+when the offer that removes the microphone's section arrives, or the participant leaves.
+
+Adding or removing a silent voice stream does not make an offer by itself: it waits
+(`QUIET_OFFER_DELAY`, 3 s, plus up to 0.9 s that depends on the session, as the upkeep that looks at
+it runs once a second) so that one offer per listener carries every join of the window, where an
+offer per join cost a big class most of a second of the shard's every second while it filled. The
+wait ends at once for anything else that needs an offer (a camera, a screen share, a voice that has
+started to send, which carry what is waiting), and a session that has not been offered anything yet
+(a latecomer) is brought up to date in its first offer.
+
 ## Large calls: the loudest voices
 
 Every open microphone is a stream to every listener, so a call of `n` people with `m` microphones

@@ -555,9 +555,9 @@ fn a_late_joiner_is_brought_the_running_share_and_camera_in_one_offer() {
     w.run_for(Duration::from_secs(1));
     assert_eq!(
         w.browsers[late].offers_received, 1,
-        "voice-less, but camera and screen: one offer"
+        "the silent microphone, the camera and the screen: one offer"
     );
-    assert_eq!(w.browsers[late].media_maps[0].len(), 2);
+    assert_eq!(w.browsers[late].media_maps[0].len(), 3);
     w.stream_video(a, true, 1.0, 30, &BOTH);
     w.stream_video(a, false, 1.0, 30, &BOTH);
     assert!(video_of(&w, late, "screen_").len() > 20);
