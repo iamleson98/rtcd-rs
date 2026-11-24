@@ -90,7 +90,7 @@ impl Engine {
             TrackType::Voice => candidates
                 .next()
                 .map(|x| Want::Source(x.id))
-                .or_else(|| p.up.voice_offered.then_some(Want::Reserved)),
+                ,
             TrackType::ScreenAudio => candidates.next().map(|x| Want::Source(x.id)),
             TrackType::Video => {
                 if r.down
