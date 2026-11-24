@@ -46,7 +46,7 @@ use tokio::task::JoinHandle;
 use crate::assets::{Assets, CameraLayers, Clip};
 use crate::host::{Rtcd, RtcdConn};
 use crate::hostile::{self, Hostile, Hot, Rng};
-use crate::stats::{Carried, Probe, Receiver, RtpClock, Worst, wall_ms_at};
+use crate::stats::{Carried, Probe, Receiver, RtpClock, wall_ms_at};
 
 const AUDIO_LEVEL_URI: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
 const MID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
@@ -753,7 +753,6 @@ async fn drive(
     let mut joined = false;
     let mut next_probe = Instant::now() + Duration::from_secs(1);
     let mut probe_ticks = 0u32;
-    let mut worst = Worst::default();
     // The quirks: answers held back, the last offer this try sent, which port of its block it is
     // on, when the next hostile step and the next MTU datagrams are due.
     let mut held: Vec<(Instant, Vec<u8>)> = Vec::new();
@@ -890,7 +889,6 @@ async fn drive(
                     }
                     RTCMessage::DataChannelMessage(_, m) => {
                         if let Ok(DcMessage::Sdp(json)) = DcMessage::decode(&m.data) {
-                            let began = Instant::now();
                             describe(
                                 &mut pc,
                                 &json,
@@ -899,7 +897,6 @@ async fn drive(
                                 (sid, call),
                                 (persist.quirk, &mut held),
                             );
-                            worst.described(began.elapsed());
                         }
                     }
                     _ => {}
@@ -1004,7 +1001,6 @@ async fn drive(
                 for l in 0..v.ssrcs.len() {
                     while v.next[l] <= now {
                         if on {
-                            worst.sent_late(now.saturating_duration_since(v.next[l]));
                             let (seq, ts) = (v.seq[l], v.ts[l]);
                             send_frame(&mut pc, v, l, mask[l % 2]);
                             if let (0, Some(p)) = (l, probe) {
@@ -1174,18 +1170,14 @@ async fn drive(
             },
             m = conn.rx.recv() => match m {
                 Some(ClientMessage::Rtc(m)) if m.session_id == sid => match m.kind {
-                    MessageType::Sdp => {
-                        let began = Instant::now();
-                        describe(
-                            &mut pc,
-                            &m.data,
-                            None,
-                            &conn,
-                            (sid, call),
-                            (persist.quirk, &mut held),
-                        );
-                        worst.described(began.elapsed());
-                    }
+                    MessageType::Sdp => describe(
+                        &mut pc,
+                        &m.data,
+                        None,
+                        &conn,
+                        (sid, call),
+                        (persist.quirk, &mut held),
+                    ),
                     MessageType::Ice => {
                         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&m.data)
                             && let Ok(init) = serde_json::from_value::<RTCIceCandidateInit>(v["candidate"].clone())
@@ -1239,13 +1231,7 @@ async fn drive(
                     .candidate_pairs()
                     .map(|c| c.current_round_trip_time)
                     .fold(0.0, f64::max);
-                rx.write(
-                    p,
-                    &rid,
-                    now,
-                    (rtt > 0.0).then_some(rtt * 1000.0),
-                    &mut worst,
-                );
+                rx.write(p, &rid, now, (rtt > 0.0).then_some(rtt * 1000.0));
             }
         }
     }

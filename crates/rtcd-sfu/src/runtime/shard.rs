@@ -418,7 +418,6 @@ impl Shard {
                 self.sweep_tcp(now);
             }
             self.flush();
-            self.engine.end_turn(self.id, now);
             self.publish_busy(now);
             if self.stopping && self.engine.session_count() == 0 {
                 debug!(shard = self.id, "stopped");
