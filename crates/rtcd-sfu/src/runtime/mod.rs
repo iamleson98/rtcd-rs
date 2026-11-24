@@ -502,9 +502,12 @@ impl Sfu {
         }
         let closed = verdict.refuses_newcomers();
         let saturated = self.core.cfg.refuse_when_saturated;
-        let shard = match self.core.registry.admit_unless(&cfg, &|slot| {
-            closed || (saturated && self.core.table.saturated(slot))
-        }) {
+        let shard = match self.core.registry.admit_ranked(
+            &cfg,
+            &|slot| closed || (saturated && self.core.table.saturated(slot)),
+            &|slot| self.core.table.get(slot).map_or(0.0, |h| h.busy()),
+            self.core.cfg.scaling.sessions_per_shard,
+        ) {
             Ok(shard) => shard,
             Err(err) => {
                 if err == AdmitError::Saturated {
