@@ -75,6 +75,9 @@ pub const MAX_OFFERS_PER_TURN: usize = 2;
 /// them). Anything else that needs an offer, a voice that starts speaking included, goes out at
 /// once and carries what was waiting. Each session adds up to 0.9 s of its own (see
 /// `Downlink::quiet_due`) so the receivers of a big call do not fall due in the same second.
+/// DIAG
+pub static DIAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub const QUIET_OFFER_DELAY: Duration = Duration::from_secs(3);
 
 /// A call: the sessions that hear each other.

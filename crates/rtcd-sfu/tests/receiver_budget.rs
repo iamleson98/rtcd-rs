@@ -359,6 +359,7 @@ fn lesson_until(r: &mut Rig, teacher: [u64; 2], cuts: &Cuts, step: &str) -> Vec<
 #[test]
 fn a_tight_budget_cuts_the_screen_share_in_order_and_takes_it_up_again_after_a_hold() {
     let cuts = Arc::new(Cuts::default());
+    rtcd_sfu::engine::DIAG.store(true, Ordering::Relaxed);
     let mut r = Rig::new(cuts.clone(), &[2400]);
     r.run(WARM_UP);
     let steady = lesson(&mut r, TEACHER, 20);
