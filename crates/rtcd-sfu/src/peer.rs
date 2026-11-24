@@ -166,7 +166,7 @@ pub(crate) fn new_peer(
                     .with_size(cfg.nack_buffer_size)
                     // A receiver that lost packets in an outage asks for all of them when the path
                     // is back; after a second a frame they belonged to has been given up on.
-                    .with_max_packet_age(Duration::from_secs(1))
+                    .with_max_packet_age(Duration::from_secs(3))
                     .build(),
                 cfg.egress.clone(),
             ),
