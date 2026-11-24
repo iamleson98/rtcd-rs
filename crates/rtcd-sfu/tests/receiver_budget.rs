@@ -368,7 +368,7 @@ fn a_tight_budget_cuts_the_screen_share_in_order_and_takes_it_up_again_after_a_h
     let squeezed = lesson(&mut r, [550_000, 1_200_000], 40);
     eprintln!("squeezed {squeezed:?} {:?}", cuts.log.lock().unwrap());
     // ...and then its large layer.
-    let tighter = lesson_until(&mut r, [1_700_000, 2_200_000], &cuts, "screen_small");
+    let tighter = lesson_until(&mut r, [1_800_000, 2_300_000], &cuts, "screen_small");
     // The cameras play all along, never paused for the screen share's sake.
     assert!(squeezed.iter().chain(&tighter).all(|&(_, flowing)| flowing));
     let steps = cuts.steps();
