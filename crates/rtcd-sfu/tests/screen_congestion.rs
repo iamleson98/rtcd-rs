@@ -16,7 +16,6 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use rtcd_sfu::engine::QUIET_OFFER_DELAY;
 use support::watch::{Playback, quantile};
 use support::{Path, ScreenPlan, World, engine_config};
 
@@ -152,9 +151,6 @@ fn lesson(
     let viewers: Vec<usize> = (0..paths.len())
         .map(|n| w.join(&format!("viewer{n}"), "call1"))
         .collect();
-    // The voice streams the joins reserved are offered once their wait is over (see
-    // `QUIET_OFFER_DELAY`), before anything is measured.
-    w.run_for(QUIET_OFFER_DELAY + Duration::from_secs(2));
     for (&v, &p) in viewers.iter().zip(paths) {
         w.set_path(v, p);
     }
