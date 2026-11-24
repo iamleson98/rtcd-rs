@@ -335,11 +335,20 @@ fn a_link_that_slows_down_mid_lesson_is_followed_within_seconds() {
 
 #[test]
 fn diag_sweep() {
-    for shift in [0u64, 500, 1000, 1500, 2000, 3000, 4000, 5000, 7000] {
+    rtcd_sfu::engine::DIAG.store(true, std::sync::atomic::Ordering::Relaxed);
+    for shift in [1000u64, 2000] {
+        eprintln!("== shift {shift}");
         SHIFT.store(shift, std::sync::atomic::Ordering::Relaxed);
         let (w, viewers, voice, start) = lesson(&[bottleneck(1_500_000, 0.02)], |_, _, _| {});
         let (from, to) = judged(start);
         let s = seen(&w, viewers[0], &voice, from, to);
+        let q = &w.browsers[viewers[0]].queue_waits;
+        for k in 0..12u64 {
+            let (f, t) = (start + Duration::from_secs(10 * k), start + Duration::from_secs(10 * k + 10));
+            let mut x: Vec<f64> = q.iter().filter(|(a, _)| *a >= f && *a < t).map(|(_, d)| d.as_secs_f64()).collect();
+            eprintln!("WIN {k} n={} p95={:.3} max={:.3}", x.len(), quantile(&mut x, 0.95), quantile(&mut x, 1.0));
+        }
+        s.print("one");
         eprintln!("SWEEP shift={shift} p95={:.3} p50={:.3} max={:.3}", s.queue.1, s.queue.0, s.queue.2);
     }
     panic!("sweep");
