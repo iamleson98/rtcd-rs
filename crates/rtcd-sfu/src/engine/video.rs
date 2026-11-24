@@ -711,24 +711,6 @@ impl Engine {
         if budget.is_none() && s.down.cameras.limit().is_none() && !path.congested() {
             return;
         }
-        // A camera that is sending but has not been measured yet costs a guess, and the budget is
-        // not held to a guess: whether the first review of a lesson falls before or after the
-        // first measurement (a matter of where the timers happen to stand) must not decide
-        // whether a camera is cut. A congested path is still looked after at once.
-        let warming_up = s.down.iter().any(|(_, d)| {
-            d.ty == TrackType::Video
-                && d.phase == DownPhase::Active
-                && self.sessions.get(d.publisher).is_some_and(|p| {
-                    !p.up.camera_steps.measured()
-                        && p.up
-                            .sources
-                            .iter()
-                            .any(|x| x.ty == TrackType::Video && x.last_packet.is_some())
-                })
-        });
-        if warming_up && !path.congested() {
-            return;
-        }
         let voices = self.calls.get(&s.call).map(|c| &c.voices);
         let mut streams = Vec::new();
         let mut cameras = Vec::new();
