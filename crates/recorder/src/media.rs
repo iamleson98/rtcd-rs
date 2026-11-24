@@ -1201,6 +1201,33 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_that_moves_to_a_new_ssrc_stays_one_file_and_resumes_at_a_keyframe() {
+        let (rec, start) = setup("moved", u64::MAX);
+        let mut s = camera(&rec);
+        // The SFU hands the writer one stream across a move of the layer: the numbers carry on with
+        // one left out, the clock with real time. The new encoder's frames until its keyframe (at
+        // 45) do not decode on the old picture.
+        for i in 0..90u32 {
+            let seq = if i < 30 { i } else { i + 1 };
+            let now = start + Duration::from_millis(33 * u64::from(i));
+            s.packet(vp8_frame(now, seq as u16, i * 3000, i % 45 == 0));
+            s.tick(now);
+        }
+        s.finish(start + Duration::from_secs(4), "test");
+        let files = rec.files();
+        assert_eq!(files.len(), 1, "{files:?}");
+        let times = block_times(&files[0].path);
+        let ms = |frame: i64| frame * 3000 / 90;
+        assert!(times.windows(2).all(|w| w[0] < w[1]), "{times:?}");
+        assert_eq!(times.iter().filter(|t| **t < ms(30)).count(), 30);
+        assert!(
+            times.iter().all(|t| *t < ms(30) || *t >= ms(45)),
+            "{times:?}"
+        );
+        assert!(times.contains(&ms(45)) && times.contains(&ms(89)));
+    }
+
+    #[test]
     fn a_video_packet_that_comes_late_is_not_lost() {
         let (rec, start) = setup("vidlate", u64::MAX);
         let mut s = camera(&rec);

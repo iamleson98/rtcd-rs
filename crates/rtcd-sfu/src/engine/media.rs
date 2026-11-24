@@ -47,10 +47,52 @@ pub(crate) struct Fan {
     pub newest: Option<u16>,
     /// Where a copy of every packet goes, if the stream is being recorded.
     pub tap: Option<Tap>,
+    /// The numbers the copy carries.
+    pub tap_clock: TapClock,
     /// The packets before the current one of a voice, for the redundant audio receivers are sent.
     pub red: red::Encoder,
     /// The payload type the sender's voice is wrapped in as redundant audio, if it negotiated it.
     pub uplink_red: Option<u8>,
+}
+
+/// The sequence numbers and timestamps a recording's writer is given for a video stream. They are
+/// the stream's own until its layer moves to a new SSRC, whose numbers and clock start elsewhere:
+/// from then on they continue from the last packet given, with the time that has passed since
+/// on the clock, so the writer sees one stream. One number is left out at the move: the writer
+/// takes it for a loss, so it waits for a keyframe, as it does after any other, and the packets
+/// of the new stream that come out of order around the move still find their places.
+#[derive(Debug, Default)]
+pub(crate) struct TapClock {
+    /// What the last packet was given, and when it arrived.
+    last: Option<(u16, u32, Instant)>,
+    /// The layer has moved: the next packet sets the offsets.
+    moved: bool,
+    seq: u16,
+    ts: u32,
+}
+
+impl TapClock {
+    pub fn moved(&mut self) {
+        self.moved = true;
+    }
+
+    /// What the writer is given for a packet. `newest`: it is not a retransmission.
+    pub fn stamp(&mut self, seq: u16, ts: u32, newest: bool, now: Instant) -> (u16, u32) {
+        if std::mem::take(&mut self.moved) {
+            (self.seq, self.ts) = self.last.map_or((0, 0), |(s, t, at)| {
+                let ticks = now.saturating_duration_since(at).as_micros() * 9 / 100;
+                (
+                    s.wrapping_add(2).wrapping_sub(seq),
+                    t.wrapping_add(ticks as u32).wrapping_sub(ts),
+                )
+            });
+        }
+        let stamp = (seq.wrapping_add(self.seq), ts.wrapping_add(self.ts));
+        if newest {
+            self.last = Some((stamp.0, stamp.1, now));
+        }
+        stamp
+    }
 }
 
 #[derive(Deserialize)]
@@ -293,6 +335,23 @@ impl Engine {
             let stale = known.id;
             self.remove_source(key, stale, now);
         }
+        // A layer that moves to a new SSRC (an encoder restart) is the same layer of the same
+        // stream: the source it was carries on under the new SSRC.
+        if let Some(rid) = init.rid.as_deref() {
+            let layer = Layer::from_rid(Some(rid));
+            let Some(s) = self.sessions.get(key) else {
+                return;
+            };
+            if let Some(moved) =
+                s.up.sources
+                    .iter()
+                    .find(|x| x.receiver == init.receiver_id && x.layer == layer)
+                    .map(|x| x.id)
+            {
+                self.layer_moved(key, moved, init.ssrc, now);
+                return;
+            }
+        }
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
@@ -407,6 +466,7 @@ impl Engine {
                 resume: false,
                 newest: None,
                 tap: None,
+                tap_clock: TapClock::default(),
                 red: red::Encoder::default(),
                 uplink_red,
             },
@@ -414,6 +474,54 @@ impl Engine {
 
         self.record_sync(key, ty, now);
         self.sync_call_stream(key, ty, now);
+    }
+
+    /// The layer `source` now arrives under `ssrc`. The source, its fan-out and its recording
+    /// stay as they were, so nothing is counted twice and the receivers keep their subscription
+    /// and layer. The new stream has numbers and a clock of its own, so those it feeds join it as
+    /// they join any source, at its next keyframe (`Rewriter::switch_to` carries their sequence
+    /// numbers and clock across), and the sender is asked for one.
+    fn layer_moved(&mut self, key: SessionKey, source: u32, ssrc: u32, now: Instant) {
+        let Some(s) = self.sessions.get_mut(key) else {
+            return;
+        };
+        let Some(src) = s.up.sources.iter_mut().find(|x| x.id == source) else {
+            return;
+        };
+        info!(session = %s.cfg.session_id, ty = %src.ty, layer = ?src.layer, old = src.ssrc, ssrc, "layer moved");
+        s.up.by_ssrc.remove(&src.ssrc);
+        s.up.by_ssrc.insert(ssrc, source);
+        src.ssrc = ssrc;
+        src.last_packet = Some(now);
+        src.last_pli = None;
+        src.bypassed = false;
+        let sk = SourceKey {
+            session: key,
+            source,
+        };
+        let Some(fan) = self.fanout.get_mut(&sk) else {
+            return;
+        };
+        fan.newest = None;
+        fan.resume = false;
+        fan.tap_clock.moved();
+        let serving = std::mem::take(&mut fan.serving);
+        let wanted = !fan.waiting.is_empty() || !serving.is_empty() || fan.tap.is_some();
+        for sub in serving {
+            let Some(ds) = self
+                .sessions
+                .get_mut(sub.session)
+                .and_then(|r| r.down.get_mut(sub.stream))
+            else {
+                continue;
+            };
+            ds.source = None;
+            ds.target = Some(source);
+            fan.waiting.push(sub);
+        }
+        if wanted && fan.ty.is_video() {
+            self.request_keyframe(key, source, now, false);
+        }
     }
 
     /// A participant's track ended.
@@ -694,6 +802,10 @@ impl Engine {
                     newest,
                 )
             });
+            let stamp = fan.tap.map(|_| {
+                fan.tap_clock
+                    .stamp(seq, packet.header.timestamp, newest, now)
+            });
             let fan = &*fan;
             if let Some(s) = self.sessions.get_mut(key) {
                 s.max_fan = s.max_fan.max(fan.serving.len() + fan.waiting.len());
@@ -702,8 +814,8 @@ impl Engine {
             let size = packet.marshal_size() as u64;
             self.metrics.rtp_bytes_received(fan.ty, size);
             // A recorded stream is copied before anything decides whether anyone watches it.
-            if let Some(tap) = fan.tap {
-                self.recordings.packet(tap, &packet, now);
+            if let (Some(tap), Some(stamp)) = (fan.tap, stamp) {
+                self.recordings.packet(tap, &packet, stamp, now);
             }
             if fan.serving.is_empty() && fan.waiting.is_empty() {
                 continue;

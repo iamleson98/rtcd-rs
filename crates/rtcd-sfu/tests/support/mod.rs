@@ -1397,6 +1397,32 @@ impl World {
         }
     }
 
+    /// Restarts a layer of a video sender under a new SSRC, as an encoder restart does: its
+    /// packets carry the same mid and rid, and sequence numbers and clock of a new stream.
+    pub fn move_layer(&mut self, i: usize, screen: bool, layer: Layer, ssrc: u32) {
+        let b = &mut self.browsers[i];
+        let v = if screen {
+            b.screen.as_mut()
+        } else {
+            b.camera.as_mut()
+        }
+        .expect("a video sender");
+        let l = layer as usize;
+        v.ssrcs[l] = ssrc;
+        v.seq[l] = v.seq[l].wrapping_add(4000);
+        v.ts[l] = v.ts[l].wrapping_add(900_000);
+        let mut sender = b.pc.rtp_sender(v.sender).expect("sender");
+        let track_id = sender.track().track_id().to_string();
+        sender
+            .replace_track(video_track(&v.stream_id, &track_id, v.ssrcs))
+            .expect("replace_track");
+        let mut parameters = sender.get_parameters().clone();
+        parameters.encodings[l].rtp_coding_parameters.ssrc = Some(ssrc);
+        sender
+            .set_parameters(parameters, None)
+            .expect("set_parameters");
+    }
+
     /// Sets the sequence numbers of a layer of a video sender back by `by`, as a sender does that
     /// starts its numbers over.
     pub fn rewind_sequence(&mut self, i: usize, screen: bool, layer: Layer, by: u16) {
@@ -1771,12 +1797,8 @@ pub fn voice_number(payload: &[u8]) -> Option<u32> {
         .flatten()
 }
 
-fn video_sender(
-    pc: &mut RTCPeerConnection,
-    stream_id: &str,
-    track_id: &str,
-    ssrcs: [u32; 2],
-) -> VideoSender {
+/// A simulcast camera or screen track: the small layer `l` and the large `h`.
+fn video_track(stream_id: &str, track_id: &str, ssrcs: [u32; 2]) -> MediaStreamTrack {
     let coding = |rid: &str, ssrc: u32| RTCRtpEncodingParameters {
         rtp_coding_parameters: RTCRtpCodingParameters {
             rid: rid.to_owned(),
@@ -1792,13 +1814,22 @@ fn video_sender(
         },
         ..Default::default()
     };
-    let track = MediaStreamTrack::new(
+    MediaStreamTrack::new(
         stream_id.to_owned(),
         track_id.to_owned(),
         track_id.to_owned(),
         RtpCodecKind::Video,
         vec![coding("l", ssrcs[0]), coding("h", ssrcs[1])],
-    );
+    )
+}
+
+fn video_sender(
+    pc: &mut RTCPeerConnection,
+    stream_id: &str,
+    track_id: &str,
+    ssrcs: [u32; 2],
+) -> VideoSender {
+    let track = video_track(stream_id, track_id, ssrcs);
     let id = pc
         .add_transceiver_from_track(
             track,

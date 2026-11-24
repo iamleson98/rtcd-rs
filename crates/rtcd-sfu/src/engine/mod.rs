@@ -183,6 +183,19 @@ impl Engine {
         self.sessions.len()
     }
 
+    /// What the engine keeps for uplink media: sources, SSRC entries and fan-outs. It stays
+    /// bounded by what the senders have, however often a layer moves to a new SSRC.
+    pub fn uplink_sizes(&self) -> (usize, usize, usize) {
+        let (sources, by_ssrc) = self
+            .sessions
+            .keys()
+            .filter_map(|k| self.sessions.get(k))
+            .fold((0, 0), |(a, b), s| {
+                (a + s.up.sources.len(), b + s.up.by_ssrc.len())
+            });
+        (sources, by_ssrc, self.fanout.len())
+    }
+
     /// Applies a command from the service.
     pub fn handle_command(&mut self, now: Instant, cmd: Command) {
         match cmd {
