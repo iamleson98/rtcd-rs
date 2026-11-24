@@ -151,6 +151,7 @@ fn lesson(
     let viewers: Vec<usize> = (0..paths.len())
         .map(|n| w.join(&format!("viewer{n}"), "call1"))
         .collect();
+    w.run_for(Duration::from_secs(5));
     for (&v, &p) in viewers.iter().zip(paths) {
         w.set_path(v, p);
     }
