@@ -2284,7 +2284,6 @@ version = "0.22.0"
 dependencies = [
  "byteorder",
  "bytes",
- "foldhash",
  "rtc-crypto",
  "rtc-rtcp",
  "rtc-rtp",
