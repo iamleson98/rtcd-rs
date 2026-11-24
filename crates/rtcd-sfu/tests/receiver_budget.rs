@@ -355,6 +355,7 @@ fn lesson_until(r: &mut Rig, teacher: [u64; 2], cuts: &Cuts, step: &str) -> Vec<
 #[test]
 fn a_tight_budget_cuts_the_screen_share_in_order_and_takes_it_up_again_after_a_hold() {
     let cuts = Arc::new(Cuts::default());
+    rtcd_sfu::engine::DIAG.store(true, Ordering::Relaxed);
     let mut r = Rig::new(cuts.clone(), &[2400]);
     r.run(WARM_UP);
     let steady = lesson(&mut r, TEACHER, 20);
@@ -390,4 +391,5 @@ fn a_tight_budget_cuts_the_screen_share_in_order_and_takes_it_up_again_after_a_h
     assert!(back < 60);
     let early = &relief[..(10 + cut_at).saturating_sub(relief_at) as usize];
     assert!(early.iter().all(|&(kbps, _)| kbps < 1000), "{early:?}");
+    panic!("diag: master run {:?} {:?}", cuts.log.lock().unwrap(), steps);
 }

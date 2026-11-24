@@ -529,11 +529,47 @@ impl Engine {
         };
         let before = s.down.screen_level.level();
         let before_rung = s.down.screen_level.rung();
+        let diag = (super::DIAG.load(std::sync::atomic::Ordering::Relaxed)
+            && tick
+            && s.cfg.props.receiver_budget_bps().is_some())
+        .then(|| {
+            static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+            let t = now.saturating_duration_since(*START.get_or_init(|| now)).as_secs();
+            let cams: Vec<String> = s
+                .down
+                .iter()
+                .filter(|(_, d)| d.ty == TrackType::Video)
+                .filter_map(|(_, d)| {
+                    let p = self.sessions.get(d.publisher)?;
+                    Some(format!(
+                        "{:?}:{}{}{}:{:.0}/{:.0}",
+                        p.cfg.session_id,
+                        u8::from(d.phase == DownPhase::Active),
+                        u8::from(d.paused),
+                        if p.up.camera_steps.measured() { "m" } else { "u" },
+                        p.up.camera_steps.small_whole(),
+                        p.up.camera_steps.lowest()
+                    ))
+                })
+                .collect();
+            format!(
+                "DIAG t={t} before={before_rung:?} ceiling={:?} other={:.0} sent={:.0} camsmall={:.0} may_raise={} queue={:?} cams={cams:?}",
+                inputs.ceiling,
+                inputs.other,
+                self.screen_rate(key, now),
+                self.cameras_small_rate(key),
+                s.down.budget_hold.may_raise(now),
+                inputs.queue,
+            )
+        });
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
         s.down.screen_review = Some(now);
         let rung = s.down.screen_level.decide(now, inputs, &ladder);
+        if let Some(d) = diag {
+            eprintln!("{d} -> {rung:?}");
+        }
         if let (Some(old), Some(ceiling)) = (before_rung, inputs.ceiling) {
             let (was, now_rate) = (ladder.rate_of(old), ladder.rate_of(rung));
             if let Some((was, is)) = was.zip(now_rate)

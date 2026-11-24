@@ -65,6 +65,9 @@ pub enum Load {
 /// bunch. The sessions that do not fit wait in a queue that the next turns work through, in order.
 pub const MAX_OFFERS_PER_TURN: usize = 2;
 
+/// DIAG
+pub static DIAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// A call: the sessions that hear each other.
 #[derive(Debug)]
 pub(crate) struct Call {
