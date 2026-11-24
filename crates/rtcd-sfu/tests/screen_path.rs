@@ -151,7 +151,7 @@ fn a_viewer_behind_a_link_that_can_carry_it_is_not_held_back() {
 #[test]
 fn what_a_lossy_path_drops_is_sent_again_until_next_to_nothing_is_missing() {
     // A packet that was lost and never came back would be a break in the picture. The responder
-    // gives up on a packet a second after it was sent (`with_max_packet_age`), which at 15 % loss,
+    // gives up on a packet three seconds after it was sent (`with_max_packet_age`), which at 15 % loss,
     // where some copies are lost three times over, leaves about a tenth of a per cent missing.
     for loss in [0.03, 0.05, 0.08, 0.15] {
         let run = share(far(loss, None));

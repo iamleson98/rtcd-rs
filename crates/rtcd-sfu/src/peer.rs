@@ -165,8 +165,13 @@ pub(crate) fn new_peer(
                 NackResponderBuilder::new()
                     .with_size(cfg.nack_buffer_size)
                     // A receiver that lost packets in an outage asks for all of them when the path
-                    // is back; after a second a frame they belonged to has been given up on.
-                    .with_max_packet_age(Duration::from_secs(1))
+                    // is back; after three seconds a frame they belonged to has been given up on.
+                    // Not sooner: a screen keyframe (a megabit or more) needs a second to cross a
+                    // slow link, and the repair of what it lost is asked for after that, so a
+                    // shorter age leaves the keyframe unrepairable, the receiver asks for another,
+                    // and the two on the link at once are overload. The size of the buffer is the
+                    // other limit: fast streams outgrow it before they come to the age.
+                    .with_max_packet_age(Duration::from_secs(3))
                     .build(),
                 cfg.egress.clone(),
             ),
