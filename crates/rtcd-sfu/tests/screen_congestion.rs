@@ -343,10 +343,10 @@ fn diag_sweep() {
         rate_bps: None,
         queue: Duration::ZERO,
     };
-    for shift in (0..=12000u64).step_by(500) {
+    for shift in (0..=12000u64).step_by(1000) {
         SHIFT.store(shift, std::sync::atomic::Ordering::Relaxed);
         let mut row = format!("SWEEP shift={shift:5}");
-        for (rate, loss) in [(1_500_000, 0.02), (2_000_000, 0.01), (1_000_000, 0.02), (4_000_000, 0.01)] {
+        for (rate, loss) in [(1_500_000, 0.02)] {
             let (w, v, voice, start) = lesson(&[bottleneck(rate, loss)], |_, _, _| {});
             let (from, to) = judged(start);
             let x = seen(&w, v[0], &voice, from, to);
@@ -361,15 +361,6 @@ fn diag_sweep() {
             && quick.large_frames() >= 15 * 60 * 95 / 100
             && quick.asap.frozen == 0.0;
         row += &format!(" | pair {} {:.2}", if ok { "ok" } else { "FAIL" }, slow.queue.1);
-        let (w, v, voice, start) = lesson(&[bottleneck(4_000_000, 0.01)], |w, v, t| {
-            if t == Duration::from_secs(60) {
-                w.set_path(v[0], bottleneck(1_200_000, 0.01));
-            }
-        });
-        let after = start + Duration::from_secs(70);
-        let x = seen(&w, v[0], &voice, after, judged(start).1);
-        let ok = catch_unwind(AssertUnwindSafe(|| assert_served(&x, "x"))).is_ok();
-        row += &format!(" | slows {} {:.2}", if ok { "ok" } else { "FAIL" }, x.queue.1);
         eprintln!("{row}");
     }
     panic!("sweep");
