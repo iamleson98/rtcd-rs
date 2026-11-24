@@ -290,7 +290,17 @@ impl World {
         World::with_metrics(cfg, Arc::new(NoMetrics))
     }
 
+    /// A world whose losses, jitter and engine draws follow `seed`: the same seed gives the same
+    /// run, and seed 0 is the world of `with_config`.
+    pub fn with_seed(cfg: EngineConfig, seed: u64) -> World {
+        World::seeded(cfg, Arc::new(NoMetrics), seed)
+    }
+
     pub fn with_metrics(cfg: EngineConfig, metrics: Arc<dyn Metrics>) -> World {
+        World::seeded(cfg, metrics, 0)
+    }
+
+    fn seeded(cfg: EngineConfig, metrics: Arc<dyn Metrics>, seed: u64) -> World {
         // `RUST_LOG=rtcd_sfu=debug cargo test -- --nocapture` shows what the engine decides.
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -304,7 +314,11 @@ impl World {
             now,
             epoch: now,
             egress,
-            engine: Engine::new(Arc::new(cfg), metrics, Rng::seeded(7)),
+            engine: Engine::new(
+                Arc::new(cfg),
+                metrics,
+                Rng::seeded(7 ^ seed.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+            ),
             server: cfg_server,
             browsers: Vec::new(),
             closed: Vec::new(),
@@ -315,7 +329,7 @@ impl World {
             blackhole: false,
             to_browsers: Vec::new(),
             to_engine: Vec::new(),
-            rng: 0x9e37_79b9_7f4a_7c15,
+            rng: 0x9e37_79b9_7f4a_7c15 ^ seed.wrapping_mul(0xd1b5_4a32_d192_ed03),
             payload_pad: 0,
             frame_pad: 1000,
             engine_spent: Duration::ZERO,
