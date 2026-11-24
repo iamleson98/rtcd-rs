@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use support::watch::{Playback, quantile};
 use support::{Path, ScreenPlan, World, engine_config};
 
+static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const LOW_BPS: u64 = 500_000;
 const HIGH_BPS: u64 = 2_500_000;
 const RUN: f64 = 120.0;
@@ -151,6 +152,10 @@ fn lesson(
     let viewers: Vec<usize> = (0..paths.len())
         .map(|n| w.join(&format!("viewer{n}"), "call1"))
         .collect();
+    let shift = SHIFT.load(std::sync::atomic::Ordering::Relaxed);
+    if shift > 0 {
+        w.run_for(Duration::from_millis(shift));
+    }
     for (&v, &p) in viewers.iter().zip(paths) {
         w.set_path(v, p);
     }
@@ -326,4 +331,16 @@ fn a_link_that_slows_down_mid_lesson_is_followed_within_seconds() {
     let s = seen(&w, viewers[0], &voice, after, judged(start).1);
     s.print("4 then 1.2 Mbit/s, from 10 s after the change");
     assert_served(&s, "4 then 1.2 Mbit/s");
+}
+
+#[test]
+fn diag_sweep() {
+    for shift in [0u64, 500, 1000, 1500, 2000, 3000, 4000, 5000, 7000] {
+        SHIFT.store(shift, std::sync::atomic::Ordering::Relaxed);
+        let (w, viewers, voice, start) = lesson(&[bottleneck(1_500_000, 0.02)], |_, _, _| {});
+        let (from, to) = judged(start);
+        let s = seen(&w, viewers[0], &voice, from, to);
+        eprintln!("SWEEP shift={shift} p95={:.3} p50={:.3} max={:.3}", s.queue.1, s.queue.0, s.queue.2);
+    }
+    panic!("sweep");
 }
