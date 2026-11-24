@@ -335,12 +335,42 @@ fn a_link_that_slows_down_mid_lesson_is_followed_within_seconds() {
 
 #[test]
 fn diag_sweep() {
-    for shift in [0u64, 500, 1000, 1500, 2000, 3000, 4000, 5000, 7000] {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let fast = Path {
+        loss: 0.0,
+        jitter: Duration::ZERO,
+        delay: Duration::from_millis(20),
+        rate_bps: None,
+        queue: Duration::ZERO,
+    };
+    for shift in [3500u64, 4000, 4500, 5000, 5500, 6000, 6500, 7000, 8000, 9000] {
         SHIFT.store(shift, std::sync::atomic::Ordering::Relaxed);
-        let (w, viewers, voice, start) = lesson(&[bottleneck(1_500_000, 0.02)], |_, _, _| {});
+        let mut row = format!("SWEEP shift={shift}");
+        for (rate, loss) in [(1_500_000, 0.02), (2_000_000, 0.01), (1_000_000, 0.02), (4_000_000, 0.01)] {
+            let (w, v, voice, start) = lesson(&[bottleneck(rate, loss)], |_, _, _| {});
+            let (from, to) = judged(start);
+            let x = seen(&w, v[0], &voice, from, to);
+            let ok = catch_unwind(AssertUnwindSafe(|| assert_served(&x, "x"))).is_ok();
+            row += &format!(" | {}k {} {:.2}", rate / 1000, if ok { "ok" } else { "FAIL" }, x.queue.1);
+        }
+        let (w, v, voice, start) = lesson(&[bottleneck(1_500_000, 0.02), fast], |_, _, _| {});
         let (from, to) = judged(start);
-        let s = seen(&w, viewers[0], &voice, from, to);
-        eprintln!("SWEEP shift={shift} p95={:.3} p50={:.3} max={:.3}", s.queue.1, s.queue.0, s.queue.2);
+        let slow = seen(&w, v[0], &voice, from, to);
+        let quick = seen(&w, v[1], &voice, from, to);
+        let ok = catch_unwind(AssertUnwindSafe(|| assert_served(&slow, "x"))).is_ok()
+            && quick.large_frames() >= 15 * 60 * 95 / 100
+            && quick.asap.frozen == 0.0;
+        row += &format!(" | pair {} {:.2}", if ok { "ok" } else { "FAIL" }, slow.queue.1);
+        let (w, v, voice, start) = lesson(&[bottleneck(4_000_000, 0.01)], |w, v, t| {
+            if t == Duration::from_secs(60) {
+                w.set_path(v[0], bottleneck(1_200_000, 0.01));
+            }
+        });
+        let after = start + Duration::from_secs(70);
+        let x = seen(&w, v[0], &voice, after, judged(start).1);
+        let ok = catch_unwind(AssertUnwindSafe(|| assert_served(&x, "x"))).is_ok();
+        row += &format!(" | slows {} {:.2}", if ok { "ok" } else { "FAIL" }, x.queue.1);
+        eprintln!("{row}");
     }
     panic!("sweep");
 }
