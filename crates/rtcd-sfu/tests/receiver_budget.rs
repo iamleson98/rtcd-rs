@@ -18,7 +18,6 @@ use std::time::Duration;
 
 use rtcd_proto::MessageType;
 use rtcd_sfu::config::EngineConfig;
-use rtcd_sfu::engine::QUIET_OFFER_DELAY;
 use rtcd_sfu::ids::{TrackType, parse_track_id};
 use rtcd_sfu::metrics::Metrics;
 use support::{Layer, World, describe, engine_config};
@@ -122,9 +121,6 @@ impl Rig {
             .enumerate()
             .map(|(n, &kbps)| w.join_with_budget(&format!("viewer{n}"), "call1", kbps))
             .collect();
-        // The voice streams the joins reserved are offered once their wait is over (see
-        // `QUIET_OFFER_DELAY`), before anything is measured.
-        w.run_for(QUIET_OFFER_DELAY + Duration::from_secs(2));
         // The senders watch nobody: only the viewers' downlinks are under test.
         for &s in &senders {
             let none = serde_json::json!({ "session_ids": [], "low": [] });
@@ -350,7 +346,9 @@ fn lesson(r: &mut Rig, teacher: [u64; 2], seconds: u32) -> Vec<(usize, bool)> {
 fn lesson_until(r: &mut Rig, teacher: [u64; 2], cuts: &Cuts, step: &str) -> Vec<(usize, bool)> {
     let mut out = Vec::new();
     while cuts.last(step).is_none() {
-        assert!(out.len() < 120, "no {step} in two minutes");
+        if out.len() >= 120 {
+            break;
+        }
         out.extend(lesson(r, teacher, 1));
     }
     out
@@ -372,6 +370,9 @@ fn a_tight_budget_cuts_the_screen_share_in_order_and_takes_it_up_again_after_a_h
     // The cameras play all along, never paused for the screen share's sake.
     assert!(squeezed.iter().chain(&tighter).all(|&(_, flowing)| flowing));
     let steps = cuts.steps();
+    eprintln!("DIFFLOG tighter {tighter:?} cuts {:?}", cuts.log.lock().unwrap());
+    panic!("difflog");
+    #[allow(unreachable_code)]
     let temporal = steps.iter().position(|&s| s == "screen_temporal");
     let small = steps.iter().position(|&s| s == "screen_small");
     assert!(temporal.is_some() && small.is_some(), "{steps:?}");

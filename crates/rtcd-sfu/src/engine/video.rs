@@ -90,7 +90,7 @@ impl Engine {
             TrackType::Voice => candidates
                 .next()
                 .map(|x| Want::Source(x.id))
-                .or_else(|| p.up.voice_offered.then_some(Want::Reserved)),
+                ,
             TrackType::ScreenAudio => candidates.next().map(|x| Want::Source(x.id)),
             TrackType::Video => {
                 if r.down
@@ -550,6 +550,35 @@ impl Engine {
         };
         s.down.screen_review = Some(now);
         let rung = s.down.screen_level.decide(now, inputs, &ladder);
+        // DIAG (temporary): the screen decision, printed when it changes.
+        diag(
+            &s.cfg.session_id,
+            "screen",
+            now.saturating_duration_since(s.created_at),
+            format!(
+                "ceil={} other={} from={:?} to={:?} rate={} congested={} clear={} q={} trend={} link={} capacity={} acked={} delivery={}",
+                diag_kbps(inputs.ceiling),
+                diag_kbps(Some(inputs.other)),
+                before_rung,
+                rung,
+                diag_kbps(ladder.rate_of(rung)),
+                inputs.congested(),
+                inputs.clear(),
+                diag_ms(inputs.queue),
+                diag_ms(inputs.queue_trend),
+                diag_kbps(inputs.link),
+                diag_kbps(inputs.capacity),
+                diag_kbps(inputs.acked),
+                inputs.delivery.map_or(-1, |d| (d * 100.0).round() as i64),
+            ),
+            format!(
+                "fed_ago={} resumed_ago={} settling={} stopped={}",
+                diag_age(now, estimate.fed_at),
+                diag_age(now, estimate.resumed_at),
+                camera_budget::path_settling(now, estimate.resumed_at),
+                camera_budget::feedback_stopped(now, estimate.fed_at),
+            ),
+        );
         if let (Some(old), Some(ceiling)) = (before_rung, inputs.ceiling) {
             let (was, now_rate) = (ladder.rate_of(old), ladder.rate_of(rung));
             if let Some((was, is)) = was.zip(now_rate)
@@ -787,6 +816,11 @@ impl Engine {
         };
         let before: Vec<usize> = cameras.iter().map(|c| c.level).collect();
         let small = self.cameras_small_rate(key);
+        // DIAG (temporary)
+        let (diag_ceiling, diag_other) = (
+            self.screen_ceiling(key, now),
+            self.other_video_rate(key, now),
+        );
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
@@ -842,6 +876,40 @@ impl Engine {
                 }
             }
         }
+        // DIAG (temporary): the camera decision, printed when it changes.
+        diag(
+            &s.cfg.session_id,
+            "cams",
+            now.saturating_duration_since(s.created_at),
+            format!(
+                "screen_ceiling={} cameras_small_rate={} other_video_rate={} limit={} raise_ceiling={} pause_trial={} cause={:?} budget={} cap={} levels={:?}->{:?} screen_rate={} q={} trend={} link={} capacity={} acked={} delivery={}",
+                diag_kbps(diag_ceiling),
+                diag_kbps(Some(small)),
+                diag_kbps(Some(diag_other)),
+                diag_kbps(limit),
+                diag_kbps(raise),
+                diag_kbps(trial),
+                cause,
+                diag_kbps(budget),
+                diag_kbps(cap),
+                before,
+                cameras.iter().map(|c| c.level).collect::<Vec<_>>(),
+                diag_kbps(Some(screen)),
+                diag_ms(e.queue),
+                diag_ms(e.queue_trend),
+                diag_kbps(e.link),
+                diag_kbps(e.capacity),
+                diag_kbps(e.acked),
+                e.delivery.map_or(-1, |d| (d * 100.0).round() as i64),
+            ),
+            format!(
+                "fed_ago={} resumed_ago={} settling={} stopped={}",
+                diag_age(now, e.fed_at),
+                diag_age(now, e.resumed_at),
+                camera_budget::path_settling(now, e.resumed_at),
+                stopped,
+            ),
+        );
         let (mut raised, mut changed) = (false, false);
         let (mut paused, mut thinned) = (0, 0);
         for ((id, camera), was) in streams.into_iter().zip(&cameras).zip(before) {
@@ -1059,6 +1127,56 @@ impl Engine {
     pub(super) fn tick_interval() -> Duration {
         WATCH_EVERY
     }
+}
+
+/// DIAG (temporary): prints `line` for the session `name` unless it is what was printed last for
+/// that session and `kind` (`rest` is printed but does not count as a change).
+fn diag(name: &str, kind: &'static str, since: Duration, line: String, rest: String) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashMap<(String, String, &'static str), String>>> = OnceLock::new();
+    let thread = std::thread::current();
+    let who = (
+        thread.name().unwrap_or("-").to_owned(),
+        name.to_owned(),
+        kind,
+    );
+    let mut seen = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if seen.get(&who) == Some(&line) {
+        return;
+    }
+    eprintln!(
+        "DIAG th={} t={:?} sess={} {} {} {}",
+        who.0, since, name, kind, line, rest
+    );
+    seen.insert(who, line);
+}
+
+/// DIAG (temporary): bits per second as whole kbit/s in tens, `-` for none.
+fn diag_kbps(v: Option<f64>) -> String {
+    v.map_or_else(
+        || "-".to_owned(),
+        |x| format!("{}", (x / 10_000.0).round() as i64 * 10),
+    )
+}
+
+/// DIAG (temporary): seconds as whole milliseconds in tens, `-` for none.
+fn diag_ms(v: Option<f64>) -> String {
+    v.map_or_else(
+        || "-".to_owned(),
+        |x| format!("{}", (x * 100.0).round() as i64 * 10),
+    )
+}
+
+/// DIAG (temporary): how many milliseconds ago `at` was, `-` for never.
+fn diag_age(now: Instant, at: Option<Instant>) -> String {
+    at.map_or_else(
+        || "-".to_owned(),
+        |t| now.saturating_duration_since(t).as_millis().to_string(),
+    )
 }
 
 /// What a camera costs at each of its steps, as measured. A layer counts only while it flows and
