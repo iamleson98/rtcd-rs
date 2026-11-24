@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
+use super::media::TapClock;
 use super::session::{SessionKey, Source, SourceKey};
 use super::{CallId, Engine};
 use crate::ids::TrackType;
@@ -158,15 +159,15 @@ impl Active {
     }
 
     /// The packet path: queue one packet of a tapped stream, or count it as dropped.
-    fn packet(&mut self, stream: u32, packet: &rtc::rtp::Packet, now: Instant) {
+    fn packet(&mut self, stream: u32, packet: &rtc::rtp::Packet, stamp: (u16, u32), now: Instant) {
         if !self.pending.is_empty() && !self.flush(now) {
             self.sink.shared().drop_one();
             return;
         }
         let item = RecordItem::Packet(RecordPacket {
             stream,
-            seq: packet.header.sequence_number,
-            ts: packet.header.timestamp,
+            seq: stamp.0,
+            ts: stamp.1,
             marker: packet.header.marker,
             payload: packet.payload.clone(),
             arrived: now,
@@ -264,9 +265,11 @@ impl Recordings {
     }
 
     /// The packet path. One bounds-checked index and `Active::packet`.
-    pub fn packet(&mut self, tap: Tap, packet: &rtc::rtp::Packet, now: Instant) {
+    ///
+    /// `stamp` is the sequence number and timestamp the writer is given (see `TapClock`).
+    pub fn packet(&mut self, tap: Tap, packet: &rtc::rtp::Packet, stamp: (u16, u32), now: Instant) {
         if let Some(Some(active)) = self.slots.get_mut(tap.rec as usize) {
-            active.packet(tap.stream, packet, now);
+            active.packet(tap.stream, packet, stamp, now);
         }
     }
 
@@ -601,6 +604,7 @@ impl Engine {
             wanted_high_since: None,
         });
         fan.tap = Some(Tap { rec, stream });
+        fan.tap_clock = TapClock::default();
         // The file opens on a keyframe: ask for one now rather than at the next upkeep.
         if ty.is_video() {
             self.request_keyframe(publisher, source, now, false);
@@ -747,7 +751,8 @@ mod tests {
                 let started = Instant::now();
                 for i in 0..4096u32 {
                     packet.header.sequence_number = (batch * 4096 + i) as u16;
-                    recordings.packet(tap, &packet, now);
+                    let stamp = (packet.header.sequence_number, packet.header.timestamp);
+                    recordings.packet(tap, &packet, stamp, now);
                 }
                 spent += started.elapsed();
                 while rx.try_recv().is_ok() {}

@@ -108,14 +108,30 @@ impl Registry {
         self.admit_unless(cfg, &|_| false)
     }
 
-    /// Like [`admit`](Self::admit), but refuses a session whose shard is `saturated` (the one its
-    /// call lives on, or for a new call every shard that takes new sessions): a shard at its
-    /// limit loses packets for every call on it, and the sessions it has are all it can serve. A
-    /// new call goes to the emptiest shard that is not saturated.
+    /// [`admit_ranked`](Self::admit_ranked) with no measured load.
+    #[cfg(test)]
     pub fn admit_unless(
         &self,
         cfg: &SessionConfig,
         saturated: &dyn Fn(usize) -> bool,
+    ) -> Result<usize, AdmitError> {
+        self.admit_ranked(cfg, saturated, &|_| 0.0, 0)
+    }
+
+    /// Records a new session and returns its shard, refusing a session whose shard is `saturated`
+    /// (the one its call lives on, or for a new call every shard that takes new sessions): a shard
+    /// at its limit loses packets for every call on it, and the sessions it has are all it can
+    /// serve. A new call goes to the open shard with the lowest rank: the sessions it carries plus
+    /// what it measures, `busy` (0 to 1) of `per_shard` sessions. A call weighs the same on a cheap
+    /// shard and a costly one (cameras, simulcast), and a shard added late stays light, so the
+    /// count alone left shards at 17 and 97 % busy; the sum keeps the count, so joins placed within
+    /// one measurement window still spread.
+    pub fn admit_ranked(
+        &self,
+        cfg: &SessionConfig,
+        saturated: &dyn Fn(usize) -> bool,
+        busy: &dyn Fn(usize) -> f32,
+        per_shard: usize,
     ) -> Result<usize, AdmitError> {
         let mut st = self.lock();
         if st.closing {
@@ -158,6 +174,7 @@ impl Registry {
                     .into_iter()
                     .enumerate()
                     .filter(|&(i, _)| st.active[i])
+                    .map(|(i, w)| (i, w + (busy(i).clamp(0.0, 1.0) * per_shard as f32) as usize))
                     .collect();
                 if open.is_empty() {
                     return Err(AdmitError::NoShard);
@@ -547,6 +564,32 @@ mod tests {
         let other = r.shard_of("s4").unwrap();
         assert_ne!(again, other);
         let _ = first;
+    }
+
+    #[test]
+    fn a_measured_hot_shard_is_avoided_when_weights_are_equal() {
+        let r = Registry::new(2);
+        let hot = |slot: usize| if slot == 0 { 0.9 } else { 0.1 };
+        let shard = r
+            .admit_ranked(&cfg("c1", "s1"), &|_| false, &hot, 300)
+            .unwrap();
+        assert_eq!(shard, 1);
+    }
+
+    #[test]
+    fn calls_placed_in_one_window_spread_across_shards() {
+        let r = Registry::new(3).expecting_calls_of(20);
+        let frozen = |slot: usize| [0.9, 0.5, 0.1][slot];
+        let mut counts = [0usize; 3];
+        for n in 0..300 {
+            let call = format!("c{n}");
+            let shard = r
+                .admit_ranked(&cfg(&call, &format!("s{n}")), &|_| false, &frozen, 300)
+                .unwrap();
+            counts[shard] += 1;
+        }
+        assert!(counts.iter().all(|&c| c > 0), "{counts:?}");
+        assert!(counts[2] > counts[1] && counts[1] > counts[0], "{counts:?}");
     }
 
     #[test]

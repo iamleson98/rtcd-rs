@@ -123,8 +123,15 @@ pub struct Engine {
     fanout: HashMap<SourceKey, media::Fan>,
     /// The recordings of the calls on this engine.
     recordings: record::Recordings,
-    /// Sessions with work to do.
-    dirty: Vec<SessionKey>,
+    /// Sessions with input to handle, in the order it arrived.
+    dirty: VecDeque<SessionKey>,
+    /// Sessions that wrote something to send and have not been flushed since: each is flushed and
+    /// rescheduled once when [`Engine::settle`] has handled all the input, however many writes
+    /// it took.
+    touched: Vec<SessionKey>,
+    /// What the datagrams taken in since the last settle may write at most, counting the receivers
+    /// of each one's stream (see [`Engine::pending_writes`]).
+    pending_writes: usize,
     timers: BTreeMap<(Instant, u64), SessionKey>,
     timer_seq: u64,
     /// Sessions that need an offer and were turned away by [`MAX_OFFERS_PER_TURN`], first come
@@ -168,7 +175,9 @@ impl Engine {
             routes: Routes::default(),
             fanout: HashMap::new(),
             recordings: record::Recordings::default(),
-            dirty: Vec::new(),
+            dirty: VecDeque::new(),
+            touched: Vec::new(),
+            pending_writes: 0,
             timers: BTreeMap::new(),
             timer_seq: 0,
             negotiations: VecDeque::new(),
@@ -182,6 +191,19 @@ impl Engine {
     /// The number of live sessions.
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// What the engine keeps for uplink media: sources, SSRC entries and fan-outs. It stays
+    /// bounded by what the senders have, however often a layer moves to a new SSRC.
+    pub fn uplink_sizes(&self) -> (usize, usize, usize) {
+        let (sources, by_ssrc) = self
+            .sessions
+            .keys()
+            .filter_map(|k| self.sessions.get(k))
+            .fold((0, 0), |(a, b), s| {
+                (a + s.up.sources.len(), b + s.up.by_ssrc.len())
+            });
+        (sources, by_ssrc, self.fanout.len())
     }
 
     /// Applies a command from the service.
@@ -198,9 +220,27 @@ impl Engine {
         self.drive(now);
     }
 
-    /// Delivers a datagram received on `local` from `peer`. Returns whether a session took it: a
-    /// datagram from an address and with an ICE username no session knows is not anyone's.
+    /// Delivers a datagram received on `local` from `peer` and settles what it set going (see
+    /// [`receive`](Self::receive) and [`settle`](Self::settle)). Returns whether a session took it.
     pub fn handle_datagram(
+        &mut self,
+        now: Instant,
+        proto: Proto,
+        local: std::net::SocketAddr,
+        peer: std::net::SocketAddr,
+        data: BytesMut,
+    ) -> bool {
+        let routed = self.receive(now, proto, local, peer, data);
+        self.settle(now);
+        routed
+    }
+
+    /// Hands a datagram received on `local` from `peer` to the session it belongs to, which is
+    /// then due for [`settle`](Self::settle): nothing is forwarded or queued for sending until
+    /// that is called, so that a batch of datagrams costs one settle and not one each. Returns
+    /// whether a session took it: a datagram from an address and with an ICE username no session
+    /// knows is not anyone's.
+    pub fn receive(
         &mut self,
         now: Instant,
         proto: Proto,
@@ -212,6 +252,7 @@ impl Engine {
         if let Some(key) = routed {
             if let Some(s) = self.sessions.get_mut(key) {
                 s.last_rx = now;
+                self.pending_writes += s.max_fan.max(1);
                 use rtc::shared::{TaggedBytesMut, TransportContext};
                 let result = s.pc.handle_read(TaggedBytesMut {
                     now,
@@ -230,8 +271,22 @@ impl Engine {
             }
             self.mark_dirty(key);
         }
-        self.drive(now);
         routed.is_some()
+    }
+
+    /// How many datagrams the engine may queue to send when it settles what it has taken in: the
+    /// most each of them can be sent to, which for a packet of a stream with many receivers is
+    /// all of them. A shard settles when this is a lot, not only after a count of datagrams, so
+    /// that what is queued before anything is sent stays bounded whatever the size of the call.
+    pub fn pending_writes(&self) -> usize {
+        self.pending_writes
+    }
+
+    /// Handles everything [`receive`](Self::receive) took in since the last settle: the sessions
+    /// with input are handled in the order it came, then each session that has something to send
+    /// is flushed once, however many sessions wrote to it.
+    pub fn settle(&mut self, now: Instant) {
+        self.drive(now);
     }
 
     /// Advances time: wakes every session whose deadline has passed.
@@ -312,45 +367,80 @@ impl Engine {
         self.offers_left = MAX_OFFERS_PER_TURN;
     }
 
+    /// Notes that a session wrote something to send, and needs nothing else done: it is flushed
+    /// and rescheduled once at the end of the settle.
+    fn mark_touched(&mut self, key: SessionKey) {
+        if let Some(s) = self.sessions.get_mut(key)
+            && !s.touched
+        {
+            s.touched = true;
+            self.touched.push(key);
+        }
+    }
+
+    /// Notes that a session has input to handle, for its connection, negotiation and timers.
     fn mark_dirty(&mut self, key: SessionKey) {
         if let Some(s) = self.sessions.get_mut(key)
             && !s.dirty
         {
             s.dirty = true;
-            self.dirty.push(key);
+            self.dirty.push_back(key);
         }
     }
 
-    /// Works through every session that has something to do, until none has.
+    /// Works through every session that has something to do, until none has: first the sessions
+    /// with input, in the order it arrived (what they handle may give others input, which joins
+    /// the queue), then each session that wrote something is flushed and rescheduled once.
     fn drive(&mut self, now: Instant) {
-        while let Some(key) = self.dirty.pop() {
-            if let Some(s) = self.sessions.get_mut(key) {
-                s.dirty = false;
-            } else {
-                continue;
+        self.pending_writes = 0;
+        while !self.dirty.is_empty() || !self.touched.is_empty() {
+            while let Some(key) = self.dirty.pop_front() {
+                if let Some(s) = self.sessions.get_mut(key) {
+                    s.dirty = false;
+                } else {
+                    continue;
+                }
+                self.guarded(key, now, |e| e.pump(key, now));
+                self.mark_touched(key);
             }
-            // One participant's bug must not take the whole shard's calls down with it.
-            let outcome = catch_unwind(AssertUnwindSafe(|| self.pump(key, now)));
-            if outcome.is_err() {
-                let id = self
-                    .sessions
-                    .get(key)
-                    .map(|s| s.cfg.session_id.clone())
-                    .unwrap_or_default();
-                error!(session = %id, "session panicked; closing it");
-                self.metrics.error(
-                    self.sessions
-                        .get(key)
-                        .map_or("", |s| s.cfg.group_id.as_str()),
-                    "panic",
-                );
-                self.close_session(key, CloseReason::SignalingFailed, now);
+            for key in std::mem::take(&mut self.touched) {
+                if let Some(s) = self.sessions.get_mut(key) {
+                    s.touched = false;
+                } else {
+                    continue;
+                }
+                self.guarded(key, now, |e| {
+                    e.flush(key);
+                    e.reschedule(key, now);
+                });
             }
         }
     }
 
-    /// Everything one session has pending: what its connection reported, what it received, what
-    /// negotiation needs next, what it wants to send.
+    /// Runs `work` for a session; one participant's bug must not take the whole shard's calls
+    /// down with it, so a panic closes that session and nothing else.
+    fn guarded(&mut self, key: SessionKey, now: Instant, work: impl FnOnce(&mut Self)) {
+        let outcome = catch_unwind(AssertUnwindSafe(|| work(self)));
+        if outcome.is_err() {
+            let id = self
+                .sessions
+                .get(key)
+                .map(|s| s.cfg.session_id.clone())
+                .unwrap_or_default();
+            error!(session = %id, "session panicked; closing it");
+            self.metrics.error(
+                self.sessions
+                    .get(key)
+                    .map_or("", |s| s.cfg.group_id.as_str()),
+                "panic",
+            );
+            self.close_session(key, CloseReason::SignalingFailed, now);
+        }
+    }
+
+    /// Everything one session has pending short of sending it: what its connection reported, what
+    /// it received, what negotiation needs next. What it wants to send is flushed after, with the
+    /// writes the other sessions made to it.
     fn pump(&mut self, key: SessionKey, now: Instant) {
         self.process_events(key, now);
         let Some(rtp) = self.process_reads(key, now) else {
@@ -364,8 +454,6 @@ impl Engine {
         self.advance_negotiation(key, now);
         self.watch_path(key, now);
         self.forward(key, rtp, now);
-        self.flush(key);
-        self.reschedule(key, now);
     }
 
     /// Moves what the connection wants to send into the output queue.

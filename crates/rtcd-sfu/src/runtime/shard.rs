@@ -44,6 +44,14 @@ const MAX_TURN_READS: u32 = 8192;
 /// lab, at 8,192). Past this the sockets that still have datagrams are read in the next turn,
 /// after the timers and with everything sent so far on its way.
 const TURN_TIME: Duration = Duration::from_millis(20);
+/// How many datagrams the shard hands the engine before it settles them: the sessions they came
+/// from are handled in the order they came in, and each session that has something to send is
+/// flushed once, not once for every datagram that wrote to it. The turn's own limit
+/// ([`TURN_TIME`]) is checked between the chunks. A chunk also ends when the datagrams in it
+/// could queue [`FLUSH_AT`] sends (a packet of a stream with a hundred receivers is a hundred),
+/// which is what bounds the engine's output between two settles, and so the time between a
+/// datagram and the first send.
+const SETTLE_EVERY: u32 = 32;
 /// Datagrams other shards may have passed on to one shard that it has not yet taken up. Media is
 /// of use for a moment: at 40 thousand datagrams a second the shard is about 100 ms behind with
 /// this many waiting, and what comes later would be played to nobody (and cost the memory, and
@@ -297,6 +305,8 @@ pub(crate) struct Shard {
     stats: Arc<ShardStats>,
     /// Datagrams taken in by the turn that is running, and when it began.
     turn_reads: u32,
+    /// Datagrams the engine has been given and not yet settled.
+    unsettled: u32,
     turn_began: Instant,
     /// The peaks of the window that is running (see `ShardStats`).
     window_peaks: [u32; 3],
@@ -359,6 +369,7 @@ impl Shard {
             busy,
             stats,
             turn_reads: 0,
+            unsettled: 0,
             turn_began: Instant::now(),
             window_peaks: [0; 3],
             worked: Duration::ZERO,
@@ -407,6 +418,7 @@ impl Shard {
             for slot in std::mem::take(&mut self.peer_ready) {
                 self.drain_peer(slot, now);
             }
+            self.settle(now);
             if commands_ready {
                 self.drain_commands(now);
             }
@@ -508,14 +520,12 @@ impl Shard {
                 let Some((peer, data)) = self.recv.get(k) else {
                     continue;
                 };
-                self.engine.handle_datagram(
-                    now,
-                    Proto::Udp,
-                    advertised,
-                    peer,
-                    BytesMut::from(data),
-                );
-                self.relieve();
+                self.engine
+                    .receive(now, Proto::Udp, advertised, peer, BytesMut::from(data));
+                self.unsettled += 1;
+                if self.unsettled >= SETTLE_EVERY || self.engine.pending_writes() >= FLUSH_AT {
+                    self.settle(now);
+                }
             }
             self.send_forwards();
             if n < self.cfg.recv_batch {
@@ -629,14 +639,12 @@ impl Shard {
                 let Some((peer, data)) = self.recv.get(k) else {
                     continue;
                 };
-                self.engine.handle_datagram(
-                    now,
-                    Proto::Udp,
-                    advertised,
-                    peer,
-                    BytesMut::from(data),
-                );
-                self.relieve();
+                self.engine
+                    .receive(now, Proto::Udp, advertised, peer, BytesMut::from(data));
+                self.unsettled += 1;
+                if self.unsettled >= SETTLE_EVERY || self.engine.pending_writes() >= FLUSH_AT {
+                    self.settle(now);
+                }
             }
             self.send_forwards();
             if n < self.cfg.recv_batch {
@@ -986,6 +994,17 @@ impl Shard {
     /// Whether the turn has taken in all it should: the timers and the sends wait behind it.
     fn turn_is_full(&self) -> bool {
         self.turn_reads >= MAX_TURN_READS || self.turn_began.elapsed() >= TURN_TIME
+    }
+
+    /// Has the engine handle the datagrams it was given since the last settle, and sends what that
+    /// queued if it is a lot.
+    fn settle(&mut self, now: Instant) {
+        if self.unsettled == 0 {
+            return;
+        }
+        self.unsettled = 0;
+        self.engine.settle(now);
+        self.relieve();
     }
 
     /// Sends what the engine has queued if it is a lot, without waiting for the turn to end.

@@ -794,3 +794,71 @@ fn a_node_that_does_not_adapt_keeps_the_large_layer_whatever_the_kernel_refuses(
         "a refusal storm changed a layer"
     );
 }
+
+/// A viewer in a call with a camera that has been streaming, then left alone long enough for the
+/// pacer's budget to fill and every timer to have run.
+fn idle_after_streaming() -> (World, usize, usize) {
+    let mut w = World::new();
+    let a = w.join_with_camera("alice", "call1");
+    let b = w.join("bob", "call1");
+    w.stream_video(a, false, 1.0, 30, &BOTH);
+    w.run_for(Duration::from_millis(500));
+    (w, a, b)
+}
+
+#[test]
+fn a_video_packet_leaves_in_the_turn_it_arrived() {
+    let (mut w, a, b) = idle_after_streaming();
+    let timeouts = w.timeouts_called;
+    let had = video_of(&w, b, "video_").len();
+
+    // One packet of the large layer, with no time passing: the engine reads it and sends it on
+    // without a wake-up in between.
+    w.step(Duration::ZERO, |w| {
+        w.send_video(a, false, Layer::High, false, 1)
+    });
+
+    assert_eq!(w.timeouts_called, timeouts, "a timer ran in the turn");
+    assert_eq!(
+        video_of(&w, b, "video_").len(),
+        had + 1,
+        "the viewer has the packet already"
+    );
+}
+
+#[test]
+fn a_frame_still_forms_one_train() {
+    let (mut w, a, b) = idle_after_streaming();
+    let had = w.browsers[b].rtp.len();
+    let mut seen = had;
+    // The step each packet of a 20-packet keyframe reaches the viewer in.
+    let mut arrivals = Vec::new();
+    for step in 0..150u32 {
+        w.step(Duration::from_millis(1), |w| {
+            if step == 0 {
+                w.send_video(a, false, Layer::High, true, 20)
+            }
+        });
+        let b = &w.browsers[b];
+        arrivals.extend(
+            b.rtp[seen..]
+                .iter()
+                .filter(|(t, _)| t.starts_with("video_"))
+                .map(|_| step),
+        );
+        seen = b.rtp.len();
+    }
+
+    assert_eq!(arrivals.len(), 20, "{arrivals:?}");
+    assert_eq!(
+        arrivals[0], 0,
+        "the first packet does not wait: {arrivals:?}"
+    );
+    // Each packet follows the one before by less than the gap that begins a new burst for the
+    // bandwidth estimator (`bwe::BURST_GAP`, 5 ms), so the frame is read as one train and the
+    // link's rate can be measured from it.
+    assert!(
+        arrivals.windows(2).all(|p| p[1] - p[0] < 5),
+        "the frame came apart: {arrivals:?}"
+    );
+}

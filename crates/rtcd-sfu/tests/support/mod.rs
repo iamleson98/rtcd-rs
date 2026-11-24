@@ -109,6 +109,9 @@ struct InFlight {
     data: BytesMut,
 }
 
+/// A datagram the engine sent: the browser it went to and its RTP sequence number, if it is RTP.
+pub type Sent = (usize, Option<u16>);
+
 /// An emulated browser.
 pub struct Browser {
     pub name: String,
@@ -155,6 +158,8 @@ pub struct Browser {
     pub datagrams_in: usize,
     /// Datagrams to and from this browser are lost.
     pub unreachable: bool,
+    /// Datagrams from this browser are lost, those to it are not.
+    pub uplink_dropped: bool,
     /// What the network does to this browser's traffic, if anything.
     pub path: Option<Path>,
     /// When the downlink has sent everything queued on it.
@@ -219,6 +224,14 @@ pub struct World {
     pub frame_pad: usize,
     /// Time spent inside the engine (datagrams in, timeouts), for the cost tests.
     pub engine_spent: Duration,
+    /// How `engine_spent` splits: the part spent reading datagrams and the part spent in timeouts,
+    /// and how many calls of each there were.
+    pub reads_spent: Duration,
+    pub timers_spent: Duration,
+    pub datagrams_read: usize,
+    pub timeouts_called: usize,
+    /// Datagrams the engine has sent so far.
+    pub transmits: usize,
     /// Called just before the world calls into the engine, with `"datagram"` or `"timeout"` and
     /// `true`, and just after with `false`: for tests that measure the engine alone.
     pub around_engine: fn(&'static str, bool),
@@ -228,6 +241,20 @@ pub struct World {
     pub nack_retry: Option<(Duration, u16)>,
     /// Whether browsers joining from now on can receive redundant audio, as a browser can.
     pub red: bool,
+    /// How many datagrams the engine takes in before it settles, as a shard's loop does: one
+    /// settles after each (`handle_datagram`), more `receive` them and settle every that many and
+    /// before the engine's timers and the world's reading of what it sent.
+    pub receive_chunk: usize,
+    /// The engine also settles when what the datagrams taken in may queue (`pending_writes`) comes
+    /// to this, as a shard's does at its `FLUSH_AT`.
+    pub flush_at: usize,
+    unsettled: usize,
+    /// The most datagrams one settle of the engine queued to send.
+    pub max_burst: usize,
+    /// While set, each datagram the engine sends, in the order it sends them, as the browser it
+    /// goes to and the sequence number if it is RTP, one list for each time the world takes what
+    /// the engine has queued. A datagram to a browser that cannot be reached is in it.
+    pub transmit_log: Option<Vec<Vec<Sent>>>,
 }
 
 /// A node with no send budget whose kernel refuses the number of datagrams `refused` says it has
@@ -282,7 +309,17 @@ impl World {
         World::with_metrics(cfg, Arc::new(NoMetrics))
     }
 
+    /// A world whose losses, jitter and engine draws follow `seed`: the same seed gives the same
+    /// run, and seed 0 is the world of `with_config`.
+    pub fn with_seed(cfg: EngineConfig, seed: u64) -> World {
+        World::seeded(cfg, Arc::new(NoMetrics), seed)
+    }
+
     pub fn with_metrics(cfg: EngineConfig, metrics: Arc<dyn Metrics>) -> World {
+        World::seeded(cfg, metrics, 0)
+    }
+
+    fn seeded(cfg: EngineConfig, metrics: Arc<dyn Metrics>, seed: u64) -> World {
         // `RUST_LOG=rtcd_sfu=debug cargo test -- --nocapture` shows what the engine decides.
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -296,7 +333,11 @@ impl World {
             now,
             epoch: now,
             egress,
-            engine: Engine::new(Arc::new(cfg), metrics, Rng::seeded(7)),
+            engine: Engine::new(
+                Arc::new(cfg),
+                metrics,
+                Rng::seeded(7 ^ seed.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+            ),
             server: cfg_server,
             browsers: Vec::new(),
             closed: Vec::new(),
@@ -307,13 +348,23 @@ impl World {
             blackhole: false,
             to_browsers: Vec::new(),
             to_engine: Vec::new(),
-            rng: 0x9e37_79b9_7f4a_7c15,
+            rng: 0x9e37_79b9_7f4a_7c15 ^ seed.wrapping_mul(0xd1b5_4a32_d192_ed03),
             payload_pad: 0,
             frame_pad: 1000,
             engine_spent: Duration::ZERO,
+            reads_spent: Duration::ZERO,
+            timers_spent: Duration::ZERO,
+            datagrams_read: 0,
+            timeouts_called: 0,
+            transmits: 0,
             around_engine: |_, _| {},
             nack_retry: None,
             red: false,
+            receive_chunk: 1,
+            flush_at: usize::MAX,
+            unsettled: 0,
+            max_burst: 0,
+            transmit_log: None,
         }
     }
 
@@ -531,6 +582,7 @@ impl World {
             read_errors: vec![],
             datagrams_in: 0,
             unreachable: false,
+            uplink_dropped: false,
             path: None,
             link_free: self.now,
             queue_waits: Vec::new(),
@@ -575,6 +627,12 @@ impl World {
             data,
         };
         self.engine.handle_command(self.now, Command::Signal(msg));
+    }
+
+    /// Browser `i` closes its connection, which tells the SFU with a DTLS close alert (it leaves
+    /// the browser when the world next lets it send).
+    pub fn close_connection(&mut self, i: usize) {
+        self.browsers[i].pc.close().expect("close");
     }
 
     pub fn leave(&mut self, i: usize) {
@@ -688,15 +746,28 @@ impl World {
         self.begin_turn();
         for _ in 0..100_000 {
             let mut moved = false;
+            self.settle_engine();
             // What has come over a path by now.
             moved |= self.deliver_due();
+            self.settle_engine();
             // The engine's output to the browsers.
+            let mut batch = Vec::new();
             while let Some(t) = self.engine.poll_transmit() {
                 moved = true;
+                self.transmits += 1;
                 self.egress.add(
                     rtcd_sfu::egress::Gauge::wire_len(t.data.len(), t.peer, false),
                     1,
                 );
+                if self.transmit_log.is_some()
+                    && let Some(i) = self.browsers.iter().position(|b| b.mapped == t.peer)
+                {
+                    // An RTP header is not encrypted; RTCP has payload types 192 to 223.
+                    let rtp = t.data.len() >= 12
+                        && t.data[0] >> 6 == 2
+                        && !(192..=223).contains(&t.data[1]);
+                    batch.push((i, rtp.then(|| u16::from_be_bytes([t.data[2], t.data[3]]))));
+                }
                 if self.blackhole {
                     continue;
                 }
@@ -711,6 +782,9 @@ impl World {
                     None => self.read_by_browser(i, t.local, t.data),
                     Some(path) => self.send_down(i, path, t.local, t.data),
                 }
+            }
+            if let (Some(log), false) = (self.transmit_log.as_mut(), batch.is_empty()) {
+                log.push(batch);
             }
             // The engine's reports to the service, which relays them to the right browser.
             while let Some(e) = self.engine.poll_event() {
@@ -752,10 +826,44 @@ impl World {
         let from = self.browsers[i].mapped;
         let started = Instant::now();
         (self.around_engine)("datagram", true);
-        self.engine
-            .handle_datagram(self.now, Proto::Udp, self.server, from, data);
+        if self.receive_chunk <= 1 {
+            let before = self.engine.queued_transmits();
+            self.engine
+                .handle_datagram(self.now, Proto::Udp, self.server, from, data);
+            self.max_burst = self.max_burst.max(self.engine.queued_transmits() - before);
+        } else {
+            self.engine
+                .receive(self.now, Proto::Udp, self.server, from, data);
+            self.unsettled += 1;
+            if self.unsettled >= self.receive_chunk || self.engine.pending_writes() >= self.flush_at
+            {
+                self.settle_now();
+            }
+        }
         (self.around_engine)("datagram", false);
-        self.engine_spent += started.elapsed();
+        let spent = started.elapsed();
+        self.engine_spent += spent;
+        self.reads_spent += spent;
+        self.datagrams_read += 1;
+    }
+
+    /// Settles the engine on the datagrams it has taken in and not yet handled.
+    fn settle_engine(&mut self) {
+        if self.unsettled == 0 {
+            return;
+        }
+        let started = Instant::now();
+        self.settle_now();
+        let spent = started.elapsed();
+        self.engine_spent += spent;
+        self.reads_spent += spent;
+    }
+
+    fn settle_now(&mut self) {
+        let before = self.engine.queued_transmits();
+        self.engine.settle(self.now);
+        self.unsettled = 0;
+        self.max_burst = self.max_burst.max(self.engine.queued_transmits() - before);
     }
 
     /// A datagram from the SFU enters the downlink of browser `i`: it may be lost, waits for the
@@ -947,7 +1055,11 @@ impl World {
             };
             moved = true;
             let b = &self.browsers[i];
-            if w.transport.peer_addr == self.server && !self.blackhole && !b.unreachable {
+            if w.transport.peer_addr == self.server
+                && !self.blackhole
+                && !b.unreachable
+                && !b.uplink_dropped
+            {
                 match b.path {
                     None => self.engine_reads(i, w.message),
                     Some(path) => self.to_engine.push(InFlight {
@@ -1078,11 +1190,31 @@ impl World {
 
     fn tick_engine(&mut self) {
         self.begin_turn();
+        self.settle_engine();
         let started = Instant::now();
         (self.around_engine)("timeout", true);
         self.engine.handle_timeout(self.now);
         (self.around_engine)("timeout", false);
-        self.engine_spent += started.elapsed();
+        let spent = started.elapsed();
+        self.engine_spent += spent;
+        self.timers_spent += spent;
+        self.timeouts_called += 1;
+    }
+
+    /// One step of `by` of virtual time as a shard's loop sees it: the clock moves once, `media`
+    /// writes what the browsers send at that instant, every side reads what it was sent, and then
+    /// the engine's timers run if one is due.
+    pub fn step(&mut self, by: Duration, media: impl FnOnce(&mut World)) {
+        self.now += by;
+        media(self);
+        for b in &mut self.browsers {
+            let _ = b.pc.handle_timeout(self.now);
+        }
+        self.settle();
+        if self.engine.poll_timeout().is_some_and(|t| t <= self.now) {
+            self.tick_engine();
+            self.settle();
+        }
     }
 
     fn next_wake(&mut self) -> Option<Instant> {
@@ -1328,6 +1460,32 @@ impl World {
                 .write_rtp(now, packet)
                 .expect("write_rtp");
         }
+    }
+
+    /// Restarts a layer of a video sender under a new SSRC, as an encoder restart does: its
+    /// packets carry the same mid and rid, and sequence numbers and clock of a new stream.
+    pub fn move_layer(&mut self, i: usize, screen: bool, layer: Layer, ssrc: u32) {
+        let b = &mut self.browsers[i];
+        let v = if screen {
+            b.screen.as_mut()
+        } else {
+            b.camera.as_mut()
+        }
+        .expect("a video sender");
+        let l = layer as usize;
+        v.ssrcs[l] = ssrc;
+        v.seq[l] = v.seq[l].wrapping_add(4000);
+        v.ts[l] = v.ts[l].wrapping_add(900_000);
+        let mut sender = b.pc.rtp_sender(v.sender).expect("sender");
+        let track_id = sender.track().track_id().to_string();
+        sender
+            .replace_track(video_track(&v.stream_id, &track_id, v.ssrcs))
+            .expect("replace_track");
+        let mut parameters = sender.get_parameters().clone();
+        parameters.encodings[l].rtp_coding_parameters.ssrc = Some(ssrc);
+        sender
+            .set_parameters(parameters, None)
+            .expect("set_parameters");
     }
 
     /// Sets the sequence numbers of a layer of a video sender back by `by`, as a sender does that
@@ -1631,7 +1789,7 @@ impl World {
     }
 
     /// Browser `i` asks for a keyframe of the stream it receives with `ssrc`, without waiting.
-    fn write_keyframe_request(&mut self, i: usize, ssrc: u32) {
+    pub fn write_keyframe_request(&mut self, i: usize, ssrc: u32) {
         let now = self.now;
         let b = &mut self.browsers[i];
         let Some(receiver) = b.pc.get_receivers().next() else {
@@ -1704,12 +1862,8 @@ pub fn voice_number(payload: &[u8]) -> Option<u32> {
         .flatten()
 }
 
-fn video_sender(
-    pc: &mut RTCPeerConnection,
-    stream_id: &str,
-    track_id: &str,
-    ssrcs: [u32; 2],
-) -> VideoSender {
+/// A simulcast camera or screen track: the small layer `l` and the large `h`.
+fn video_track(stream_id: &str, track_id: &str, ssrcs: [u32; 2]) -> MediaStreamTrack {
     let coding = |rid: &str, ssrc: u32| RTCRtpEncodingParameters {
         rtp_coding_parameters: RTCRtpCodingParameters {
             rid: rid.to_owned(),
@@ -1725,13 +1879,22 @@ fn video_sender(
         },
         ..Default::default()
     };
-    let track = MediaStreamTrack::new(
+    MediaStreamTrack::new(
         stream_id.to_owned(),
         track_id.to_owned(),
         track_id.to_owned(),
         RtpCodecKind::Video,
         vec![coding("l", ssrcs[0]), coding("h", ssrcs[1])],
-    );
+    )
+}
+
+fn video_sender(
+    pc: &mut RTCPeerConnection,
+    stream_id: &str,
+    track_id: &str,
+    ssrcs: [u32; 2],
+) -> VideoSender {
+    let track = video_track(stream_id, track_id, ssrcs);
     let id = pc
         .add_transceiver_from_track(
             track,

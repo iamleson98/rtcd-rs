@@ -411,8 +411,13 @@ pub(crate) struct Session {
     /// When a packet from the participant last arrived.
     pub last_rx: Instant,
     pub lifecycle: Lifecycle,
-    /// On the engine's dirty list.
+    /// On the engine's list of sessions with input to handle.
     pub dirty: bool,
+    /// On the engine's list of sessions to flush.
+    pub touched: bool,
+    /// The most receivers one stream of this session has had (those it is sent to and those
+    /// waiting for a keyframe): what a datagram from it can cost in writes at most.
+    pub max_fan: usize,
     /// The wake-up time registered in the engine's timer queue.
     pub timer: Option<(Instant, u64)>,
 
