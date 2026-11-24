@@ -695,6 +695,9 @@ impl Engine {
                 )
             });
             let fan = &*fan;
+            if let Some(s) = self.sessions.get_mut(key) {
+                s.max_fan = s.max_fan.max(fan.serving.len() + fan.waiting.len());
+            }
             // The uplink counts whether or not anyone receives the stream.
             let size = packet.marshal_size() as u64;
             self.metrics.rtp_bytes_received(fan.ty, size);
@@ -757,7 +760,7 @@ impl Engine {
                         red.as_ref(),
                         frame.as_ref(),
                         now,
-                        &mut self.dirty,
+                        &mut self.touched,
                     ) {
                         sent[type_slot(
                             r.down.get(sub.stream).map_or(TrackType::Video, |d| d.ty),
@@ -785,7 +788,7 @@ impl Engine {
                     red.as_ref(),
                     frame.as_ref(),
                     now,
-                    &mut self.dirty,
+                    &mut self.touched,
                 );
                 let ty = r.down.get(sub.stream).map_or(TrackType::Voice, |d| d.ty);
                 if let Some(written) = wrote {
@@ -1001,7 +1004,7 @@ fn write_down(
     red: Option<&bytes::Bytes>,
     frame: Option<&Frame>,
     now: Instant,
-    dirty: &mut Vec<SessionKey>,
+    touched: &mut Vec<SessionKey>,
 ) -> Option<u64> {
     let ds = r.down.get_mut(sub.stream)?;
     if ds.phase != DownPhase::Active {
@@ -1050,9 +1053,9 @@ fn write_down(
     }
     let size = out.marshal_size() as u64;
     let ok = sender.write_rtp(now, out).is_ok();
-    if ok && !r.dirty {
-        r.dirty = true;
-        dirty.push(sub.session);
+    if ok && !r.touched {
+        r.touched = true;
+        touched.push(sub.session);
     }
     ok.then_some(size)
 }

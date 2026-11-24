@@ -74,6 +74,8 @@ impl Engine {
             last_rx: now,
             lifecycle: Lifecycle::Connecting,
             dirty: false,
+            touched: false,
+            max_fan: 0,
             timer: None,
             ufrags: vec![ufrag.clone()],
             addrs: Vec::new(),

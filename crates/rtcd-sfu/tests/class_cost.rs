@@ -39,7 +39,8 @@ const LOSS: f64 = 0.005;
 
 /// `CLASS_COST_CLASSES`, `_WATCH` (cameras besides the teacher's each student watches), `_WARMUP`
 /// and `_SECONDS` (of virtual time) and `_ROUNDS` change the set-up and the length of the
-/// measurement.
+/// measurement; `_CHUNK` is how many datagrams the engine takes in before it settles them (the
+/// shard's is 32; 1 settles after each).
 fn setting(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -162,6 +163,9 @@ struct Round {
 
 fn build(classes: usize, watch: usize, small: bool) -> (World, Vec<Camera>, Vec<Mic>) {
     let mut w = World::with_config(node());
+    w.receive_chunk = setting("CLASS_COST_CHUNK", 32);
+    // The shard's `FLUSH_AT`.
+    w.flush_at = 2048;
     let mut cameras = Vec::new();
     let mut mics = Vec::new();
     for c in 0..classes {
