@@ -219,6 +219,14 @@ pub struct World {
     pub frame_pad: usize,
     /// Time spent inside the engine (datagrams in, timeouts), for the cost tests.
     pub engine_spent: Duration,
+    /// How `engine_spent` splits: the part spent reading datagrams and the part spent in timeouts,
+    /// and how many calls of each there were.
+    pub reads_spent: Duration,
+    pub timers_spent: Duration,
+    pub datagrams_read: usize,
+    pub timeouts_called: usize,
+    /// Datagrams the engine has sent so far.
+    pub transmits: usize,
     /// Called just before the world calls into the engine, with `"datagram"` or `"timeout"` and
     /// `true`, and just after with `false`: for tests that measure the engine alone.
     pub around_engine: fn(&'static str, bool),
@@ -311,6 +319,11 @@ impl World {
             payload_pad: 0,
             frame_pad: 1000,
             engine_spent: Duration::ZERO,
+            reads_spent: Duration::ZERO,
+            timers_spent: Duration::ZERO,
+            datagrams_read: 0,
+            timeouts_called: 0,
+            transmits: 0,
             around_engine: |_, _| {},
             nack_retry: None,
             red: false,
@@ -693,6 +706,7 @@ impl World {
             // The engine's output to the browsers.
             while let Some(t) = self.engine.poll_transmit() {
                 moved = true;
+                self.transmits += 1;
                 self.egress.add(
                     rtcd_sfu::egress::Gauge::wire_len(t.data.len(), t.peer, false),
                     1,
@@ -755,7 +769,10 @@ impl World {
         self.engine
             .handle_datagram(self.now, Proto::Udp, self.server, from, data);
         (self.around_engine)("datagram", false);
-        self.engine_spent += started.elapsed();
+        let spent = started.elapsed();
+        self.engine_spent += spent;
+        self.reads_spent += spent;
+        self.datagrams_read += 1;
     }
 
     /// A datagram from the SFU enters the downlink of browser `i`: it may be lost, waits for the
@@ -1082,7 +1099,26 @@ impl World {
         (self.around_engine)("timeout", true);
         self.engine.handle_timeout(self.now);
         (self.around_engine)("timeout", false);
-        self.engine_spent += started.elapsed();
+        let spent = started.elapsed();
+        self.engine_spent += spent;
+        self.timers_spent += spent;
+        self.timeouts_called += 1;
+    }
+
+    /// One step of `by` of virtual time as a shard's loop sees it: the clock moves once, `media`
+    /// writes what the browsers send at that instant, every side reads what it was sent, and then
+    /// the engine's timers run if one is due.
+    pub fn step(&mut self, by: Duration, media: impl FnOnce(&mut World)) {
+        self.now += by;
+        media(self);
+        for b in &mut self.browsers {
+            let _ = b.pc.handle_timeout(self.now);
+        }
+        self.settle();
+        if self.engine.poll_timeout().is_some_and(|t| t <= self.now) {
+            self.tick_engine();
+            self.settle();
+        }
     }
 
     fn next_wake(&mut self) -> Option<Instant> {
