@@ -63,6 +63,8 @@ pub(crate) const QUEUE_SHRINKING: f64 = -0.02;
 /// keyframe sets a queue all at once.
 pub(crate) const QUEUE_SURGING: f64 = 0.15;
 pub(crate) const KEYFRAME_GRACE: Duration = Duration::from_secs(2);
+/// How long after a keyframe went in its queue may still be draining.
+const KEYFRAME_QUEUE: Duration = Duration::from_secs(3);
 /// For a few seconds after a temporal layer is added (which costs no keyframe), a queue that grows
 /// past this means the layer did not fit.
 const TRIAL_QUEUE: f64 = 0.08;
@@ -439,6 +441,8 @@ pub struct ScreenLevel {
     /// Until when the queue the large layer's keyframe sets is expected (a keyframe is on its way
     /// to the receiver), or a temporal layer just added is on trial.
     keyframe_grace: Option<Instant>,
+    /// When a keyframe of the stream last went in on the path.
+    keyframe_seen: Option<Instant>,
     /// Whether the last reading was a queue growing as fast as [`QUEUE_SURGING`] says: one
     /// reading is a burst (a keyframe's first packets), two in a row are a path fed too much.
     surging: bool,
@@ -461,6 +465,7 @@ impl ScreenLevel {
             hold_until: None,
             queued_since: None,
             keyframe_grace: None,
+            keyframe_seen: None,
             surging: false,
             trial_until: None,
             calm_since: None,
@@ -491,7 +496,24 @@ impl ScreenLevel {
         inputs.dropping()
             || q >= QUEUE_CRITICAL
             || surging
-            || (now.saturating_duration_since(since) >= QUEUE_PERSISTS && trend >= QUEUE_SHRINKING)
+            || (now.saturating_duration_since(since) >= self.persists(now)
+                && trend >= QUEUE_SHRINKING)
+    }
+
+    /// How long a queue has to stand to count as lasting: longer while the queue a keyframe set is
+    /// still draining, which on a path that carries little more than the rung takes seconds, and
+    /// looks like a path fed too much until it is gone.
+    fn persists(&self, now: Instant) -> Duration {
+        let draining = self
+            .keyframe_seen
+            .is_some_and(|t| now.saturating_duration_since(t) < KEYFRAME_QUEUE);
+        QUEUE_PERSISTS + if draining { KEYFRAME_GRACE } else { Duration::ZERO }
+    }
+
+    /// A keyframe of the stream goes in on the receiver's path (the sender's own, as much as one
+    /// asked for): the queue it sets is not read as lasting for as long as it takes to drain.
+    pub fn keyframe_goes_in(&mut self, now: Instant) {
+        self.keyframe_seen = Some(now);
     }
 
     /// A keyframe is on its way to the receiver (it, or another receiver of the stream, asked for
@@ -1319,6 +1341,25 @@ mod tests {
             rung(Layer::High, Some(0)),
             "once the keyframe has gone in, a queue that surges is congestion"
         );
+    }
+
+    #[test]
+    fn the_queue_a_keyframe_going_in_sets_has_longer_to_drain_before_it_counts_as_lasting() {
+        let mut s = ScreenLevel::new();
+        let mut t = Instant::now();
+        hold(&mut s, &mut t, 120, clear(4_000_000.0));
+        let lasting = queued(0.3, 1_700_000.0);
+        // A keyframe of the stream goes in (the sender's own, nobody asked for it): a second
+        // after the queue it set began it is still draining.
+        t += Duration::from_secs(1);
+        s.keyframe_goes_in(t);
+        for _ in 0..4 {
+            t += Duration::from_millis(500);
+            assert_eq!(s.decide(t, lasting, &ladder()), rung(Layer::High, None));
+        }
+        // A queue that has stood that long and is not draining is congestion all the same.
+        t += Duration::from_millis(1500);
+        assert_eq!(s.decide(t, lasting, &ladder()), rung(Layer::High, Some(0)));
     }
 
     #[test]

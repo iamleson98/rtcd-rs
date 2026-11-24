@@ -791,6 +791,11 @@ impl Engine {
                 if let Some(written) = wrote {
                     sent[type_slot(ty)] += written;
                 }
+                // A keyframe of a screen share goes in as a burst on this receiver's path, the
+                // sender's own periodic ones as much as those asked for.
+                if newest && ty == TrackType::Screen && frame.as_ref().is_some_and(|f| f.key) {
+                    r.down.screen_level.keyframe_goes_in(now);
+                }
                 // A camera being paused goes when the frame it is in is complete.
                 if packet.header.marker && r.down.get(sub.stream).is_some_and(|d| d.pausing) {
                     pausing.push(sub);

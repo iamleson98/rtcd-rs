@@ -142,6 +142,16 @@ fn bottleneck(rate_bps: u64, loss: f64) -> Path {
 /// `change` may alter as the run goes (it is given the time shared so far).
 fn lesson(
     paths: &[Path],
+    change: impl FnMut(&mut World, &[usize], Duration),
+) -> (World, Vec<usize>, Vec<Instant>, Instant) {
+    lesson_after(Duration::ZERO, paths, change)
+}
+
+/// `lesson`, `wait` after the joins: where the sender's periodic keyframes fall against the
+/// receiver's reviews is a matter of when it starts.
+fn lesson_after(
+    wait: Duration,
+    paths: &[Path],
     mut change: impl FnMut(&mut World, &[usize], Duration),
 ) -> (World, Vec<usize>, Vec<Instant>, Instant) {
     let mut w = World::with_config(engine_config());
@@ -151,6 +161,7 @@ fn lesson(
     let viewers: Vec<usize> = (0..paths.len())
         .map(|n| w.join(&format!("viewer{n}"), "call1"))
         .collect();
+    w.run_for(wait);
     for (&v, &p) in viewers.iter().zip(paths) {
         w.set_path(v, p);
     }
@@ -231,6 +242,25 @@ fn a_viewer_behind_a_slow_bloated_link_gets_a_picture_that_never_freezes() {
             "{name}: only {} frames shown in a minute",
             s.buffered.frames
         );
+    }
+}
+
+#[test]
+fn a_slow_link_settles_whenever_in_the_second_the_lesson_starts() {
+    // The large layer's base rung fits this link, with the sender's periodic keyframes making a
+    // queue that drains on its own: whether one of them fell where a review read it as
+    // congestion used to decide whether the receiver was moved off the layer again and again.
+    for wait_ms in [0, 500, 1000, 1500, 2000, 3000, 5000, 7000] {
+        let (w, viewers, voice, start) = lesson_after(
+            Duration::from_millis(wait_ms),
+            &[bottleneck(1_500_000, 0.02)],
+            |_, _, _| {},
+        );
+        let (from, to) = judged(start);
+        let s = seen(&w, viewers[0], &voice, from, to);
+        let name = format!("started {wait_ms} ms after the joins");
+        s.print(&name);
+        assert_served(&s, &name);
     }
 }
 
