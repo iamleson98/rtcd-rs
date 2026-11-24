@@ -16,10 +16,10 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use rtcd_sfu::engine::QUIET_OFFER_DELAY;
 use support::watch::{Playback, quantile};
 use support::{Path, ScreenPlan, World, engine_config};
 
+static SHIFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const LOW_BPS: u64 = 500_000;
 const HIGH_BPS: u64 = 2_500_000;
 const RUN: f64 = 120.0;
@@ -152,9 +152,10 @@ fn lesson(
     let viewers: Vec<usize> = (0..paths.len())
         .map(|n| w.join(&format!("viewer{n}"), "call1"))
         .collect();
-    // The voice streams the joins reserved are offered once their wait is over (see
-    // `QUIET_OFFER_DELAY`), before anything is measured.
-    w.run_for(QUIET_OFFER_DELAY + Duration::from_secs(2));
+    let shift = SHIFT.load(std::sync::atomic::Ordering::Relaxed);
+    if shift > 0 {
+        w.run_for(Duration::from_millis(shift));
+    }
     for (&v, &p) in viewers.iter().zip(paths) {
         w.set_path(v, p);
     }
@@ -330,4 +331,46 @@ fn a_link_that_slows_down_mid_lesson_is_followed_within_seconds() {
     let s = seen(&w, viewers[0], &voice, after, judged(start).1);
     s.print("4 then 1.2 Mbit/s, from 10 s after the change");
     assert_served(&s, "4 then 1.2 Mbit/s");
+}
+
+#[test]
+fn diag_sweep() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let fast = Path {
+        loss: 0.0,
+        jitter: Duration::ZERO,
+        delay: Duration::from_millis(20),
+        rate_bps: None,
+        queue: Duration::ZERO,
+    };
+    for shift in (0..=12000u64).step_by(500) {
+        SHIFT.store(shift, std::sync::atomic::Ordering::Relaxed);
+        let mut row = format!("SWEEP shift={shift:5}");
+        for (rate, loss) in [(1_500_000, 0.02), (2_000_000, 0.01), (1_000_000, 0.02), (4_000_000, 0.01)] {
+            let (w, v, voice, start) = lesson(&[bottleneck(rate, loss)], |_, _, _| {});
+            let (from, to) = judged(start);
+            let x = seen(&w, v[0], &voice, from, to);
+            let ok = catch_unwind(AssertUnwindSafe(|| assert_served(&x, "x"))).is_ok();
+            row += &format!(" | {}k {} {:.2}", rate / 1000, if ok { "ok" } else { "FAIL" }, x.queue.1);
+        }
+        let (w, v, voice, start) = lesson(&[bottleneck(1_500_000, 0.02), fast], |_, _, _| {});
+        let (from, to) = judged(start);
+        let slow = seen(&w, v[0], &voice, from, to);
+        let quick = seen(&w, v[1], &voice, from, to);
+        let ok = catch_unwind(AssertUnwindSafe(|| assert_served(&slow, "x"))).is_ok()
+            && quick.large_frames() >= 15 * 60 * 95 / 100
+            && quick.asap.frozen == 0.0;
+        row += &format!(" | pair {} {:.2}", if ok { "ok" } else { "FAIL" }, slow.queue.1);
+        let (w, v, voice, start) = lesson(&[bottleneck(4_000_000, 0.01)], |w, v, t| {
+            if t == Duration::from_secs(60) {
+                w.set_path(v[0], bottleneck(1_200_000, 0.01));
+            }
+        });
+        let after = start + Duration::from_secs(70);
+        let x = seen(&w, v[0], &voice, after, judged(start).1);
+        let ok = catch_unwind(AssertUnwindSafe(|| assert_served(&x, "x"))).is_ok();
+        row += &format!(" | slows {} {:.2}", if ok { "ok" } else { "FAIL" }, x.queue.1);
+        eprintln!("{row}");
+    }
+    panic!("sweep");
 }
