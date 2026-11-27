@@ -128,6 +128,18 @@ pub struct RecordEnded {
     pub dropped: u64,
 }
 
+/// Service to server: what the service sent to a session over its life on this node. One report
+/// is sent per session on each node it ends on (a session that moves nodes ends on the first),
+/// and the server adds them up. A service that predates it sends none, and a server that
+/// predates it skips the type.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionBytes {
+    pub session_id: String,
+    /// Bytes of datagrams sent to the participant: media, retransmissions, padding and
+    /// receiver reports, and the connection's own traffic, without the IP and UDP headers.
+    pub bytes_sent: u64,
+}
+
 /// A control-plane message on the websocket between a client and the service: a msgpack string
 /// naming the type, directly followed by a msgpack value holding the data (no enclosing array).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +166,8 @@ pub enum ClientMessage {
     RecordFile(RecordFile),
     /// Service to server: the recording ended on this node.
     RecordEnded(RecordEnded),
+    /// Service to server: what a session was sent, when it ended on this node.
+    SessionBytes(SessionBytes),
 }
 
 impl ClientMessage {
@@ -171,6 +185,7 @@ impl ClientMessage {
             Self::RecordStop(_) => "record_stop",
             Self::RecordFile(_) => "record_file",
             Self::RecordEnded(_) => "record_ended",
+            Self::SessionBytes(_) => "session_bytes",
         }
     }
 
@@ -249,6 +264,11 @@ impl ClientMessage {
                 write_uint_entry(&mut out, "files", r.files.into());
                 write_int_entry(&mut out, "durationMs", r.duration_ms);
                 write_uint_entry(&mut out, "dropped", r.dropped);
+            }
+            Self::SessionBytes(r) => {
+                rmp::encode::write_map_len(&mut out, 2).expect("vec write");
+                write_str_entry(&mut out, "sessionID", &r.session_id);
+                write_uint_entry(&mut out, "bytesSent", r.bytes_sent);
             }
         }
         out
@@ -331,6 +351,13 @@ impl ClientMessage {
                     files: lookup_u32(map, "files"),
                     duration_ms: lookup_i64(map, "durationMs"),
                     dropped: lookup_u64(map, "dropped"),
+                })
+            }
+            "session_bytes" => {
+                let map = as_map(&data, "session_bytes")?;
+                Self::SessionBytes(SessionBytes {
+                    session_id: lookup_string(map, "sessionID"),
+                    bytes_sent: lookup_u64(map, "bytesSent"),
                 })
             }
             "rtc" => Self::Rtc(Message::decode(&data)?),
@@ -446,10 +473,42 @@ mod tests {
                 duration_ms: 3_600_000,
                 dropped: 42,
             }),
+            ClientMessage::SessionBytes(SessionBytes {
+                session_id: "s".into(),
+                bytes_sent: 7_000_000_000,
+            }),
         ];
         for msg in all {
             assert_eq!(ClientMessage::unpack(&msg.pack()).unwrap(), msg);
         }
+    }
+
+    #[test]
+    fn the_byte_count_is_a_map_the_go_decoder_reads_by_name() {
+        let frame = ClientMessage::SessionBytes(SessionBytes {
+            session_id: "s".into(),
+            bytes_sent: 5_000_000_000,
+        })
+        .pack();
+        let (kind, rest) = read_value(&frame).unwrap();
+        assert_eq!(kind.as_str(), Some("session_bytes"));
+        let (data, _) = read_value(rest).unwrap();
+        let map = as_map(&data, "session_bytes").unwrap();
+        let keys: Vec<_> = map.iter().filter_map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["sessionID", "bytesSent"]);
+        // A missing field reads as zero, as for every message.
+        let mut frame = Vec::new();
+        rmp::encode::write_str(&mut frame, "session_bytes").unwrap();
+        rmp::encode::write_map_len(&mut frame, 1).unwrap();
+        rmp::encode::write_str(&mut frame, "sessionID").unwrap();
+        rmp::encode::write_str(&mut frame, "s").unwrap();
+        assert_eq!(
+            ClientMessage::unpack(&frame).unwrap(),
+            ClientMessage::SessionBytes(SessionBytes {
+                session_id: "s".into(),
+                bytes_sent: 0,
+            })
+        );
     }
 
     #[test]

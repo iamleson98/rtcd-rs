@@ -16,6 +16,35 @@ pub enum Proto {
 }
 
 impl Proto {
+    /// What a packet of `payload` bytes to `peer` costs on the wire: the payload plus the IP header
+    /// (20 bytes for IPv4, 40 for IPv6) and the UDP header (8) or the TCP header (20) with its
+    /// RFC 4571 length (2). Egress is billed by the wire bytes, so the count a session reports
+    /// carries them too.
+    pub fn wire_bytes(self, payload: usize, peer: &std::net::SocketAddr) -> u64 {
+        let ip = if peer.is_ipv4() { 20 } else { 40 };
+        let transport = match self {
+            Proto::Udp => 8,
+            Proto::Tcp => 22,
+        };
+        (payload + ip + transport) as u64
+    }
+}
+
+#[cfg(test)]
+mod wire_bytes_tests {
+    use super::Proto;
+
+    #[test]
+    fn a_packet_costs_its_headers_too() {
+        let v4: std::net::SocketAddr = "192.0.2.1:5000".parse().unwrap();
+        let v6: std::net::SocketAddr = "[2001:db8::1]:5000".parse().unwrap();
+        assert_eq!(Proto::Udp.wire_bytes(1000, &v4), 1028);
+        assert_eq!(Proto::Udp.wire_bytes(1000, &v6), 1048);
+        assert_eq!(Proto::Tcp.wire_bytes(1000, &v4), 1042);
+    }
+}
+
+impl Proto {
     pub(crate) fn from_transport(p: rtc::shared::TransportProtocol) -> Self {
         match p {
             rtc::shared::TransportProtocol::TCP => Self::Tcp,
@@ -79,5 +108,9 @@ pub enum Event {
         group_id: String,
         session_id: String,
         reason: CloseReason,
+        /// What the engine sent to the participant over the session's life, in bytes of
+        /// datagrams (see `Session::bytes_sent`). `None` when it was lost with the shard that
+        /// held it.
+        bytes_sent: Option<u64>,
     },
 }

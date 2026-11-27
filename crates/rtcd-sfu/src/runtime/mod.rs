@@ -917,6 +917,7 @@ fn abandon_sessions(registry: &Registry, shard: usize, sink: &dyn EventSink) {
             group_id: cfg.group_id,
             session_id: cfg.session_id,
             reason: CloseReason::ConnectionLost,
+            bytes_sent: None,
         });
     }
 }

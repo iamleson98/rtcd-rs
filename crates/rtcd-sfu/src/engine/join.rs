@@ -77,6 +77,7 @@ impl Engine {
             touched: false,
             max_fan: 0,
             timer: None,
+            bytes_sent: 0,
             ufrags: vec![ufrag.clone()],
             addrs: Vec::new(),
             candidates_added: false,
@@ -117,6 +118,8 @@ impl Engine {
             group_id: cfg.group_id,
             session_id: cfg.session_id,
             reason: CloseReason::Rejected,
+            // Nothing was ever sent to it.
+            bytes_sent: Some(0),
         });
     }
 
@@ -271,6 +274,7 @@ impl Engine {
         let _ = s.pc.close();
         while let Some(t) = rtc::sansio::Protocol::poll_write(&mut s.pc) {
             let proto = super::types::Proto::from_transport(t.transport.transport_protocol);
+            s.bytes_sent += proto.wire_bytes(t.message.len(), &t.transport.peer_addr);
             self.out.push_back(super::types::Transmit {
                 proto,
                 local: t.transport.local_addr,
@@ -284,6 +288,7 @@ impl Engine {
             group_id: s.cfg.group_id.clone(),
             session_id: s.cfg.session_id.clone(),
             reason,
+            bytes_sent: Some(s.bytes_sent),
         });
     }
 

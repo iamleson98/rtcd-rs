@@ -463,6 +463,7 @@ impl Engine {
         };
         while let Some(t) = s.pc.poll_write() {
             let proto = Proto::from_transport(t.transport.transport_protocol);
+            s.bytes_sent += proto.wire_bytes(t.message.len(), &t.transport.peer_addr);
             tracing::trace!(session = %s.cfg.session_id, bytes = t.message.len(), peer = %t.transport.peer_addr, "transmit");
             self.out.push_back(Transmit {
                 proto,

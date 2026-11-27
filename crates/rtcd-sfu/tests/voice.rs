@@ -598,6 +598,37 @@ fn a_call_ends_when_its_last_participant_leaves_and_the_id_can_be_reused() {
 }
 
 #[test]
+fn a_session_that_ends_is_reported_with_every_byte_sent_to_it() {
+    let mut w = World::new();
+    let a = w.join("alice", "call1");
+    let b = w.join("bob", "call1");
+    talk(&mut w, a);
+    talk(&mut w, b);
+    w.run_for(Duration::from_secs(2));
+    let before = w.browsers[b].engine_bytes;
+    assert!(before > 0, "bob was sent something");
+    w.leave(b);
+    w.run_for(Duration::from_secs(1));
+    let reported = w
+        .bytes_reported
+        .iter()
+        .find(|(id, _)| *id == w.browsers[b].session_id)
+        .and_then(|(_, bytes)| *bytes)
+        .expect("the end of bob's session is reported with a count");
+    assert!(reported >= before, "what was sent before the leave counts");
+    assert_eq!(
+        reported, w.browsers[b].engine_bytes,
+        "the count is what the engine handed out for bob, the closing alert included"
+    );
+    // Alice's session is still open: nothing is reported for it.
+    assert!(
+        w.bytes_reported
+            .iter()
+            .all(|(id, _)| *id != w.browsers[a].session_id)
+    );
+}
+
+#[test]
 fn calls_are_isolated() {
     let mut w = World::new();
     let a = w.join("alice", "call1");

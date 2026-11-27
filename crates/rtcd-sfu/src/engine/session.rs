@@ -420,6 +420,10 @@ pub(crate) struct Session {
     pub max_fan: usize,
     /// The wake-up time registered in the engine's timer queue.
     pub timer: Option<(Instant, u64)>,
+    /// Bytes sent to the participant so far as the network carries them, IP and UDP (or TCP)
+    /// headers included (`Proto::wire_bytes`): media after encryption, retransmissions, padding,
+    /// receiver reports, ICE, DTLS and data channel. Added to once per datagram, in the flush.
+    pub bytes_sent: u64,
 
     /// The ICE username fragments STUN checks for this session carry as their local part.
     pub ufrags: Vec<String>,

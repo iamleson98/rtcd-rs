@@ -70,8 +70,9 @@ fn client_messages_decode_whatever_map_order_go_used() {
             ClientMessage::RecordStart(_)
             | ClientMessage::RecordStop(_)
             | ClientMessage::RecordFile(_)
-            | ClientMessage::RecordEnded(_) => {
-                panic!("{name}: the Go service has no recording messages")
+            | ClientMessage::RecordEnded(_)
+            | ClientMessage::SessionBytes(_) => {
+                panic!("{name}: the Go service has no recording or byte-count messages")
             }
         }
         seen += 1;

@@ -171,6 +171,11 @@ async fn leaving_ends_the_session_and_the_client_is_told() {
         a.pump(&mut ws).await;
     }
     assert!(a.closed, "a close message names the session");
+    assert!(
+        a.bytes_sent.is_some_and(|n| n > 0),
+        "what was sent to the session is reported before its close: {:?}",
+        a.bytes_sent
+    );
     assert_eq!(sessions(&s, "mm", "call1").await.0, 404);
     s.shutdown().await;
 }
