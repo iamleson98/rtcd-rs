@@ -229,6 +229,8 @@ pub struct Participant {
     pub session: String,
     pub voice: Vec<bool>,
     pub closed: bool,
+    /// What the service said it sent the session, when it ended.
+    pub bytes_sent: Option<u64>,
 }
 
 impl Participant {
@@ -248,6 +250,7 @@ impl Participant {
             session,
             voice: vec![],
             closed: false,
+            bytes_sent: None,
         };
         for s in first {
             ws.signal(&p.session, s).await;
@@ -276,6 +279,9 @@ impl Participant {
                     self.voice.push(m.kind == MessageType::VoiceOn)
                 }
                 ClientMessage::Close(r) if r.session_id == self.session => self.closed = true,
+                ClientMessage::SessionBytes(r) if r.session_id == self.session => {
+                    self.bytes_sent = Some(r.bytes_sent)
+                }
                 m @ (ClientMessage::RecordFile(_) | ClientMessage::RecordEnded(_)) => {
                     ws.reports.push(m)
                 }

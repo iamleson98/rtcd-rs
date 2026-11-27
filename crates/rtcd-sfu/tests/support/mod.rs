@@ -121,6 +121,9 @@ pub struct Browser {
     /// The address the SFU hears the browser from: `addr` until a NAT remaps it ([`World::rebind`]).
     pub mapped: SocketAddr,
     pub dc: Option<usize>,
+    /// Wire bytes (headers included) of the datagrams the engine handed out for this browser,
+    /// whether or not they arrived.
+    pub engine_bytes: u64,
     /// The verdict of the last lock request.
     pub lock_answer: Option<bool>,
     pub tracks: Vec<RemoteTrack>,
@@ -207,6 +210,8 @@ pub struct World {
     pub server: SocketAddr,
     pub browsers: Vec<Browser>,
     pub closed: Vec<(String, CloseReason)>,
+    /// What the engine reported each closed session was sent, in bytes.
+    pub bytes_reported: Vec<(String, Option<u64>)>,
     pub voice_events: Vec<(String, bool)>,
     pub ice_messages: usize,
     next_browser: u16,
@@ -341,6 +346,7 @@ impl World {
             server: cfg_server,
             browsers: Vec::new(),
             closed: Vec::new(),
+            bytes_reported: Vec::new(),
             voice_events: Vec::new(),
             ice_messages: 0,
             next_browser: 1,
@@ -557,6 +563,7 @@ impl World {
             addr,
             mapped: addr,
             dc: None,
+            engine_bytes: 0,
             lock_answer: None,
             tracks: vec![],
             ended_tracks: vec![],
@@ -768,6 +775,9 @@ impl World {
                         && !(192..=223).contains(&t.data[1]);
                     batch.push((i, rtp.then(|| u16::from_be_bytes([t.data[2], t.data[3]]))));
                 }
+                if let Some(b) = self.browsers.iter_mut().find(|b| b.mapped == t.peer) {
+                    b.engine_bytes += t.proto.wire_bytes(t.data.len(), &t.peer);
+                }
                 if self.blackhole {
                     continue;
                 }
@@ -950,8 +960,14 @@ impl World {
     fn on_engine_event(&mut self, e: Event) {
         match e {
             Event::SessionClosed {
-                session_id, reason, ..
-            } => self.closed.push((session_id, reason)),
+                session_id,
+                reason,
+                bytes_sent,
+                ..
+            } => {
+                self.bytes_reported.push((session_id.clone(), bytes_sent));
+                self.closed.push((session_id, reason));
+            }
             Event::Message(m) => match m.kind {
                 MessageType::VoiceOn => self.voice_events.push((m.session_id, true)),
                 MessageType::VoiceOff => self.voice_events.push((m.session_id, false)),

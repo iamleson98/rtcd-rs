@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use rtcd_proto::{ClientMessage, Hello, Message, MessageType, SessionConfig, SessionRef};
+use rtcd_proto::{
+    ClientMessage, Hello, Message, MessageType, SessionBytes, SessionConfig, SessionRef,
+};
 use rtcd_sfu::engine::Event;
 use rtcd_sfu::runtime::{AdmitError, JoinError, Sfu};
 use tokio::sync::mpsc;
@@ -292,6 +294,7 @@ impl Service {
             }
             ClientMessage::Hello(_)
             | ClientMessage::Close(_)
+            | ClientMessage::SessionBytes(_)
             | ClientMessage::Vad(_)
             | ClientMessage::RecordFile(_)
             | ClientMessage::RecordEnded(_) => {
@@ -355,6 +358,30 @@ impl Service {
         }
     }
 
+    /// Tells the server what the session was sent, on the connection the session was bound to: the
+    /// app node that has the call. When that connection is gone the report goes to any connection
+    /// of the client (the server ignores what it cannot place), and waits for one if there is none.
+    fn report_bytes(
+        &self,
+        conn_id: Option<&str>,
+        group_id: &str,
+        session_id: &str,
+        bytes_sent: u64,
+    ) {
+        let msg = ClientMessage::SessionBytes(SessionBytes {
+            session_id: session_id.to_owned(),
+            bytes_sent,
+        });
+        let bound = conn_id.and_then(|c| self.conns.lock().get(c).cloned());
+        match bound {
+            Some(h) if h.send(&msg) => {
+                self.metrics
+                    .ws_message(&h.client_id, msg.type_name(), "out")
+            }
+            _ => self.reports.send(group_id, msg),
+        }
+    }
+
     /// Relays one report of the SFU to the client the session belongs to.
     fn on_event(&self, event: Event) {
         match event {
@@ -380,7 +407,10 @@ impl Service {
                 }
             }
             Event::SessionClosed {
-                session_id, reason, ..
+                group_id,
+                session_id,
+                reason,
+                bytes_sent,
             } => {
                 let conn = self.session_conn.lock().remove(&session_id);
                 debug!(session = %session_id, ?reason, "session closed");
@@ -388,6 +418,9 @@ impl Service {
                     let mut closed = self.closed.lock();
                     closed.retain(|_, t| t.elapsed() < CLOSED_MEMORY);
                     closed.insert(session_id.clone(), Instant::now());
+                }
+                if let Some(bytes_sent) = bytes_sent {
+                    self.report_bytes(conn.as_deref(), &group_id, &session_id, bytes_sent);
                 }
                 if let Some(conn) = conn {
                     self.send_close(&conn, &session_id);

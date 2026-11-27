@@ -18,7 +18,8 @@ mod session;
 pub mod turn;
 
 pub use client_message::{
-    ClientMessage, Hello, JoinRequest, RecordEnded, RecordFile, RecordStart, RecordStop, SessionRef,
+    ClientMessage, Hello, JoinRequest, RecordEnded, RecordFile, RecordStart, RecordStop,
+    SessionBytes, SessionRef,
 };
 pub use error::ProtoError;
 pub use message::{Message, MessageType};
