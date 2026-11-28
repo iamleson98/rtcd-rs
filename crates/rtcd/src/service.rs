@@ -429,7 +429,13 @@ impl Service {
                     closed.insert(session_id.clone(), Instant::now());
                 }
                 if let Some(bytes_sent) = bytes_sent {
-                    self.report_bytes(conn.as_deref(), &group_id, &session_id, &call_id, bytes_sent);
+                    self.report_bytes(
+                        conn.as_deref(),
+                        &group_id,
+                        &session_id,
+                        &call_id,
+                        bytes_sent,
+                    );
                 }
                 if let Some(conn) = conn {
                     self.send_close(&conn, &session_id);
