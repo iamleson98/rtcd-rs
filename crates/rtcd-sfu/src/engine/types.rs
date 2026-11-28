@@ -107,6 +107,8 @@ pub enum Event {
     SessionClosed {
         group_id: String,
         session_id: String,
+        /// The call the session joined (or tried to join), as the join named it.
+        call_id: String,
         reason: CloseReason,
         /// What the engine sent to the participant over the session's life, in bytes of
         /// datagrams (see `Session::bytes_sent`). `None` when it was lost with the shard that

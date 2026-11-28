@@ -117,6 +117,7 @@ impl Engine {
         self.events.push_back(Event::SessionClosed {
             group_id: cfg.group_id,
             session_id: cfg.session_id,
+            call_id: cfg.call_id,
             reason: CloseReason::Rejected,
             // Nothing was ever sent to it.
             bytes_sent: Some(0),
@@ -287,6 +288,7 @@ impl Engine {
         self.events.push_back(Event::SessionClosed {
             group_id: s.cfg.group_id.clone(),
             session_id: s.cfg.session_id.clone(),
+            call_id: s.cfg.call_id.clone(),
             reason,
             bytes_sent: Some(s.bytes_sent),
         });

@@ -306,18 +306,24 @@ impl Service {
     fn join(&self, conn_id: &str, client_id: &str, join: &rtcd_proto::JoinRequest) {
         let cfg = SessionConfig::from_join(client_id, join);
         let session_id = cfg.session_id.clone();
-        debug!(session = %session_id, call = %cfg.call_id, "join");
+        let call_id = cfg.call_id.clone();
+        let group_id = cfg.group_id.clone();
+        debug!(session = %session_id, call = %call_id, "join");
         // Bind first: the SFU may have something to say the moment it starts the session.
         self.session_conn
             .lock()
             .insert(session_id.clone(), conn_id.to_owned());
         if let Err(err) = self.sfu.join(cfg) {
             error!(session = %session_id, %err, "failed to initialize the rtc session");
-            // A duplicate leaves the first session in place, still bound to its connection.
+            // A duplicate leaves the first session in place, still bound to its connection; its
+            // own report, at its end, carries its own call id.
             if !matches!(err, JoinError::Admit(AdmitError::Duplicate)) {
                 self.session_conn.lock().remove(&session_id);
                 self.send_close(conn_id, &session_id);
             }
+            // The join never became a session, so the server is not left waiting for its bytes:
+            // it was sent none. After the close, as for a session the SFU ended.
+            self.report_bytes(Some(conn_id), &group_id, &session_id, &call_id, 0);
         }
     }
 
@@ -366,10 +372,12 @@ impl Service {
         conn_id: Option<&str>,
         group_id: &str,
         session_id: &str,
+        call_id: &str,
         bytes_sent: u64,
     ) {
         let msg = ClientMessage::SessionBytes(SessionBytes {
             session_id: session_id.to_owned(),
+            call_id: call_id.to_owned(),
             bytes_sent,
         });
         let bound = conn_id.and_then(|c| self.conns.lock().get(c).cloned());
@@ -409,6 +417,7 @@ impl Service {
             Event::SessionClosed {
                 group_id,
                 session_id,
+                call_id,
                 reason,
                 bytes_sent,
             } => {
@@ -420,7 +429,13 @@ impl Service {
                     closed.insert(session_id.clone(), Instant::now());
                 }
                 if let Some(bytes_sent) = bytes_sent {
-                    self.report_bytes(conn.as_deref(), &group_id, &session_id, bytes_sent);
+                    self.report_bytes(
+                        conn.as_deref(),
+                        &group_id,
+                        &session_id,
+                        &call_id,
+                        bytes_sent,
+                    );
                 }
                 if let Some(conn) = conn {
                     self.send_close(&conn, &session_id);

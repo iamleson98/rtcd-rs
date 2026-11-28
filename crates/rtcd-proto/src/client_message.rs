@@ -135,6 +135,10 @@ pub struct RecordEnded {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SessionBytes {
     pub session_id: String,
+    /// The call the session joined, which this report belongs to. A session id can come back in
+    /// another call, so the server places the bytes by this id and not by the session's. Empty
+    /// from a service that predates it.
+    pub call_id: String,
     /// Bytes of datagrams sent to the participant: media, retransmissions, padding and
     /// receiver reports, and the connection's own traffic, without the IP and UDP headers.
     pub bytes_sent: u64,
@@ -266,8 +270,9 @@ impl ClientMessage {
                 write_uint_entry(&mut out, "dropped", r.dropped);
             }
             Self::SessionBytes(r) => {
-                rmp::encode::write_map_len(&mut out, 2).expect("vec write");
+                rmp::encode::write_map_len(&mut out, 3).expect("vec write");
                 write_str_entry(&mut out, "sessionID", &r.session_id);
+                write_str_entry(&mut out, "callID", &r.call_id);
                 write_uint_entry(&mut out, "bytesSent", r.bytes_sent);
             }
         }
@@ -357,6 +362,7 @@ impl ClientMessage {
                 let map = as_map(&data, "session_bytes")?;
                 Self::SessionBytes(SessionBytes {
                     session_id: lookup_string(map, "sessionID"),
+                    call_id: lookup_string(map, "callID"),
                     bytes_sent: lookup_u64(map, "bytesSent"),
                 })
             }
@@ -475,6 +481,7 @@ mod tests {
             }),
             ClientMessage::SessionBytes(SessionBytes {
                 session_id: "s".into(),
+                call_id: "c".into(),
                 bytes_sent: 7_000_000_000,
             }),
         ];
@@ -487,6 +494,7 @@ mod tests {
     fn the_byte_count_is_a_map_the_go_decoder_reads_by_name() {
         let frame = ClientMessage::SessionBytes(SessionBytes {
             session_id: "s".into(),
+            call_id: "c".into(),
             bytes_sent: 5_000_000_000,
         })
         .pack();
@@ -495,7 +503,7 @@ mod tests {
         let (data, _) = read_value(rest).unwrap();
         let map = as_map(&data, "session_bytes").unwrap();
         let keys: Vec<_> = map.iter().filter_map(|(k, _)| k.as_str()).collect();
-        assert_eq!(keys, ["sessionID", "bytesSent"]);
+        assert_eq!(keys, ["sessionID", "callID", "bytesSent"]);
         // A missing field reads as zero, as for every message.
         let mut frame = Vec::new();
         rmp::encode::write_str(&mut frame, "session_bytes").unwrap();
@@ -506,6 +514,7 @@ mod tests {
             ClientMessage::unpack(&frame).unwrap(),
             ClientMessage::SessionBytes(SessionBytes {
                 session_id: "s".into(),
+                call_id: String::new(),
                 bytes_sent: 0,
             })
         );
