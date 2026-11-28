@@ -283,6 +283,15 @@ async fn a_join_the_sfu_refuses_is_closed_back_to_the_client() {
         ClientMessage::Close(r) => assert_eq!(r.session_id, "broken"),
         other => panic!("expected a close, got {other:?}"),
     }
+    // Then exactly one report of nothing sent, so the server does not wait for one.
+    match ws.next_message().await {
+        ClientMessage::SessionBytes(r) => {
+            assert_eq!(r.session_id, "broken");
+            assert_eq!(r.bytes_sent, 0);
+        }
+        other => panic!("expected a zero byte report, got {other:?}"),
+    }
+    assert!(ws.try_next(Duration::from_millis(200)).await.is_none());
     s.shutdown().await;
 }
 
@@ -298,6 +307,37 @@ async fn a_duplicate_join_does_not_close_the_existing_session() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(!a.closed, "a second join of a live session leaves it alone");
+    assert_eq!(sessions(&s, "mm", "call1").await.0, 200);
+    s.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_duplicate_join_is_answered_with_one_zero_report_for_its_own_call() {
+    let s = TestServer::start().await;
+    s.register("mm").await;
+    let mut ws = s.connect("mm").await;
+    let mut a = Participant::join(&mut ws, s.media, "alice", "call1", 7001).await;
+    // The same session id asks to join another call: the live session stays in call1.
+    ws.join("call2", "session-alice").await;
+    let mut reports = Vec::new();
+    for _ in 0..20 {
+        while let Some(m) = ws.try_next(Duration::from_millis(10)).await {
+            match m {
+                ClientMessage::SessionBytes(r) => reports.push(r),
+                ClientMessage::Close(_) => panic!("a duplicate join closes nothing"),
+                ClientMessage::Rtc(m) => {
+                    for sig in a.browser.handle_signal(m.kind, &m.data) {
+                        ws.signal(&a.session, sig).await;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(reports.len(), 1, "one report for the join that was refused");
+    assert_eq!(reports[0].session_id, "session-alice");
+    assert_eq!(reports[0].call_id, "call2");
+    assert_eq!(reports[0].bytes_sent, 0);
     assert_eq!(sessions(&s, "mm", "call1").await.0, 200);
     s.shutdown().await;
 }

@@ -73,11 +73,13 @@ The shard counts, per session, the bytes of every datagram it hands to the socke
 retransmissions, padding, receiver reports, ICE, DTLS and the data channel, without the 28 bytes of
 IPv4 and UDP headers. It is a plain add per datagram in the flush that already holds the session.
 When the session ends on the node the service sends the server one `session_bytes` message
-(`{sessionID, bytesSent}`) on the connection the session was bound to, just before its `close`, or on
+(`{sessionID, callID, bytesSent}`, the call the session joined) on the connection the session was bound to, just before its `close`, or on
 any connection of the client when that one is gone (it waits for one if none is up). A session that
 moves to another node, or that the server joins again after the node lost it, ends on each and is
 reported by each; the server adds them up. A session lost with a dead shard sends none, which the
-server reads as "not known". A server from before the message skips the type (it is read as an
+server reads as "not known". A join the node refuses (full, saturated, invalid) or that repeats a live session id is answered with
+a report of 0 for the join's own call, after the close if there is one, so the server never waits for
+a report that cannot come; the live session's own report still carries its call. A server from before the message skips the type (it is read as an
 unknown message and logged at debug level only); a service from before it simply never sends one.
 The server counts fair use by it (`docs/billing/SUBSCRIPTION-PLANS.md` in class-management).
 
